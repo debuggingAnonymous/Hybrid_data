@@ -1,0 +1,1660 @@
+        -:    0:Source:tree.c
+        -:    0:Graph:tree.gcno
+        -:    0:Data:tree.gcda
+        -:    0:Runs:9
+        -:    0:Programs:2
+        -:    1:/* tree.c -- helper functions to build and evaluate the expression tree.
+        -:    2:   Copyright (C) 1990, 91, 92, 93, 94, 2000, 2003, 2004, 2005, 2006, 2007 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:   
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:   
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   16:*/
+        -:   17:
+        -:   18:#include <config.h>
+        -:   19:#include "defs.h"
+        -:   20:
+        -:   21:#include <assert.h>
+        -:   22:#include <stdlib.h>
+        -:   23:
+        -:   24:#include "xalloc.h"
+        -:   25:#include "error.h"
+        -:   26:
+        -:   27:
+        -:   28:#if ENABLE_NLS
+        -:   29:# include <libintl.h>
+        -:   30:# define _(Text) gettext (Text)
+        -:   31:#else
+        -:   32:# define _(Text) Text
+        -:   33:#endif
+        -:   34:#ifdef gettext_noop
+        -:   35:# define N_(String) gettext_noop (String)
+        -:   36:#else
+        -:   37:/* See locate.c for explanation as to why not use (String) */
+        -:   38:# define N_(String) String
+        -:   39:#endif
+        -:   40:
+        -:   41:
+        -:   42:
+        -:   43:/* All predicates for each path to process. */
+        -:   44:static struct predicate *predicates = NULL;
+        -:   45:
+        -:   46:/* The root of the evaluation tree. */
+        -:   47:static struct predicate *eval_tree  = NULL;
+        -:   48:
+        -:   49:/* The last predicate allocated. */
+        -:   50:static struct predicate *last_pred = NULL;
+        -:   51:
+        -:   52:
+        -:   53:static struct predicate *scan_rest PARAMS((struct predicate **input,
+        -:   54:				       struct predicate *head,
+        -:   55:				       short int prev_prec));
+        -:   56:static void merge_pred PARAMS((struct predicate *beg_list, struct predicate *end_list, struct predicate **last_p));
+        -:   57:static struct predicate *set_new_parent PARAMS((struct predicate *curr, enum predicate_precedence high_prec, struct predicate **prevp));
+        -:   58:static const char *cost_name PARAMS((enum EvaluationCost cost));
+        -:   59:
+        -:   60:
+        -:   61:/* Return a pointer to a tree that represents the
+        -:   62:   expression prior to non-unary operator *INPUT.
+        -:   63:   Set *INPUT to point at the next input predicate node.
+        -:   64:
+        -:   65:   Only accepts the following:
+        -:   66:   
+        -:   67:   <primary>
+        -:   68:   expression		[operators of higher precedence]
+        -:   69:   <uni_op><primary>
+        -:   70:   (arbitrary expression)
+        -:   71:   <uni_op>(arbitrary expression)
+        -:   72:   
+        -:   73:   In other words, you can not start out with a bi_op or close_paren.
+        -:   74:
+        -:   75:   If the following operator (if any) is of a higher precedence than
+        -:   76:   PREV_PREC, the expression just nabbed is part of a following
+        -:   77:   expression, which really is the expression that should be handed to
+        -:   78:   our caller, so get_expr recurses. */
+        -:   79:
+        -:   80:struct predicate *
+       32:   81:get_expr (struct predicate **input,
+        -:   82:	  short int prev_prec,
+        -:   83:	  const struct predicate* prev_pred)
+        -:   84:{
+       32:   85:  struct predicate *next = NULL;
+       32:   86:  struct predicate *this_pred = (*input);
+        -:   87:
+       32:   88:  if (*input == NULL)
+    #####:   89:    error (1, 0, _("invalid expression"));
+        -:   90:  
+       32:   91:  switch ((*input)->p_type)
+        -:   92:    {
+        -:   93:    case NO_TYPE:
+    #####:   94:      error (1, 0, _("invalid expression"));
+    #####:   95:      break;
+        -:   96:
+        -:   97:    case BI_OP:
+        -:   98:      /* e.g. "find . -a" */
+    #####:   99:      error (1, 0, _("invalid expression; you have used a binary operator '%s' with nothing before it."), this_pred->p_name);
+    #####:  100:      break;
+        -:  101:
+        -:  102:    case CLOSE_PAREN:
+    #####:  103:      if ((UNI_OP == prev_pred->p_type
+    #####:  104:	  || BI_OP == prev_pred->p_type)
+    #####:  105:	  && !this_pred->artificial)
+        -:  106:	{
+        -:  107:	  /* e.g. "find \( -not \)" or "find \( -true -a \" */
+    #####:  108:	  error(1, 0, _("expected an expression between '%s' and ')'"),
+        -:  109:		prev_pred->p_name);
+        -:  110:	}
+    #####:  111:      else if ( (*input)->artificial )
+        -:  112:	{
+        -:  113:	  /* We have reached the end of the user-supplied predicates
+        -:  114:	   * unexpectedly. 
+        -:  115:	   */
+        -:  116:	  /* e.g. "find . -true -a" */
+    #####:  117:	  error (1, 0, _("expected an expression after '%s'"), prev_pred->p_name);
+        -:  118:	}
+        -:  119:      else
+        -:  120:	{
+    #####:  121:	  error (1, 0, _("invalid expression; you have too many ')'"));
+        -:  122:	}
+    #####:  123:      break;
+        -:  124:
+        -:  125:    case PRIMARY_TYPE:
+       32:  126:      next = *input;
+       32:  127:      *input = (*input)->pred_next;
+       32:  128:      break;
+        -:  129:
+        -:  130:    case UNI_OP:
+    #####:  131:      next = *input;
+    #####:  132:      *input = (*input)->pred_next;
+    #####:  133:      next->pred_right = get_expr (input, NEGATE_PREC, next);
+    #####:  134:      break;
+        -:  135:
+        -:  136:    case OPEN_PAREN:
+    #####:  137:      if ( (NULL == (*input)->pred_next) || (*input)->pred_next->artificial )
+        -:  138:	{
+        -:  139:	  /* user typed something like "find . (", and so the ) we are
+        -:  140:	   * looking at is from the artificial "( ) -print" that we
+        -:  141:	   * add.
+        -:  142:	   */
+    #####:  143:	  error (1, 0, _("invalid expression; expected to find a ')' but didn't see one.  Perhaps you need an extra predicate after '%s'"), this_pred->p_name);
+        -:  144:	}
+    #####:  145:      prev_pred = (*input);
+    #####:  146:      *input = (*input)->pred_next;
+    #####:  147:      if ( (*input)->p_type == CLOSE_PAREN )
+        -:  148:	{
+    #####:  149:	  error (1, 0, _("invalid expression; empty parentheses are not allowed."));
+        -:  150:	}
+    #####:  151:      next = get_expr (input, NO_PREC, prev_pred);
+    #####:  152:      if ((*input == NULL)
+    #####:  153:	  || ((*input)->p_type != CLOSE_PAREN))
+    #####:  154:	error (1, 0, _("invalid expression; I was expecting to find a ')' somewhere but did not see one."));
+    #####:  155:      *input = (*input)->pred_next;	/* move over close */
+    #####:  156:      break;
+        -:  157:      
+        -:  158:    default:
+    #####:  159:      error (1, 0, _("oops -- invalid expression type!"));
+    #####:  160:      break;
+        -:  161:    }
+        -:  162:
+        -:  163:  /* We now have the first expression and are positioned to check
+        -:  164:     out the next operator.  If NULL, all done.  Otherwise, if
+        -:  165:     PREV_PREC < the current node precedence, we must continue;
+        -:  166:     the expression we just nabbed is more tightly bound to the
+        -:  167:     following expression than to the previous one. */
+       32:  168:  if (*input == NULL)
+        8:  169:    return (next);
+       24:  170:  if ((int) (*input)->p_prec > (int) prev_prec)
+        -:  171:    {
+        8:  172:      next = scan_rest (input, next, prev_prec);
+        8:  173:      if (next == NULL)
+    #####:  174:	error (1, 0, _("invalid expression"));
+        -:  175:    }
+       24:  176:  return (next);
+        -:  177:}
+        -:  178:
+        -:  179:/* Scan across the remainder of a predicate input list starting
+        -:  180:   at *INPUT, building the rest of the expression tree to return.
+        -:  181:   Stop at the first close parenthesis or the end of the input list.
+        -:  182:   Assumes that get_expr has been called to nab the first element
+        -:  183:   of the expression tree.
+        -:  184:   
+        -:  185:   *INPUT points to the current input predicate list element.
+        -:  186:   It is updated as we move along the list to point to the
+        -:  187:   terminating input element.
+        -:  188:   HEAD points to the predicate element that was obtained
+        -:  189:   by the call to get_expr.
+        -:  190:   PREV_PREC is the precedence of the previous predicate element. */
+        -:  191:
+        -:  192:static struct predicate *
+        8:  193:scan_rest (struct predicate **input,
+        -:  194:	   struct predicate *head,
+        -:  195:	   short int prev_prec)
+        -:  196:{
+        -:  197:  struct predicate *tree;	/* The new tree we are building. */
+        -:  198:
+        8:  199:  if ((*input == NULL) || ((*input)->p_type == CLOSE_PAREN))
+    #####:  200:    return (NULL);
+        8:  201:  tree = head;
+       40:  202:  while ((*input != NULL) && ((int) (*input)->p_prec > (int) prev_prec))
+        -:  203:    {
+       24:  204:      switch ((*input)->p_type)
+        -:  205:	{
+        -:  206:	case NO_TYPE:
+        -:  207:	case PRIMARY_TYPE:
+        -:  208:	case UNI_OP:
+        -:  209:	case OPEN_PAREN:
+        -:  210:	  /* I'm not sure how we get here, so it is not obvious what
+        -:  211:	   * sort of mistakes might give rise to this condition.
+        -:  212:	   */
+    #####:  213:	  error (1, 0, _("invalid expression"));
+    #####:  214:	  break;
+        -:  215:
+        -:  216:	case BI_OP:
+        -:  217:	  {
+       24:  218:	    struct predicate *prev = (*input);
+       24:  219:	    (*input)->pred_left = tree;
+       24:  220:	    tree = *input;
+       24:  221:	    *input = (*input)->pred_next;
+       24:  222:	    tree->pred_right = get_expr (input, tree->p_prec, prev);
+       24:  223:	    break;
+        -:  224:	  }
+        -:  225:
+        -:  226:	case CLOSE_PAREN:
+    #####:  227:	  return tree;
+        -:  228:
+        -:  229:	default:
+    #####:  230:	  error (1, 0,
+        -:  231:		 _("oops -- invalid expression type (%d)!"),
+    #####:  232:		 (int)(*input)->p_type);
+    #####:  233:	  break;
+        -:  234:	}
+        -:  235:    }
+        8:  236:  return tree;
+        -:  237:}
+        -:  238:
+        -:  239:/* Returns true if the specified predicate is reorderable. */
+        -:  240:static boolean
+       16:  241:predicate_is_cost_free(const struct predicate *p)
+        -:  242:{
+       24:  243:  if (pred_is(p, pred_name) ||
+       16:  244:      pred_is(p, pred_path) ||
+       16:  245:      pred_is(p, pred_iname) ||
+        8:  246:      pred_is(p, pred_ipath))
+        -:  247:    {
+        -:  248:      /* Traditionally (at least 4.1.7 through 4.2.x) GNU find always
+        -:  249:       * optimised these cases.
+        -:  250:       */
+        8:  251:      return true;
+        -:  252:    }
+        8:  253:  else if (options.optimisation_level > 0)
+        -:  254:    {
+       12:  255:      if (pred_is(p, pred_and) ||
+       12:  256:	  pred_is(p, pred_negate) ||
+       12:  257:	  pred_is(p, pred_comma) ||
+        6:  258:	  pred_is(p, pred_or))
+    #####:  259:	return false;
+        -:  260:      else
+        6:  261:	return NeedsNothing == p->p_cost;
+        -:  262:    }
+        -:  263:  else
+        -:  264:    {
+        2:  265:      return false;
+        -:  266:    }
+        -:  267:}
+        -:  268:
+        -:  269:/* Prints a predicate */
+    #####:  270:void print_predicate(FILE *fp, const struct predicate *p)
+        -:  271:{
+    #####:  272:  fprintf (fp, "%s%s%s",
+        -:  273:	   p->p_name,
+    #####:  274:	   p->arg_text ? " " : "",
+    #####:  275:	   p->arg_text ? p->arg_text : "");
+    #####:  276:}
+        -:  277:
+        -:  278:
+        -:  279:struct predlist 
+        -:  280:{
+        -:  281:  struct predicate *head;
+        -:  282:  struct predicate *tail;
+        -:  283:};
+        -:  284:
+        -:  285:static void
+      108:  286:predlist_init(struct predlist *p)
+        -:  287:{
+      108:  288:  p->head = p->tail = NULL;
+      108:  289:}
+        -:  290:
+        -:  291:static void
+       14:  292:predlist_insert(struct predlist *list,
+        -:  293:		struct predicate *curr,
+        -:  294:		struct predicate **pprev)
+        -:  295:{
+       14:  296:  struct predicate **insertpos = &(list->head);
+        -:  297:  
+       14:  298:  *pprev = curr->pred_left;
+       14:  299:  if (options.optimisation_level > 2)
+        -:  300:    {
+        -:  301:      /* Insert the new node in the list after any other entries which
+        -:  302:       * are more selective.
+        -:  303:       */
+        -:  304:      if (0)
+        -:  305:	while ( (*insertpos) && ((*insertpos)->est_success_rate < curr->est_success_rate) )
+        -:  306:	  {
+        -:  307:	    insertpos = &((*insertpos)->pred_left);
+        -:  308:	  }
+        -:  309:    }
+       14:  310:  curr->pred_left = (*insertpos);
+       14:  311:  (*insertpos) = curr;
+       14:  312:  if (NULL == list->tail)
+       14:  313:    list->tail = list->head;
+       14:  314:}
+        -:  315:
+        -:  316:static int
+    #####:  317:pred_cost_compare(const struct predicate *p1, const struct predicate *p2, boolean wantfailure)
+        -:  318:{
+    #####:  319:  if (p1->p_cost == p2->p_cost)
+        -:  320:    {
+    #####:  321:      if (p1->est_success_rate == p2->est_success_rate)
+    #####:  322:	return 0;
+    #####:  323:      else if (wantfailure)
+    #####:  324:	return p1->est_success_rate < p2->est_success_rate ? -1 :  1;
+        -:  325:      else
+    #####:  326:	return p1->est_success_rate < p2->est_success_rate ?  1 : -1;
+        -:  327:    }
+        -:  328:  else 
+        -:  329:    {
+    #####:  330:      return p1->p_cost < p2->p_cost ? -1 : 1;
+        -:  331:    }
+        -:  332:}
+        -:  333:
+        -:  334:
+        -:  335:static void 
+      288:  336:predlist_merge_sort(struct predlist *list,
+        -:  337:		    struct predicate **last)
+        -:  338:{
+        -:  339:  struct predlist new_list;
+        -:  340:  struct predicate *p, *q;
+        -:  341:
+      288:  342:  if (NULL == list->head)
+      562:  343:    return;			/* nothing to do */
+        -:  344:
+       14:  345:  if (options.debug_options & DebugTreeOpt)
+        -:  346:    {
+    #####:  347:      fprintf(stderr, "%s:\n", "predlist before merge sort");
+    #####:  348:      print_tree(stderr, list->head, 2);
+        -:  349:    }
+        -:  350:  
+       14:  351:  calculate_derived_rates(list->head);
+       14:  352:  predlist_init(&new_list);
+       42:  353:  while (list->head)
+        -:  354:    {
+        -:  355:      /* remove head of source list */
+       14:  356:      q = list->head;
+       14:  357:      list->head = list->head->pred_left;
+       14:  358:      q->pred_left = NULL;
+        -:  359:
+        -:  360:      /* insert it into the new list */
+       14:  361:      for (p=new_list.head; p; p=p->pred_left)
+        -:  362:	{
+        -:  363:	  /* If these operations are OR operations, we want to get a
+        -:  364:	   * successful test as soon as possible, to take advantage of
+        -:  365:	   * the short-circuit evaluation.  If they're AND, we want to
+        -:  366:	   * get an unsuccessful result early for the same reason.
+        -:  367:	   * Therefore we invert the sense of the comparison for the
+        -:  368:	   * OR case.  We only want to invert the sense of the success
+        -:  369:	   * rate comparison, not the operation cost comparison.  Hence we 
+        -:  370:	   * pass a flag into pred_cost_compare().
+        -:  371:	   */
+    #####:  372:	  boolean wantfailure = (OR_PREC != p->p_prec);
+    #####:  373:	  if (pred_cost_compare(p->pred_right, q->pred_right, wantfailure) >= 0)
+    #####:  374:	    break;
+        -:  375:	}
+       14:  376:      if (p)
+        -:  377:	{
+        -:  378:	  /* insert into existing list */
+    #####:  379:	  q->pred_left = p->pred_left;
+    #####:  380:	  if (NULL == q->pred_left)
+    #####:  381:	    new_list.tail = q;
+    #####:  382:	  p->pred_left = q;
+        -:  383:	}
+        -:  384:      else 
+        -:  385:	{
+       14:  386:	  q->pred_left = new_list.head;	/* prepend */
+       14:  387:	  new_list.head = q;
+       14:  388:	  if (NULL == new_list.tail)
+       14:  389:	    new_list.tail = q; /* first item in new list */
+        -:  390:	}
+        -:  391:    }
+       14:  392:  if (options.debug_options & DebugTreeOpt)
+        -:  393:    {
+    #####:  394:      fprintf(stderr, "%s:\n", "predlist after merge sort");
+    #####:  395:      print_tree(stderr, new_list.head, 2);
+        -:  396:    }
+        -:  397:  
+       14:  398:  calculate_derived_rates(new_list.head);
+       14:  399:  merge_pred(new_list.head, new_list.tail, last);
+       14:  400:  predlist_init(list);
+        -:  401:}
+        -:  402:
+        -:  403:static void 
+       24:  404:merge_lists(struct predlist lists[], int nlists,
+        -:  405:	    struct predlist *name_list,
+        -:  406:	    struct predlist *regex_list,
+        -:  407:	    struct predicate **last)
+        -:  408:{
+        -:  409:  int i;
+        -:  410:  static void (*mergefn)(struct predlist *, struct predicate**);
+        -:  411:
+       24:  412:  mergefn = predlist_merge_sort;
+        -:  413:  
+       24:  414:  mergefn(name_list,   last);
+       24:  415:  mergefn(regex_list,  last);
+        -:  416:  
+      264:  417:  for (i=0; i<nlists; i++)
+      240:  418:    mergefn(&lists[i], last);
+       24:  419:}
+        -:  420:
+        -:  421:
+        -:  422:
+        -:  423:static boolean 
+       72:  424:subtree_has_side_effects(const struct predicate *p)
+        -:  425:{
+       72:  426:  if (p)
+        -:  427:    {
+       80:  428:      return p->side_effects
+       16:  429:	|| subtree_has_side_effects(p->pred_left)
+       56:  430:	|| subtree_has_side_effects(p->pred_right);
+        -:  431:    }
+        -:  432:  else
+        -:  433:    {
+        -:  434:
+       32:  435:      return false;
+        -:  436:    }
+        -:  437:}
+        -:  438:
+        -:  439:static int
+    #####:  440:worst_cost (const struct predicate *p)
+        -:  441:{
+    #####:  442:  if (p)
+        -:  443:    {
+        -:  444:      unsigned int cost_r, cost_l, worst;
+    #####:  445:      cost_l = worst_cost(p->pred_left);
+    #####:  446:      cost_r = worst_cost(p->pred_right);
+    #####:  447:      worst = (cost_l > cost_r) ? cost_l : cost_r;
+    #####:  448:      if (worst < p->p_cost)
+    #####:  449:	worst = p->p_cost;
+    #####:  450:      return worst;
+        -:  451:    }
+        -:  452:  else
+        -:  453:    {
+    #####:  454:      return 0;
+        -:  455:    }
+        -:  456:}
+        -:  457:
+        -:  458:
+        -:  459:
+        -:  460:static void
+    #####:  461:perform_arm_swap(struct predicate *p)
+        -:  462:{
+    #####:  463:  struct predicate *tmp = p->pred_left->pred_right;
+    #####:  464:  p->pred_left->pred_right = p->pred_right;
+    #####:  465:  p->pred_right = tmp;
+    #####:  466:}
+        -:  467:
+        -:  468:/* Consider swapping p->pred_left->pred_right with p->pred_right, 
+        -:  469: * if that yields a faster evaluation.   Normally the left predicate is 
+        -:  470: * evaluated first.
+        -:  471: *
+        -:  472: * If the operation is an OR, we want the left predicate to be the one that 
+        -:  473: * succeeds most often.   If it is an AND, we want it to be the predicate that 
+        -:  474: * fails most often.
+        -:  475: *
+        -:  476: * We don't consider swapping arms of an operator where their cost is
+        -:  477: * different or where they have side effects.
+        -:  478: *
+        -:  479: * A viable test case for this is 
+        -:  480: * ./find -D opt   -O3  .   \! -type f -o -type d
+        -:  481: * Here, the ! -type f should be evaluated first,
+        -:  482: * as we assume that 95% of inodes are vanilla files.
+        -:  483: */
+        -:  484:static boolean
+       64:  485:consider_arm_swap(struct predicate *p)
+        -:  486:{
+        -:  487:  int left_cost, right_cost;
+       64:  488:  const char *reason = NULL;
+        -:  489:  struct predicate **pl, **pr;
+        -:  490:
+       64:  491:  if (BI_OP != p->p_type)
+       32:  492:    reason = "Not a binary operation";
+        -:  493:
+       64:  494:  if (!reason)
+        -:  495:    {
+       32:  496:      if (NULL == p->pred_left || NULL == p->pred_right)
+        8:  497:	reason = "Doesn't have two arms";
+        -:  498:    }
+        -:  499:
+        -:  500:  
+       64:  501:  if (!reason)
+        -:  502:    {
+       24:  503:      if (NULL == p->pred_left->pred_right)
+    #####:  504:	reason = "Left arm has no child on RHS";
+        -:  505:    }
+       64:  506:  pr = &p->pred_right;
+       64:  507:  pl = &p->pred_left->pred_right;
+        -:  508:  
+       64:  509:  if (!reason)
+        -:  510:    {
+       24:  511:      if (subtree_has_side_effects(*pl))
+        8:  512:	reason = "Left subtree has side-effects";
+        -:  513:    }
+       64:  514:  if (!reason)
+        -:  515:    {
+       16:  516:      if (subtree_has_side_effects(*pr))
+       16:  517:	reason = "Right subtree has side-effects";
+        -:  518:    }
+        -:  519:
+       64:  520:  if (!reason)
+        -:  521:    {
+    #####:  522:      left_cost = worst_cost(*pl);
+    #####:  523:      right_cost = worst_cost(*pr);
+        -:  524:      
+    #####:  525:      if (left_cost < right_cost)
+        -:  526:	{
+    #####:  527:	  reason = "efficient as-is";
+        -:  528:	}
+        -:  529:    }
+       64:  530:  if (!reason)
+        -:  531:    {
+        -:  532:      boolean want_swap;
+        -:  533:      
+    #####:  534:      if (left_cost == right_cost)
+        -:  535:	{
+        -:  536:	  /* it's a candidate */
+    #####:  537:	  float succ_rate_l = (*pl)->est_success_rate;
+    #####:  538:	  float succ_rate_r = (*pr)->est_success_rate;
+        -:  539:
+    #####:  540:	  if (options.debug_options & DebugTreeOpt)
+        -:  541:	    {
+    #####:  542:	      fprintf(stderr, "Success rates: l=%f, r=%f\n", succ_rate_l, succ_rate_r);
+        -:  543:	    }
+        -:  544:	  
+    #####:  545:	  if (pred_is(p, pred_or))
+        -:  546:	    {
+    #####:  547:	      want_swap = succ_rate_r < succ_rate_l;
+    #####:  548:	      if (!want_swap)
+    #####:  549:		reason = "Operation is OR and right success rate >= left";
+        -:  550:	    }
+    #####:  551:	  else if (pred_is(p, pred_and))
+        -:  552:	    {
+    #####:  553:	      want_swap = succ_rate_r > succ_rate_l;
+    #####:  554:	      if (!want_swap)
+    #####:  555:		reason = "Operation is AND and right success rate <= left";
+        -:  556:	    }
+        -:  557:	  else
+        -:  558:	    {
+    #####:  559:	      want_swap = false;
+    #####:  560:	      reason = "Not AND or OR";
+        -:  561:	    }
+        -:  562:	}
+        -:  563:      else 
+        -:  564:	{
+    #####:  565:	  want_swap = true;
+        -:  566:	}
+        -:  567:      
+    #####:  568:      if (want_swap)
+        -:  569:	{
+    #####:  570:	  if (options.debug_options & DebugTreeOpt)
+        -:  571:	    {
+    #####:  572:	      fprintf(stderr, "Performing arm swap on:\n");
+    #####:  573:	      print_tree (stderr, p, 0);
+        -:  574:	    }
+    #####:  575:	  perform_arm_swap(p);
+    #####:  576:	  return true;
+        -:  577:	}
+        -:  578:    }
+        -:  579:      
+        -:  580:
+       64:  581:  if (options.debug_options & DebugTreeOpt)
+        -:  582:    {
+    #####:  583:      fprintf(stderr, "Not an arm swap candidate (%s):\n", reason);
+    #####:  584:      print_tree (stderr, p, 0);
+        -:  585:    }
+       64:  586:  return false;
+        -:  587:}
+        -:  588:
+        -:  589:static boolean
+      136:  590:do_arm_swaps(struct predicate *p)
+        -:  591:{
+      136:  592:  if (p)
+        -:  593:    {
+        -:  594:      boolean swapped;
+        -:  595:      do 
+        -:  596:	{
+       64:  597:	  swapped = false;
+       64:  598:	  if (consider_arm_swap(p)
+       64:  599:	      || do_arm_swaps(p->pred_left)
+       64:  600:	      || do_arm_swaps(p->pred_right))
+        -:  601:	    {
+    #####:  602:	      swapped = true;
+        -:  603:	    }
+       64:  604:	} while (swapped);
+       64:  605:      return swapped;
+        -:  606:    }
+        -:  607:  else
+        -:  608:    {
+       72:  609:      return false;
+        -:  610:    }
+        -:  611:}
+        -:  612:
+        -:  613:
+        -:  614:
+        -:  615:/* Optimize the ordering of the predicates in the tree.  Rearrange
+        -:  616:   them to minimize work.  Strategies:
+        -:  617:   * Evaluate predicates that don't need inode information first;
+        -:  618:     the predicates are divided into 1 or more groups separated by
+        -:  619:     predicates (if any) which have "side effects", such as printing.
+        -:  620:     The grouping implements the partial ordering on predicates which
+        -:  621:     those with side effects impose.
+        -:  622:
+        -:  623:   * Place -name, -iname, -path, -ipath, -regex and -iregex at the front
+        -:  624:     of a group, with -name, -iname, -path and -ipath ahead of
+        -:  625:     -regex and -iregex.  Predicates which are moved to the front
+        -:  626:     of a group by definition do not have side effects.  Both
+        -:  627:     -regex and -iregex both use pred_regex.
+        -:  628:
+        -:  629:     If higher optimisation levels have been selected, reordering also
+        -:  630:     occurs according to the p_cost member of each predicate (which
+        -:  631:     reflects the performance cost of the test).  The ordering also
+        -:  632:     bears in mind whether these operations are more likely to succeed
+        -:  633:     or fail.  When evauating a chain of OR conditions, we prefer
+        -:  634:     tests likely to succeed at the front of the list.  For AND, we
+        -:  635:     prefer tests likely to fail at the front of the list.
+        -:  636:     
+        -:  637:     This routine "normalizes" the predicate tree by ensuring that
+        -:  638:     all expression predicates have AND (or OR or COMMA) parent nodes
+        -:  639:     which are linked along the left edge of the expression tree.
+        -:  640:     This makes manipulation of subtrees easier.  
+        -:  641:
+        -:  642:     EVAL_TREEP points to the root pointer of the predicate tree
+        -:  643:     to be rearranged.  opt_expr may return a new root pointer there.
+        -:  644:     Return true if the tree contains side effects, false if not. */
+        -:  645:
+        -:  646:static boolean
+        8:  647:opt_expr (struct predicate **eval_treep)
+        -:  648:{
+        8:  649:  struct predlist regex_list={NULL,NULL}, name_list={NULL,NULL};
+        -:  650:  struct predlist cbo_list[NumEvaluationCosts];
+        -:  651:  int i;
+        -:  652:  struct predicate *curr;
+        -:  653:  struct predicate **prevp;	/* Address of `curr' node. */
+        -:  654:  struct predicate **last_sidep; /* Last predicate with side effects. */
+        -:  655:  PRED_FUNC pred_func;
+        -:  656:  enum predicate_type p_type;
+        8:  657:  boolean has_side_effects = false; /* Return value. */
+        -:  658:  enum predicate_precedence prev_prec, /* precedence of last BI_OP in branch */
+        -:  659:			    biop_prec; /* topmost BI_OP precedence in branch */
+        -:  660:
+        8:  661:  if (eval_treep == NULL || *eval_treep == NULL)
+    #####:  662:    return (false);
+        -:  663:
+       88:  664:  for (i=0; i<NumEvaluationCosts; i++)
+       80:  665:    predlist_init(&cbo_list[i]);
+        -:  666:  
+        -:  667:  /* Set up to normalize tree as a left-linked list of ANDs or ORs.
+        -:  668:     Set `curr' to the leftmost node, `prevp' to its address, and
+        -:  669:     `pred_func' to the predicate type of its parent. */
+        8:  670:  prevp = eval_treep;
+        8:  671:  prev_prec = AND_PREC;
+        8:  672:  curr = *prevp;
+       40:  673:  while (curr->pred_left != NULL)
+        -:  674:    {
+       24:  675:      prevp = &curr->pred_left;
+       24:  676:      prev_prec = curr->p_prec;	/* must be a BI_OP */
+       24:  677:      curr = curr->pred_left;
+        -:  678:    }
+        -:  679:
+        -:  680:  /* Link in the appropriate BI_OP for the last expression, if needed. */
+        8:  681:  if (curr->p_type != BI_OP)
+        8:  682:    set_new_parent (curr, prev_prec, prevp);
+        -:  683:  
+        8:  684:  if (options.debug_options & (DebugExpressionTree|DebugTreeOpt))
+        -:  685:    {
+        -:  686:      /* Normalized tree. */
+    #####:  687:      fprintf (stderr, "Normalized Eval Tree:\n");
+    #####:  688:      print_tree (stderr, *eval_treep, 0);
+        -:  689:    }
+        -:  690:  
+        -:  691:  /* Rearrange the predicates. */
+        8:  692:  prevp = eval_treep;
+        8:  693:  biop_prec = NO_PREC; /* not COMMA_PREC */
+        8:  694:  if ((*prevp) && (*prevp)->p_type == BI_OP)
+        8:  695:    biop_prec = (*prevp)->p_prec;
+       48:  696:  while ((curr = *prevp) != NULL)
+        -:  697:    {
+        -:  698:      /* If there is a BI_OP of different precedence from the first
+        -:  699:	 in the pred_left chain, create a new parent of the
+        -:  700:	 original precedence, link the new parent to the left of the
+        -:  701:	 previous and link CURR to the right of the new parent. 
+        -:  702:	 This preserves the precedence of expressions in the tree
+        -:  703:	 in case we rearrange them. */
+       32:  704:      if (curr->p_type == BI_OP)
+        -:  705:	{
+       32:  706:          if (curr->p_prec != biop_prec)
+    #####:  707:	    curr = set_new_parent(curr, biop_prec, prevp);
+        -:  708:	}
+        -:  709:	  
+        -:  710:      /* See which predicate type we have. */
+       32:  711:      p_type = curr->pred_right->p_type;
+       32:  712:      pred_func = curr->pred_right->pred_func;
+        -:  713:
+        -:  714:
+       32:  715:      switch (p_type)
+        -:  716:	{
+        -:  717:	case NO_TYPE:
+        -:  718:	case PRIMARY_TYPE:
+        -:  719:	  /* Don't rearrange the arguments of the comma operator, it is
+        -:  720:	     not commutative.  */
+       32:  721:	  if (biop_prec == COMMA_PREC)
+    #####:  722:	    break;
+        -:  723:
+        -:  724:	  /* If this predicate has no side effects, consider reordering it. */
+       32:  725:	  if (!curr->pred_right->side_effects)		  
+        -:  726:	    {
+        -:  727:	      boolean reorder;
+        -:  728:	      
+        -:  729:	      /* If it's one of our special primaries, move it to the
+        -:  730:		 front of the list for that primary. */
+       16:  731:	      if (predicate_is_cost_free(curr->pred_right))
+        -:  732:		{
+       14:  733:		  if (options.debug_options & DebugTreeOpt)
+        -:  734:		    {
+    #####:  735:		      fprintf(stderr, "-O%d: promoting cheap predicate ",
+    #####:  736:			      (int)options.optimisation_level);
+    #####:  737:		      print_predicate(stderr, curr->pred_right);
+    #####:  738:		      fprintf(stderr, " into name_list\n");
+        -:  739:		    }
+       14:  740:		  predlist_insert(&name_list, curr, prevp);
+       14:  741:		  continue;
+        -:  742:		}
+        -:  743:	      
+        2:  744:	      if (pred_func == pred_regex)
+        -:  745:		{
+    #####:  746:		  predlist_insert(&regex_list, curr, prevp);
+    #####:  747:		  continue;
+        -:  748:		}
+        -:  749:
+        4:  750:	      reorder = ((options.optimisation_level > 1)
+    #####:  751:			  && (NeedsType == curr->pred_right->p_cost)
+        4:  752:			  && !curr->pred_right->need_stat) ||
+        2:  753:		(options.optimisation_level > 2);
+        -:  754:	      
+        2:  755:	      if (reorder)
+        -:  756:		{
+    #####:  757:		  if (options.debug_options & DebugTreeOpt)
+        -:  758:		    {
+    #####:  759:		      fprintf(stderr, "-O%d: categorising predicate ",
+    #####:  760:			      (int)options.optimisation_level);
+    #####:  761:		      print_predicate(stderr, curr->pred_right);
+    #####:  762:		      fprintf(stderr, " by cost (%s)\n",
+    #####:  763:			      cost_name(curr->pred_right->p_cost));
+        -:  764:		    }
+    #####:  765:		  predlist_insert(&cbo_list[curr->pred_right->p_cost], curr, prevp);
+    #####:  766:		  continue;
+        -:  767:		}
+        -:  768:	    }
+        -:  769:	  
+       18:  770:	  break;
+        -:  771:
+        -:  772:	case UNI_OP:
+        -:  773:	  /* For NOT, check the expression trees below the NOT. */
+    #####:  774:	  curr->pred_right->side_effects
+    #####:  775:	    = opt_expr (&curr->pred_right->pred_right);
+    #####:  776:	  break;
+        -:  777:
+        -:  778:	case BI_OP:
+        -:  779:	  /* For nested AND or OR, recurse (AND/OR form layers on the left of
+        -:  780:	     the tree), and continue scanning this level of AND or OR. */
+    #####:  781:	  curr->pred_right->side_effects = opt_expr (&curr->pred_right);
+    #####:  782:	  break;
+        -:  783:
+        -:  784:	  /* At this point, get_expr and scan_rest have already removed
+        -:  785:	     all of the user's parentheses. */
+        -:  786:
+        -:  787:	default:
+    #####:  788:	  error (1, 0, _("oops -- invalid expression type!"));
+    #####:  789:	  break;
+        -:  790:	}
+        -:  791:
+       18:  792:      if (curr->pred_right->side_effects == true)
+        -:  793:	{
+       16:  794:	  last_sidep = prevp;
+        -:  795:
+        -:  796:	  /* Incorporate lists and reset list pointers for this group.  */
+       16:  797:	  merge_lists(cbo_list, NumEvaluationCosts, &name_list, &regex_list, last_sidep);
+       16:  798:	  has_side_effects = true;
+        -:  799:	}
+        -:  800:
+       18:  801:      prevp = &curr->pred_left;
+        -:  802:    }
+        -:  803:
+        -:  804:  /* Do final list merges. */
+        8:  805:  last_sidep = prevp;
+        8:  806:  merge_lists(cbo_list, NumEvaluationCosts, &name_list, &regex_list, last_sidep);
+        8:  807:  return has_side_effects;
+        -:  808:}
+        -:  809:
+        -:  810:static float
+       60:  811:constrain_rate(float rate)
+        -:  812:{
+       60:  813:  if (rate > 1.0f)
+    #####:  814:    return 1.0;
+       60:  815:  else if (rate < 0.0)
+    #####:  816:    return 0.0;
+        -:  817:  else
+       60:  818:    return rate;
+        -:  819:}
+        -:  820:
+        -:  821:/* Link in a new parent BI_OP node for CURR, at *PREVP, with precedence
+        -:  822:   HIGH_PREC. */
+        -:  823:
+        -:  824:static struct predicate *
+        8:  825:set_new_parent (struct predicate *curr, enum predicate_precedence high_prec, struct predicate **prevp)
+        -:  826:{
+        -:  827:  struct predicate *new_parent;
+        -:  828:
+        8:  829:  new_parent = xmalloc (sizeof (struct predicate));
+        8:  830:  new_parent->p_type = BI_OP;
+        8:  831:  new_parent->p_prec = high_prec;
+        8:  832:  new_parent->need_stat = false;
+        8:  833:  new_parent->need_type = false;
+        8:  834:  new_parent->p_cost = NeedsNothing;
+        -:  835:  
+        8:  836:  switch (high_prec)
+        -:  837:    {
+        -:  838:    case COMMA_PREC:
+    #####:  839:      new_parent->pred_func = pred_comma;
+    #####:  840:      new_parent->p_name = ",";
+    #####:  841:      new_parent->est_success_rate = 1.0;
+    #####:  842:      break;
+        -:  843:    case OR_PREC:
+    #####:  844:      new_parent->pred_func = pred_or;
+    #####:  845:      new_parent->p_name = "-o";
+    #####:  846:      new_parent->est_success_rate = constrain_rate(curr->est_success_rate);
+    #####:  847:      break;
+        -:  848:    case AND_PREC:
+        8:  849:      new_parent->pred_func = pred_and;
+        8:  850:      new_parent->p_name = "-a";
+        8:  851:      new_parent->est_success_rate = constrain_rate(curr->est_success_rate);
+        8:  852:      break;
+        -:  853:    default:
+        -:  854:      ;				/* empty */
+        -:  855:    }
+        -:  856:  
+        8:  857:  new_parent->side_effects = false;
+        8:  858:  new_parent->no_default_print = false;
+        8:  859:  new_parent->args.str = NULL;
+        8:  860:  new_parent->pred_next = NULL;
+        -:  861:
+        -:  862:  /* Link in new_parent.
+        -:  863:     Pushes rest of left branch down 1 level to new_parent->pred_right. */
+        8:  864:  new_parent->pred_left = NULL;
+        8:  865:  new_parent->pred_right = curr;
+        8:  866:  *prevp = new_parent;
+        -:  867:
+        8:  868:  return new_parent;
+        -:  869:}
+        -:  870:
+        -:  871:/* Merge the predicate list that starts at BEG_LIST and ends at END_LIST
+        -:  872:   into the tree at LAST_P. */
+        -:  873:
+        -:  874:static void
+       14:  875:merge_pred (struct predicate *beg_list, struct predicate *end_list, struct predicate **last_p)
+        -:  876:{
+       14:  877:  end_list->pred_left = *last_p;
+       14:  878:  *last_p = beg_list;
+       14:  879:}
+        -:  880:
+        -:  881:/* Find the first node in expression tree TREE that requires
+        -:  882:   a stat call and mark the operator above it as needing a stat
+        -:  883:   before calling the node.   Since the expression precedences 
+        -:  884:   are represented in the tree, some preds that need stat may not
+        -:  885:   get executed (because the expression value is determined earlier.)
+        -:  886:   So every expression needing stat must be marked as such, not just
+        -:  887:   the earliest, to be sure to obtain the stat.  This still guarantees 
+        -:  888:   that a stat is made as late as possible.  Return true if the top node 
+        -:  889:   in TREE requires a stat, false if not. */
+        -:  890:
+        -:  891:
+        -:  892:struct pred_cost_lookup
+        -:  893:{
+        -:  894:  PRED_FUNC             fn;
+        -:  895:  enum EvaluationCost   cost;
+        -:  896:};
+        -:  897:static struct pred_cost_lookup costlookup[] = 
+        -:  898:  {
+        -:  899:    { pred_amin      ,  NeedsStatInfo        },
+        -:  900:    { pred_and       ,  NeedsNothing,        },
+        -:  901:    { pred_anewer    ,  NeedsStatInfo,       },
+        -:  902:    { pred_atime     ,  NeedsStatInfo,       },
+        -:  903:    { pred_closeparen,  NeedsNothing         },
+        -:  904:    { pred_cmin      ,  NeedsStatInfo,       },
+        -:  905:    { pred_cnewer    ,  NeedsStatInfo,       },
+        -:  906:    { pred_comma     ,  NeedsNothing,        },
+        -:  907:    { pred_ctime     ,  NeedsStatInfo,       },
+        -:  908:    { pred_delete    ,  NeedsSyncDiskHit     },
+        -:  909:    { pred_empty     ,  NeedsStatInfo        },
+        -:  910:    { pred_exec      ,  NeedsEventualExec    },
+        -:  911:    { pred_execdir   ,  NeedsEventualExec    },
+        -:  912:    { pred_executable,  NeedsAccessInfo      },
+        -:  913:    { pred_false     ,  NeedsNothing         }, 
+        -:  914:    { pred_fprint    ,  NeedsNothing         }, 
+        -:  915:    { pred_fprint0   ,  NeedsNothing         }, 
+        -:  916:    { pred_fprintf   ,  NeedsNothing         }, 
+        -:  917:    { pred_fstype    ,  NeedsStatInfo        }, /* true for amortised cost */
+        -:  918:    { pred_gid       ,  NeedsStatInfo        },
+        -:  919:    { pred_group     ,  NeedsStatInfo        },
+        -:  920:    { pred_ilname    ,  NeedsLinkName        },
+        -:  921:    { pred_iname     ,  NeedsNothing         },
+        -:  922:    { pred_inum      ,  NeedsStatInfo        },
+        -:  923:    { pred_ipath     ,  NeedsNothing         },
+        -:  924:    { pred_links     ,  NeedsStatInfo        },
+        -:  925:    { pred_lname     ,  NeedsLinkName        },
+        -:  926:    { pred_ls        ,  NeedsStatInfo        },
+        -:  927:    { pred_fls       ,  NeedsStatInfo        },
+        -:  928:    { pred_mmin	     ,  NeedsStatInfo        },
+        -:  929:    { pred_mtime     ,  NeedsStatInfo        },
+        -:  930:    { pred_name	     ,  NeedsNothing         },
+        -:  931:    { pred_negate    ,  NeedsNothing,        },
+        -:  932:    { pred_newer     ,  NeedsStatInfo,       },
+        -:  933:    { pred_newerXY   ,  NeedsStatInfo,       },
+        -:  934:    { pred_nogroup   ,  NeedsStatInfo        }, /* true for amortised cost if caching is on */
+        -:  935:    { pred_nouser    ,  NeedsStatInfo        }, /* true for amortised cost if caching is on */
+        -:  936:    { pred_ok        ,  NeedsUserInteraction },
+        -:  937:    { pred_okdir     ,  NeedsUserInteraction },
+        -:  938:    { pred_openparen ,  NeedsNothing         },
+        -:  939:    { pred_or        ,  NeedsNothing,        },
+        -:  940:    { pred_path	     ,  NeedsNothing         },
+        -:  941:    { pred_perm	     ,  NeedsStatInfo        },
+        -:  942:    { pred_print     ,  NeedsNothing         },
+        -:  943:    { pred_print0    ,  NeedsNothing         }, 
+        -:  944:    { pred_prune     ,  NeedsNothing         },
+        -:  945:    { pred_quit	     ,  NeedsNothing         },
+        -:  946:    { pred_readable  ,  NeedsAccessInfo      },
+        -:  947:    { pred_regex     ,  NeedsNothing         },
+        -:  948:    { pred_samefile  ,  NeedsStatInfo        },
+        -:  949:    { pred_size      ,  NeedsStatInfo        },
+        -:  950:    { pred_true	     ,  NeedsNothing         },
+        -:  951:    { pred_type      ,  NeedsType            },
+        -:  952:    { pred_uid       ,  NeedsStatInfo        },
+        -:  953:    { pred_used      ,  NeedsStatInfo        },
+        -:  954:    { pred_user      ,  NeedsStatInfo        },
+        -:  955:    { pred_writable  ,  NeedsAccessInfo      },
+        -:  956:    { pred_xtype     ,  NeedsType            } /* roughly correct unless most files are symlinks */
+        -:  957:  };
+        -:  958:static int pred_table_sorted = 0;
+        -:  959:
+        -:  960:static boolean
+        8:  961:check_sorted(void *base, size_t members, size_t membersize,
+        -:  962:	     int (*cmpfn)(const void*, const void*))
+        -:  963:{
+        8:  964:  const char *p = base;
+        -:  965:  size_t i;
+      464:  966:  for (i=1u; i<members; ++i)
+        -:  967:    {
+      456:  968:      int result = cmpfn(p+i*membersize, p+(i-1)*membersize);
+      456:  969:      if (result < 0)
+    #####:  970:	return false;
+      456:  971:      result = cmpfn(p+(i-1)*membersize, p+i*membersize);
+      456:  972:      assert (result <= 0);
+        -:  973:    }
+        8:  974:  return true;
+        -:  975:}
+        -:  976:
+        -:  977:
+        -:  978:static int
+     3272:  979:cost_table_comparison(const void *p1, const void *p2)
+        -:  980:{
+        -:  981:  /* We have to compare the function pointers with memcmp(), 
+        -:  982:   * because ISO C does not allow magnitude comparison of 
+        -:  983:   * function pointers (just equality testing).
+        -:  984:   */
+     3272:  985:  const struct pred_cost_lookup *pc1 = p1;
+     3272:  986:  const struct pred_cost_lookup *pc2 = p2;
+        -:  987:  union {
+        -:  988:    PRED_FUNC pfn;
+        -:  989:    char mem[sizeof (PRED_FUNC)];
+        -:  990:  } u1, u2;
+        -:  991:
+     3272:  992:  u1.pfn = pc1->fn;
+     3272:  993:  u2.pfn = pc2->fn;
+     3272:  994:  return memcmp(u1.mem, u2.mem, sizeof(u1.pfn));
+        -:  995:}
+        -:  996:
+        -:  997:static enum EvaluationCost
+       56:  998:get_pred_cost(const struct predicate *p)
+        -:  999:{
+       56: 1000:  enum EvaluationCost data_requirement_cost = NeedsNothing;
+       56: 1001:  enum EvaluationCost inherent_cost = NeedsUnknown;
+        -: 1002:
+       56: 1003:  if (p->need_stat)
+        -: 1004:    {
+    #####: 1005:      data_requirement_cost = NeedsStatInfo;
+        -: 1006:    }
+       56: 1007:  else if (p->need_type)
+        -: 1008:    {
+    #####: 1009:      data_requirement_cost = NeedsType;
+        -: 1010:    }
+        -: 1011:  else 
+        -: 1012:    {
+       56: 1013:      data_requirement_cost = NeedsNothing;
+        -: 1014:    }
+        -: 1015:  
+       56: 1016:  if (pred_is(p, pred_exec) || pred_is(p, pred_execdir))
+        -: 1017:    {
+    #####: 1018:      if (p->args.exec_vec.multiple)
+    #####: 1019:	inherent_cost = NeedsEventualExec;
+        -: 1020:      else
+    #####: 1021:	inherent_cost = NeedsImmediateExec;
+        -: 1022:    }
+       56: 1023:  else if (pred_is(p, pred_fprintf))
+        -: 1024:    {
+        -: 1025:      /* the parser calculated the cost for us. */
+    #####: 1026:      inherent_cost = p->p_cost;
+        -: 1027:    }
+        -: 1028:  else 
+        -: 1029:    {
+        -: 1030:      struct pred_cost_lookup key;
+        -: 1031:      void *entry;
+        -: 1032:
+       56: 1033:      if (!pred_table_sorted)
+        -: 1034:	{
+        8: 1035:	  qsort(costlookup,
+        -: 1036:		sizeof(costlookup)/sizeof(costlookup[0]),
+        -: 1037:		sizeof(costlookup[0]),
+        -: 1038:		cost_table_comparison);
+        -: 1039:
+        8: 1040:	  if (!check_sorted(costlookup,
+        -: 1041:			    sizeof(costlookup)/sizeof(costlookup[0]),
+        -: 1042:			    sizeof(costlookup[0]),
+        -: 1043:			    cost_table_comparison))
+        -: 1044:	    {
+    #####: 1045:	      error(1, 0, "Failed to sort the costlookup array (indirect).");
+        -: 1046:	    }
+        8: 1047:	  pred_table_sorted = 1;
+        -: 1048:	}
+       56: 1049:      key.fn = p->pred_func;
+       56: 1050:      entry = bsearch(&key, costlookup, 
+        -: 1051:		      sizeof(costlookup)/sizeof(costlookup[0]),
+        -: 1052:		      sizeof(costlookup[0]),
+        -: 1053:		      cost_table_comparison);
+       56: 1054:      if (entry)
+        -: 1055:	{
+       56: 1056:	  inherent_cost = ((const struct pred_cost_lookup*)entry)->cost;
+        -: 1057:	}
+        -: 1058:      else
+        -: 1059:	{
+    #####: 1060:	  error(0, 0, "warning: no cost entry for predicate %s", p->p_name);
+    #####: 1061:	  inherent_cost = NeedsUnknown;
+        -: 1062:	}
+        -: 1063:    }
+        -: 1064:
+       56: 1065:  if (inherent_cost > data_requirement_cost)
+    #####: 1066:    return inherent_cost;
+        -: 1067:  else
+       56: 1068:    return data_requirement_cost;
+        -: 1069:}
+        -: 1070:
+        -: 1071:static void
+      120: 1072:estimate_costs (struct predicate *tree)
+        -: 1073:{
+      120: 1074:  if (tree)
+        -: 1075:    {
+       56: 1076:      estimate_costs(tree->pred_right);
+       56: 1077:      estimate_costs(tree->pred_left);
+        -: 1078:      
+       56: 1079:      tree->p_cost = get_pred_cost(tree);
+        -: 1080:    }
+      120: 1081:}
+        -: 1082:
+        -: 1083:struct predicate*
+       32: 1084:get_eval_tree(void)
+        -: 1085:{
+       32: 1086:  return eval_tree;
+        -: 1087:}
+        -: 1088:
+        -: 1089:static float 
+      104: 1090:getrate(const struct predicate *p)
+        -: 1091:{
+      104: 1092:  if (p)
+       76: 1093:    return p->est_success_rate;
+        -: 1094:  else
+       28: 1095:    return 1.0f;
+        -: 1096:}
+        -: 1097:
+        -: 1098:
+        -: 1099:float 
+      112: 1100:calculate_derived_rates(struct predicate *p)
+        -: 1101:{
+      112: 1102:  assert (NULL != p);
+        -: 1103:
+      112: 1104:  if (p->pred_right)
+       52: 1105:    calculate_derived_rates(p->pred_right);
+      112: 1106:  if (p->pred_left)
+       24: 1107:    calculate_derived_rates(p->pred_left);
+        -: 1108:
+      112: 1109:  assert (p->p_type != CLOSE_PAREN);
+      112: 1110:  assert (p->p_type != OPEN_PAREN);
+        -: 1111:
+      112: 1112:  switch (p->p_type)
+        -: 1113:    {
+        -: 1114:    case NO_TYPE:
+    #####: 1115:      assert (NULL == p->pred_right);
+    #####: 1116:      assert (NULL == p->pred_left);
+    #####: 1117:      return p->est_success_rate;
+        -: 1118:      
+        -: 1119:    case PRIMARY_TYPE:
+       60: 1120:      assert (NULL == p->pred_right);
+       60: 1121:      assert (NULL == p->pred_left);
+       60: 1122:      return p->est_success_rate;
+        -: 1123:
+        -: 1124:    case UNI_OP:
+        -: 1125:      /* Unary operators must have exactly one operand */
+    #####: 1126:      assert (pred_is(p, pred_negate));
+    #####: 1127:      assert (NULL == p->pred_left);
+    #####: 1128:      p->est_success_rate = (1.0 - p->pred_right->est_success_rate);
+    #####: 1129:      return p->est_success_rate;
+        -: 1130:
+        -: 1131:    case BI_OP:
+        -: 1132:      {
+        -: 1133:	float rate;
+        -: 1134:	/* Binary operators must have two operands */
+       52: 1135:	if (pred_is(p, pred_and))
+        -: 1136:	  {
+       52: 1137:	    rate = getrate(p->pred_right) * getrate(p->pred_left);
+        -: 1138:	  }
+    #####: 1139:	else if (pred_is(p, pred_comma))
+        -: 1140:	  {
+    #####: 1141:	    rate = 1.0f;
+        -: 1142:	  }
+    #####: 1143:	else if (pred_is(p, pred_or))
+        -: 1144:	  {
+    #####: 1145:	    rate = getrate(p->pred_right) + getrate(p->pred_left);
+        -: 1146:	  }
+        -: 1147:	else
+        -: 1148:	  {
+        -: 1149:	    /* only and, or and comma are BI_OP. */
+    #####: 1150:	    assert (0);
+        -: 1151:	    abort ();
+        -: 1152:	  }
+       52: 1153:	p->est_success_rate = constrain_rate(rate);
+        -: 1154:      }
+       52: 1155:      return p->est_success_rate;
+        -: 1156:
+        -: 1157:    case OPEN_PAREN:
+        -: 1158:    case CLOSE_PAREN:
+    #####: 1159:      p->est_success_rate = 1.0;
+    #####: 1160:      return p->est_success_rate;
+        -: 1161:    }
+    #####: 1162:  assert (0);
+        -: 1163:  abort ();
+        -: 1164:}
+        -: 1165:
+        -: 1166:/* opt_expr() rearranges predicates such that each left subtree is
+        -: 1167: * rooted at a logical predicate (e.g. and or or).  check_normalization()
+        -: 1168: * asserts that this property still holds.
+        -: 1169: * 
+        -: 1170: */
+      128: 1171:static void check_normalization(struct predicate *p, boolean at_root)
+        -: 1172:{
+      128: 1173:  if (at_root)
+        -: 1174:    {
+       16: 1175:      assert (BI_OP == p->p_type);
+        -: 1176:    }
+        -: 1177:
+      128: 1178:  if (p->pred_left)
+        -: 1179:    {
+       48: 1180:      assert (BI_OP == p->pred_left->p_type);
+       48: 1181:      check_normalization(p->pred_left, false);
+        -: 1182:    }
+      128: 1183:  if (p->pred_right)
+        -: 1184:    {
+       64: 1185:      check_normalization(p->pred_right, false);
+        -: 1186:    }
+      128: 1187:}
+        -: 1188:
+        -: 1189:struct predicate*
+        9: 1190:build_expression_tree(int argc, char *argv[], int end_of_leading_options)
+        -: 1191:{
+        -: 1192:  const struct parser_table *parse_entry; /* Pointer to the parsing table entry for this expression. */
+        -: 1193:  char *predicate_name;		/* Name of predicate being parsed. */
+        -: 1194:  struct predicate *cur_pred;
+        -: 1195:  const struct parser_table *entry_close, *entry_print, *entry_open;
+        -: 1196:  int i, oldi;
+        -: 1197:
+        9: 1198:  predicates = NULL;
+        -: 1199:  
+        -: 1200:  /* Find where in ARGV the predicates begin by skipping the list of
+        -: 1201:   * start points.
+        -: 1202:   */
+        9: 1203:  for (i = end_of_leading_options; i < argc && !looks_like_expression(argv[i], true); i++)
+        -: 1204:    {
+        -: 1205:      /* Do nothing. */ ;
+        -: 1206:    }
+        -: 1207:  
+        -: 1208:  /* Enclose the expression in `( ... )' so a default -print will
+        -: 1209:     apply to the whole expression. */
+        9: 1210:  entry_open  = find_parser("(");
+        9: 1211:  entry_close = find_parser(")");
+        9: 1212:  entry_print = find_parser("print");
+        9: 1213:  assert (entry_open  != NULL);
+        9: 1214:  assert (entry_close != NULL);
+        9: 1215:  assert (entry_print != NULL);
+        -: 1216:  
+        9: 1217:  parse_openparen (entry_open, argv, &argc);
+        9: 1218:  last_pred->p_name = "(";
+        9: 1219:  predicates->artificial = true;
+        9: 1220:  parse_begin_user_args(argv, argc, last_pred, predicates);
+        9: 1221:  pred_sanity_check(last_pred);
+        -: 1222:  
+        -: 1223:  /* Build the input order list. */
+       50: 1224:  while (i < argc )
+        -: 1225:    {
+       33: 1226:      if (!looks_like_expression(argv[i], false))
+        -: 1227:	{
+    #####: 1228:	  error (0, 0, _("paths must precede expression: %s"), argv[i]);
+    #####: 1229:	  usage(stderr, 1, NULL);
+        -: 1230:	}
+        -: 1231:
+       33: 1232:      predicate_name = argv[i];
+       33: 1233:      parse_entry = find_parser (predicate_name);
+       33: 1234:      if (parse_entry == NULL)
+        -: 1235:	{
+        -: 1236:	  /* Command line option not recognized */
+    #####: 1237:	  error (1, 0, _("unknown predicate `%s'"), predicate_name);
+        -: 1238:	}
+        -: 1239:
+        -: 1240:      /* We have recognised a test of the form -foo.  Eat that, 
+        -: 1241:       * unless it is a predicate like -newerXY.
+        -: 1242:       */
+       33: 1243:      if (parse_entry->type != ARG_SPECIAL_PARSE)
+        -: 1244:	{
+       33: 1245:	  i++;
+        -: 1246:	}
+       33: 1247:      oldi = i;
+       33: 1248:      if (!(*(parse_entry->parser_func)) (parse_entry, argv, &i))
+        -: 1249:	{
+    #####: 1250:	  if (argv[i])
+        -: 1251:	    {
+    #####: 1252:	      if ( (ARG_SPECIAL_PARSE == parse_entry->type) && (i == oldi) )
+        -: 1253:		{
+        -: 1254:		  /* The special parse function spat out the
+        -: 1255:		   * predicate.  It must be invalid, or not tasty.
+        -: 1256:		   */
+    #####: 1257:		  error (1, 0, _("invalid predicate `%s'"),
+        -: 1258:			 predicate_name);
+        -: 1259:		}
+        -: 1260:	      else
+        -: 1261:		{
+    #####: 1262:		  error (1, 0, _("invalid argument `%s' to `%s'"),
+    #####: 1263:			 argv[i], predicate_name);
+        -: 1264:		}
+        -: 1265:	    }
+        -: 1266:	  else
+        -: 1267:	    {
+        -: 1268:	      /* Command line option requires an argument */
+    #####: 1269:	      error (1, 0, _("missing argument to `%s'"), predicate_name);
+        -: 1270:	    }
+        -: 1271:	}
+        -: 1272:      else
+        -: 1273:	{
+       32: 1274:	  last_pred->p_name = predicate_name;
+        -: 1275:	  
+        -: 1276:	  /* If the parser consumed an argument, save it. */
+       32: 1277:	  if (i != oldi)
+        8: 1278:	    last_pred->arg_text = argv[oldi];
+        -: 1279:	  else
+       24: 1280:	    last_pred->arg_text = NULL;
+        -: 1281:	}
+       32: 1282:      pred_sanity_check(last_pred);
+       32: 1283:      pred_sanity_check(predicates); /* XXX: expensive */
+        -: 1284:    }
+        8: 1285:  parse_end_user_args(argv, argc, last_pred, predicates);
+        8: 1286:  if (predicates->pred_next == NULL)
+        -: 1287:    {
+        -: 1288:      /* No predicates that do something other than set a global variable
+        -: 1289:	 were given; remove the unneeded initial `(' and add `-print'. */
+    #####: 1290:      cur_pred = predicates;
+    #####: 1291:      predicates = last_pred = predicates->pred_next;
+    #####: 1292:      free (cur_pred);
+    #####: 1293:      parse_print (entry_print, argv, &argc);
+    #####: 1294:      last_pred->p_name = "-print";
+    #####: 1295:      pred_sanity_check(last_pred); 
+    #####: 1296:      pred_sanity_check(predicates); /* XXX: expensive */
+        -: 1297:    }
+        8: 1298:  else if (!default_prints (predicates->pred_next))
+        -: 1299:    {
+        -: 1300:      /* One or more predicates that produce output were given;
+        -: 1301:	 remove the unneeded initial `('. */
+        8: 1302:      cur_pred = predicates;
+        8: 1303:      predicates = predicates->pred_next;
+        8: 1304:      pred_sanity_check(predicates); /* XXX: expensive */
+        8: 1305:      free (cur_pred);
+        -: 1306:    }
+        -: 1307:  else
+        -: 1308:    {
+        -: 1309:      /* `( user-supplied-expression ) -print'. */
+    #####: 1310:      parse_closeparen (entry_close, argv, &argc);
+    #####: 1311:      last_pred->p_name = ")";
+    #####: 1312:      last_pred->artificial = true;
+    #####: 1313:      pred_sanity_check(last_pred);
+    #####: 1314:      parse_print (entry_print, argv, &argc);
+    #####: 1315:      last_pred->p_name = "-print";
+    #####: 1316:      last_pred->artificial = true;
+    #####: 1317:      pred_sanity_check(last_pred);
+    #####: 1318:      pred_sanity_check(predicates); /* XXX: expensive */
+        -: 1319:    }
+        -: 1320:
+        8: 1321:  if (options.debug_options & (DebugExpressionTree|DebugTreeOpt))
+        -: 1322:    {
+    #####: 1323:      fprintf (stderr, "Predicate List:\n");
+    #####: 1324:      print_list (stderr, predicates);
+        -: 1325:    }
+        -: 1326:  
+        -: 1327:  /* do a sanity check */
+        8: 1328:  check_option_combinations(predicates);
+        8: 1329:  pred_sanity_check(predicates);
+        -: 1330:  
+        -: 1331:  /* Done parsing the predicates.  Build the evaluation tree. */
+        8: 1332:  cur_pred = predicates;
+        8: 1333:  eval_tree = get_expr (&cur_pred, NO_PREC, NULL);
+        8: 1334:  calculate_derived_rates(eval_tree);
+        -: 1335:  
+        -: 1336:  /* Check if we have any left-over predicates (this fixes
+        -: 1337:   * Debian bug #185202).
+        -: 1338:   */
+        8: 1339:  if (cur_pred != NULL)
+        -: 1340:    {
+        -: 1341:      /* cur_pred->p_name is often NULL here */
+    #####: 1342:      if (pred_is(cur_pred, pred_closeparen))
+        -: 1343:	{
+        -: 1344:	  /* e.g. "find \( -true \) \)" */
+    #####: 1345:	  error (1, 0, _("you have too many ')'"));
+        -: 1346:	}
+        -: 1347:      else
+        -: 1348:	{
+    #####: 1349:	  if (cur_pred->p_name)
+    #####: 1350:	    error (1, 0, _("unexpected extra predicate '%s'"), cur_pred->p_name);
+        -: 1351:	  else
+    #####: 1352:	    error (1, 0, _("unexpected extra predicate"));
+        -: 1353:	}
+        -: 1354:    }
+        -: 1355:  
+        8: 1356:  if (options.debug_options & (DebugExpressionTree|DebugTreeOpt))
+        -: 1357:    {
+    #####: 1358:      fprintf (stderr, "Eval Tree:\n");
+    #####: 1359:      print_tree (stderr, eval_tree, 0);
+        -: 1360:    }
+        -: 1361:
+        8: 1362:  estimate_costs(eval_tree);
+        -: 1363:  
+        -: 1364:  /* Rearrange the eval tree in optimal-predicate order. */
+        8: 1365:  opt_expr (&eval_tree);
+        -: 1366:
+        -: 1367:  /* Check that the tree is in normalised order (opt_expr does this) */
+        8: 1368:  check_normalization(eval_tree, true);
+        -: 1369:  
+        8: 1370:  do_arm_swaps(eval_tree);
+        -: 1371:  
+        -: 1372:  /* Check that the tree is still in normalised order */
+        8: 1373:  check_normalization(eval_tree, true);
+        -: 1374:
+        8: 1375:  if (options.debug_options & (DebugExpressionTree|DebugTreeOpt))
+        -: 1376:    {
+    #####: 1377:      fprintf (stderr, "Optimized Eval Tree:\n");
+    #####: 1378:      print_tree (stderr, eval_tree, 0);
+    #####: 1379:      fprintf (stderr, "Optimized command line:\n");
+    #####: 1380:      print_optlist(stderr, eval_tree);
+    #####: 1381:      fprintf(stderr, "\n");
+        -: 1382:    }
+        -: 1383:
+        8: 1384:  return eval_tree;
+        -: 1385:}
+        -: 1386:
+        -: 1387:/* Initialise the performance data for a predicate. 
+        -: 1388: */
+        -: 1389:static void
+       65: 1390:init_pred_perf(struct predicate *pred)
+        -: 1391:{
+       65: 1392:  struct predicate_performance_info *p = &pred->perf;
+       65: 1393:  p->visits = p->successes = 0;
+       65: 1394:}
+        -: 1395:
+        -: 1396:
+        -: 1397:/* Return a pointer to a new predicate structure, which has been
+        -: 1398:   linked in as the last one in the predicates list.
+        -: 1399:
+        -: 1400:   Set `predicates' to point to the start of the predicates list.
+        -: 1401:   Set `last_pred' to point to the new last predicate in the list.
+        -: 1402:   
+        -: 1403:   Set all cells in the new structure to the default values. */
+        -: 1404:
+        -: 1405:struct predicate *
+       65: 1406:get_new_pred (const struct parser_table *entry)
+        -: 1407:{
+        -: 1408:  register struct predicate *new_pred;
+        -: 1409:  (void) entry;
+        -: 1410:
+        -: 1411:  /* Options should not be turned into predicates. */
+       65: 1412:  assert (entry->type != ARG_OPTION);
+       65: 1413:  assert (entry->type != ARG_POSITIONAL_OPTION);
+        -: 1414:  
+       65: 1415:  if (predicates == NULL)
+        -: 1416:    {
+        9: 1417:      predicates = (struct predicate *)
+        9: 1418:	xmalloc (sizeof (struct predicate));
+        9: 1419:      last_pred = predicates;
+        -: 1420:    }
+        -: 1421:  else
+        -: 1422:    {
+       56: 1423:      new_pred = xmalloc (sizeof (struct predicate));
+       56: 1424:      last_pred->pred_next = new_pred;
+       56: 1425:      last_pred = new_pred;
+        -: 1426:    }
+       65: 1427:  last_pred->parser_entry = entry;
+       65: 1428:  last_pred->pred_func = NULL;
+       65: 1429:  last_pred->p_name = NULL;
+       65: 1430:  last_pred->p_type = NO_TYPE;
+       65: 1431:  last_pred->p_prec = NO_PREC;
+       65: 1432:  last_pred->side_effects = false;
+       65: 1433:  last_pred->no_default_print = false;
+       65: 1434:  last_pred->need_stat = true;
+       65: 1435:  last_pred->need_type = true;
+       65: 1436:  last_pred->args.str = NULL;
+       65: 1437:  last_pred->pred_next = NULL;
+       65: 1438:  last_pred->pred_left = NULL;
+       65: 1439:  last_pred->pred_right = NULL;
+       65: 1440:  last_pred->literal_control_chars = options.literal_control_chars;
+       65: 1441:  last_pred->artificial = false;
+       65: 1442:  last_pred->est_success_rate = 1.0;
+       65: 1443:  init_pred_perf(last_pred);
+       65: 1444:  return last_pred;
+        -: 1445:}
+        -: 1446:
+        -: 1447:/* Return a pointer to a new predicate, with operator check.
+        -: 1448:   Like get_new_pred, but it checks to make sure that the previous
+        -: 1449:   predicate is an operator.  If it isn't, the AND operator is inserted. */
+        -: 1450:
+        -: 1451:struct predicate *
+       41: 1452:get_new_pred_chk_op (const struct parser_table *entry)
+        -: 1453:{
+        -: 1454:  struct predicate *new_pred;
+        -: 1455:  static const struct parser_table *entry_and = NULL;
+        -: 1456:
+        -: 1457:  /* Locate the entry in the parser table for the "and" operator */
+       41: 1458:  if (NULL == entry_and)
+        9: 1459:    entry_and = find_parser("and");
+        -: 1460:
+        -: 1461:  /* Check that it's actually there. If not, that is a bug.*/
+       41: 1462:  assert (entry_and != NULL);	
+        -: 1463:
+       41: 1464:  if (last_pred)
+       32: 1465:    switch (last_pred->p_type)
+        -: 1466:      {
+        -: 1467:      case NO_TYPE:
+    #####: 1468:	error (1, 0, _("oops -- invalid default insertion of and!"));
+    #####: 1469:	break;
+        -: 1470:
+        -: 1471:      case PRIMARY_TYPE:
+        -: 1472:      case CLOSE_PAREN:
+        -: 1473:	/* We need to interpose the and operator. */
+       24: 1474:	new_pred = get_new_pred (entry_and);
+       24: 1475:	new_pred->pred_func = pred_and;
+       24: 1476:	new_pred->p_name = "-a";
+       24: 1477:	new_pred->p_type = BI_OP;
+       24: 1478:	new_pred->p_prec = AND_PREC;
+       24: 1479:	new_pred->need_stat = false;
+       24: 1480:	new_pred->need_type = false;
+       24: 1481:	new_pred->args.str = NULL;
+       24: 1482:	new_pred->side_effects = false;
+       24: 1483:	new_pred->no_default_print = false;
+       24: 1484:	break;
+        -: 1485:
+        -: 1486:      default:
+        8: 1487:	break;
+        -: 1488:      }
+        -: 1489:  
+       41: 1490:  new_pred = get_new_pred (entry);
+       41: 1491:  new_pred->parser_entry = entry;
+       41: 1492:  return new_pred;
+        -: 1493:}
+        -: 1494:
+        -: 1495:struct cost_assoc
+        -: 1496:{
+        -: 1497:  enum EvaluationCost cost;
+        -: 1498:  char *name;
+        -: 1499:};
+        -: 1500:struct cost_assoc cost_table[] = 
+        -: 1501:  {
+        -: 1502:    { NeedsNothing,         "Nothing" },
+        -: 1503:    { NeedsType,	    "Type" },
+        -: 1504:    { NeedsStatInfo,	    "StatInfo" },
+        -: 1505:    { NeedsLinkName,	    "LinkName" },
+        -: 1506:    { NeedsAccessInfo,	    "AccessInfo" },
+        -: 1507:    { NeedsSyncDiskHit,	    "SyncDiskHit" },
+        -: 1508:    { NeedsEventualExec,    "EventualExec" },
+        -: 1509:    { NeedsImmediateExec,   "ImmediateExec" },
+        -: 1510:    { NeedsUserInteraction, "UserInteraction" },
+        -: 1511:    { NeedsUnknown,	    "Unknown" }
+        -: 1512:  };
+        -: 1513:
+        -: 1514:struct prec_assoc
+        -: 1515:{
+        -: 1516:  short prec;
+        -: 1517:  char *prec_name;
+        -: 1518:};
+        -: 1519:
+        -: 1520:static struct prec_assoc prec_table[] =
+        -: 1521:{
+        -: 1522:  {NO_PREC, "no"},
+        -: 1523:  {COMMA_PREC, "comma"},
+        -: 1524:  {OR_PREC, "or"},
+        -: 1525:  {AND_PREC, "and"},
+        -: 1526:  {NEGATE_PREC, "negate"},
+        -: 1527:  {MAX_PREC, "max"},
+        -: 1528:  {-1, "unknown "}
+        -: 1529:};
+        -: 1530:
+        -: 1531:struct op_assoc
+        -: 1532:{
+        -: 1533:  short type;
+        -: 1534:  char *type_name;
+        -: 1535:};
+        -: 1536:
+        -: 1537:static struct op_assoc type_table[] =
+        -: 1538:{
+        -: 1539:  {NO_TYPE,      "no"},
+        -: 1540:  {PRIMARY_TYPE, "primary"},
+        -: 1541:  {UNI_OP,       "uni_op"},
+        -: 1542:  {BI_OP,        "bi_op"},
+        -: 1543:  {OPEN_PAREN,   "open_paren  "},
+        -: 1544:  {CLOSE_PAREN,  "close_paren "},
+        -: 1545:  {-1,           "unknown"}
+        -: 1546:};
+        -: 1547:
+        -: 1548:static const char *
+    #####: 1549:cost_name (enum EvaluationCost cost)
+        -: 1550:{
+        -: 1551:  unsigned int i;
+    #####: 1552:  unsigned int n = sizeof(cost_table)/sizeof(cost_table[0]);
+        -: 1553:  
+    #####: 1554:  for (i = 0; i<n; ++i)
+    #####: 1555:    if (cost_table[i].cost == cost)
+    #####: 1556:      return cost_table[i].name;
+    #####: 1557:  return "unknown";
+        -: 1558:}
+        -: 1559:
+        -: 1560:
+        -: 1561:static char *
+    #####: 1562:type_name (type)
+        -: 1563:     short type;
+        -: 1564:{
+        -: 1565:  int i;
+        -: 1566:
+    #####: 1567:  for (i = 0; type_table[i].type != (short) -1; i++)
+    #####: 1568:    if (type_table[i].type == type)
+    #####: 1569:      break;
+    #####: 1570:  return (type_table[i].type_name);
+        -: 1571:}
+        -: 1572:
+        -: 1573:static char *
+    #####: 1574:prec_name (prec)
+        -: 1575:     short prec;
+        -: 1576:{
+        -: 1577:  int i;
+        -: 1578:
+    #####: 1579:  for (i = 0; prec_table[i].prec != (short) -1; i++)
+    #####: 1580:    if (prec_table[i].prec == prec)
+    #####: 1581:      break;
+    #####: 1582:  return (prec_table[i].prec_name);
+        -: 1583:}
+        -: 1584:
+        -: 1585:
+        -: 1586:/* Walk the expression tree NODE to stdout.
+        -: 1587:   INDENT is the number of levels to indent the left margin. */
+        -: 1588:
+        -: 1589:void
+    #####: 1590:print_tree (FILE *fp, struct predicate *node, int indent)
+        -: 1591:{
+        -: 1592:  int i;
+        -: 1593:
+    #####: 1594:  if (node == NULL)
+    #####: 1595:    return;
+    #####: 1596:  for (i = 0; i < indent; i++)
+    #####: 1597:    fprintf (fp, "    ");
+    #####: 1598:  fprintf (fp, "pred=[");
+    #####: 1599:  print_predicate(fp, node);
+    #####: 1600:  fprintf (fp, "] type=%s prec=%s",
+    #####: 1601:	  type_name (node->p_type), prec_name (node->p_prec));
+    #####: 1602:  fprintf (fp, " cost=%s rate=%#03.2g %sside effects ",
+        -: 1603:	   cost_name(node->p_cost),
+    #####: 1604:	   node->est_success_rate,
+    #####: 1605:	   (node->side_effects ? "" : "no "));
+        -: 1606:  
+    #####: 1607:  if (node->need_stat || node->need_type)
+        -: 1608:    {
+    #####: 1609:      int comma = 0;
+        -: 1610:      
+    #####: 1611:      fprintf (fp, "Needs ");
+    #####: 1612:      if (node->need_stat)
+        -: 1613:	{
+    #####: 1614:	  fprintf (fp, "stat");
+    #####: 1615:	  comma = 1;
+        -: 1616:	}
+    #####: 1617:      if (node->need_type)
+        -: 1618:	{
+    #####: 1619:	  fprintf (fp, "%stype", comma ? "," : "");
+        -: 1620:	}
+        -: 1621:    }
+    #####: 1622:  fprintf (fp, "\n");
+        -: 1623:
+        -: 1624:
+    #####: 1625:  for (i = 0; i < indent; i++)
+    #####: 1626:    fprintf (fp, "    ");
+    #####: 1627:  if (NULL == node->pred_left && NULL == node->pred_right)
+        -: 1628:    {
+    #####: 1629:      fprintf (fp, "no children.\n");
+        -: 1630:    }
+        -: 1631:  else
+        -: 1632:    {
+    #####: 1633:      if (node->pred_left)
+        -: 1634:	{
+    #####: 1635:	  fprintf (fp, "left:\n");
+    #####: 1636:	  print_tree (fp, node->pred_left, indent + 1);
+        -: 1637:	}
+        -: 1638:      else 
+        -: 1639:	{
+    #####: 1640:	  fprintf (fp, "no left.\n");
+        -: 1641:	}
+        -: 1642:      
+    #####: 1643:      for (i = 0; i < indent; i++)
+    #####: 1644:	fprintf (fp, "    ");
+    #####: 1645:      if (node->pred_right)
+        -: 1646:	{
+    #####: 1647:	  fprintf (fp, "right:\n");
+    #####: 1648:	  print_tree (fp, node->pred_right, indent + 1);
+        -: 1649:	}
+        -: 1650:      else
+        -: 1651:	{
+    #####: 1652:	  fprintf (fp, "no right.\n");
+        -: 1653:	}
+        -: 1654:    }
+        -: 1655:}

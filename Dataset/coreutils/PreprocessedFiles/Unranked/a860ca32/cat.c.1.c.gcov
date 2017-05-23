@@ -1,0 +1,792 @@
+        -:    0:Source:cat.c
+        -:    0:Graph:cat.gcno
+        -:    0:Data:cat.gcda
+        -:    0:Runs:2
+        -:    0:Programs:1
+        -:    1:/* cat -- concatenate files and print on the standard output.
+        -:    2:   Copyright (C) 88, 90, 91, 1995-2006 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Differences from the Unix cat:
+        -:   18:   * Always unbuffered, -u is ignored.
+        -:   19:   * Usually much faster than other versions of cat, the difference
+        -:   20:   is especially apparent when using the -v option.
+        -:   21:
+        -:   22:   By tege@sics.se, Torbjorn Granlund, advised by rms, Richard Stallman.  */
+        -:   23:
+        -:   24:#include <config.h>
+        -:   25:
+        -:   26:#include <stdio.h>
+        -:   27:#include <getopt.h>
+        -:   28:#include <sys/types.h>
+        -:   29:
+        -:   30:#if HAVE_STROPTS_H
+        -:   31:# include <stropts.h>
+        -:   32:#endif
+        -:   33:#if HAVE_SYS_IOCTL_H
+        -:   34:# include <sys/ioctl.h>
+        -:   35:#endif
+        -:   36:
+        -:   37:#include "system.h"
+        -:   38:#include "error.h"
+        -:   39:#include "full-write.h"
+        -:   40:#include "getpagesize.h"
+        -:   41:#include "quote.h"
+        -:   42:#include "safe-read.h"
+        -:   43:
+        -:   44:/* The official name of this program (e.g., no `g' prefix).  */
+        -:   45:#define PROGRAM_NAME "cat"
+        -:   46:
+        -:   47:#define AUTHORS "Torbjorn Granlund", "Richard M. Stallman"
+        -:   48:
+        -:   49:/* Undefine, to avoid warning about redefinition on some systems.  */
+        -:   50:#undef max
+        -:   51:#define max(h,i) ((h) > (i) ? (h) : (i))
+        -:   52:
+        -:   53:/* Name under which this program was invoked.  */
+        -:   54:char *program_name;
+        -:   55:
+        -:   56:/* Name of input file.  May be "-".  */
+        -:   57:static char const *infile;
+        -:   58:
+        -:   59:/* Descriptor on which input file is open.  */
+        -:   60:static int input_desc;
+        -:   61:
+        -:   62:/* Buffer for line numbers.
+        -:   63:   An 11 digit counter may overflow within an hour on a P2/466,
+        -:   64:   an 18 digit counter needs about 1000y */
+        -:   65:#define LINE_COUNTER_BUF_LEN 20
+        -:   66:static char line_buf[LINE_COUNTER_BUF_LEN] =
+        -:   67:  {
+        -:   68:    ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+        -:   69:    ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', '0',
+        -:   70:    '\t', '\0'
+        -:   71:  };
+        -:   72:
+        -:   73:/* Position in `line_buf' where printing starts.  This will not change
+        -:   74:   unless the number of lines is larger than 999999.  */
+        -:   75:static char *line_num_print = line_buf + LINE_COUNTER_BUF_LEN - 8;
+        -:   76:
+        -:   77:/* Position of the first digit in `line_buf'.  */
+        -:   78:static char *line_num_start = line_buf + LINE_COUNTER_BUF_LEN - 3;
+        -:   79:
+        -:   80:/* Position of the last digit in `line_buf'.  */
+        -:   81:static char *line_num_end = line_buf + LINE_COUNTER_BUF_LEN - 3;
+        -:   82:
+        -:   83:/* Preserves the `cat' function's local `newlines' between invocations.  */
+        -:   84:static int newlines2 = 0;
+        -:   85:
+        -:   86:void
+    #####:   87:usage (int status)
+        -:   88:{
+    #####:   89:  if (status != EXIT_SUCCESS)
+    #####:   90:    fprintf (stderr, _("Try `%s --help' for more information.\n"),
+        -:   91:	     program_name);
+        -:   92:  else
+        -:   93:    {
+    #####:   94:      printf (_("\
+        -:   95:Usage: %s [OPTION] [FILE]...\n\
+        -:   96:"),
+        -:   97:	      program_name);
+    #####:   98:      fputs (_("\
+        -:   99:Concatenate FILE(s), or standard input, to standard output.\n\
+        -:  100:\n\
+        -:  101:  -A, --show-all           equivalent to -vET\n\
+        -:  102:  -b, --number-nonblank    number nonempty output lines\n\
+        -:  103:  -e                       equivalent to -vE\n\
+        -:  104:  -E, --show-ends          display $ at end of each line\n\
+        -:  105:  -n, --number             number all output lines\n\
+        -:  106:  -s, --squeeze-blank      suppress repeated empty output lines\n\
+        -:  107:"), stdout);
+    #####:  108:      fputs (_("\
+        -:  109:  -t                       equivalent to -vT\n\
+        -:  110:  -T, --show-tabs          display TAB characters as ^I\n\
+        -:  111:  -u                       (ignored)\n\
+        -:  112:  -v, --show-nonprinting   use ^ and M- notation, except for LFD and TAB\n\
+        -:  113:"), stdout);
+    #####:  114:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  115:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  116:      fputs (_("\
+        -:  117:\n\
+        -:  118:With no FILE, or when FILE is -, read standard input.\n\
+        -:  119:"), stdout);
+    #####:  120:      printf (_("\
+        -:  121:\n\
+        -:  122:Examples:\n\
+        -:  123:  %s f - g  Output f's contents, then standard input, then g's contents.\n\
+        -:  124:  %s        Copy standard input to standard output.\n\
+        -:  125:"),
+        -:  126:	      program_name, program_name);
+    #####:  127:      emit_bug_reporting_address ();
+        -:  128:    }
+    #####:  129:  exit (status);
+        -:  130:}
+        -:  131:
+        -:  132:/* Compute the next line number.  */
+        -:  133:
+        -:  134:static void
+    #####:  135:next_line_num (void)
+        -:  136:{
+    #####:  137:  char *endp = line_num_end;
+        -:  138:  do
+        -:  139:    {
+    #####:  140:      if ((*endp)++ < '9')
+    #####:  141:	return;
+    #####:  142:      *endp-- = '0';
+        -:  143:    }
+    #####:  144:  while (endp >= line_num_start);
+    #####:  145:  if (line_num_start > line_buf)
+    #####:  146:    *--line_num_start = '1';
+        -:  147:  else
+    #####:  148:    *line_buf = '>';
+    #####:  149:  if (line_num_start < line_num_print)
+    #####:  150:    line_num_print--;
+        -:  151:}
+        -:  152:
+        -:  153:/* Plain cat.  Copies the file behind `input_desc' to STDOUT_FILENO.
+        -:  154:   Return true if successful.  */
+        -:  155:
+        -:  156:static bool
+        4:  157:simple_cat (
+        -:  158:     /* Pointer to the buffer, used by reads and writes.  */
+        -:  159:     char *buf,
+        -:  160:
+        -:  161:     /* Number of characters preferably read or written by each read and write
+        -:  162:        call.  */
+        -:  163:     size_t bufsize)
+        -:  164:{
+        -:  165:  /* Actual number of characters read, and therefore written.  */
+        -:  166:  size_t n_read;
+        -:  167:
+        -:  168:  /* Loop until the end of the file.  */
+        -:  169:
+        -:  170:  for (;;)
+        -:  171:    {
+        -:  172:      /* Read a block of input.  */
+        -:  173:
+        4:  174:      n_read = safe_read (input_desc, buf, bufsize);
+        4:  175:      if (n_read == SAFE_READ_ERROR)
+        -:  176:	{
+    #####:  177:	  error (0, errno, "%s", infile);
+    #####:  178:	  return false;
+        -:  179:	}
+        -:  180:
+        -:  181:      /* End of this file?  */
+        -:  182:
+        4:  183:      if (n_read == 0)
+        2:  184:	return true;
+        -:  185:
+        -:  186:      /* Write this block out.  */
+        -:  187:
+        -:  188:      {
+        -:  189:	/* The following is ok, since we know that 0 < n_read.  */
+        2:  190:	size_t n = n_read;
+        2:  191:	if (full_write (STDOUT_FILENO, buf, n) != n)
+    #####:  192:	  error (EXIT_FAILURE, errno, _("write error"));
+        -:  193:      }
+        2:  194:    }
+        -:  195:}
+        -:  196:
+        -:  197:/* Write any pending output to STDOUT_FILENO.
+        -:  198:   Pending is defined to be the *BPOUT - OUTBUF bytes starting at OUTBUF.
+        -:  199:   Then set *BPOUT to OUTPUT if it's not already that value.  */
+        -:  200:
+        -:  201:static inline void
+    #####:  202:write_pending (char *outbuf, char **bpout)
+        -:  203:{
+    #####:  204:  size_t n_write = *bpout - outbuf;
+    #####:  205:  if (0 < n_write)
+        -:  206:    {
+    #####:  207:      if (full_write (STDOUT_FILENO, outbuf, n_write) != n_write)
+    #####:  208:        error (EXIT_FAILURE, errno, _("write error"));
+    #####:  209:      *bpout = outbuf;
+        -:  210:    }
+    #####:  211:}
+        -:  212:
+        -:  213:/* Cat the file behind INPUT_DESC to the file behind OUTPUT_DESC.
+        -:  214:   Return true if successful.
+        -:  215:   Called if any option more than -u was specified.
+        -:  216:
+        -:  217:   A newline character is always put at the end of the buffer, to make
+        -:  218:   an explicit test for buffer end unnecessary.  */
+        -:  219:
+        -:  220:static bool
+    #####:  221:cat (
+        -:  222:     /* Pointer to the beginning of the input buffer.  */
+        -:  223:     char *inbuf,
+        -:  224:
+        -:  225:     /* Number of characters read in each read call.  */
+        -:  226:     size_t insize,
+        -:  227:
+        -:  228:     /* Pointer to the beginning of the output buffer.  */
+        -:  229:     char *outbuf,
+        -:  230:
+        -:  231:     /* Number of characters written by each write call.  */
+        -:  232:     size_t outsize,
+        -:  233:
+        -:  234:     /* Variables that have values according to the specified options.  */
+        -:  235:     bool show_nonprinting,
+        -:  236:     bool show_tabs,
+        -:  237:     bool number,
+        -:  238:     bool number_nonblank,
+        -:  239:     bool show_ends,
+        -:  240:     bool squeeze_blank)
+        -:  241:{
+        -:  242:  /* Last character read from the input buffer.  */
+        -:  243:  unsigned char ch;
+        -:  244:
+        -:  245:  /* Pointer to the next character in the input buffer.  */
+        -:  246:  char *bpin;
+        -:  247:
+        -:  248:  /* Pointer to the first non-valid byte in the input buffer, i.e. the
+        -:  249:     current end of the buffer.  */
+        -:  250:  char *eob;
+        -:  251:
+        -:  252:  /* Pointer to the position where the next character shall be written.  */
+        -:  253:  char *bpout;
+        -:  254:
+        -:  255:  /* Number of characters read by the last read call.  */
+        -:  256:  size_t n_read;
+        -:  257:
+        -:  258:  /* Determines how many consecutive newlines there have been in the
+        -:  259:     input.  0 newlines makes NEWLINES -1, 1 newline makes NEWLINES 1,
+        -:  260:     etc.  Initially 0 to indicate that we are at the beginning of a
+        -:  261:     new line.  The "state" of the procedure is determined by
+        -:  262:     NEWLINES.  */
+    #####:  263:  int newlines = newlines2;
+        -:  264:
+        -:  265:#ifdef FIONREAD
+        -:  266:  /* If nonzero, use the FIONREAD ioctl, as an optimization.
+        -:  267:     (On Ultrix, it is not supported on NFS file systems.)  */
+    #####:  268:  bool use_fionread = true;
+        -:  269:#endif
+        -:  270:
+        -:  271:  /* The inbuf pointers are initialized so that BPIN > EOB, and thereby input
+        -:  272:     is read immediately.  */
+        -:  273:
+    #####:  274:  eob = inbuf;
+    #####:  275:  bpin = eob + 1;
+        -:  276:
+    #####:  277:  bpout = outbuf;
+        -:  278:
+        -:  279:  for (;;)
+        -:  280:    {
+        -:  281:      do
+        -:  282:	{
+        -:  283:	  /* Write if there are at least OUTSIZE bytes in OUTBUF.  */
+        -:  284:
+    #####:  285:	  if (outbuf + outsize <= bpout)
+        -:  286:	    {
+    #####:  287:	      char *wp = outbuf;
+        -:  288:	      size_t remaining_bytes;
+        -:  289:	      do
+        -:  290:		{
+    #####:  291:		  if (full_write (STDOUT_FILENO, wp, outsize) != outsize)
+    #####:  292:		    error (EXIT_FAILURE, errno, _("write error"));
+    #####:  293:		  wp += outsize;
+    #####:  294:		  remaining_bytes = bpout - wp;
+        -:  295:		}
+    #####:  296:	      while (outsize <= remaining_bytes);
+        -:  297:
+        -:  298:	      /* Move the remaining bytes to the beginning of the
+        -:  299:		 buffer.  */
+        -:  300:
+    #####:  301:	      memmove (outbuf, wp, remaining_bytes);
+    #####:  302:	      bpout = outbuf + remaining_bytes;
+        -:  303:	    }
+        -:  304:
+        -:  305:	  /* Is INBUF empty?  */
+        -:  306:
+    #####:  307:	  if (bpin > eob)
+        -:  308:	    {
+    #####:  309:	      bool input_pending = false;
+        -:  310:#ifdef FIONREAD
+    #####:  311:	      int n_to_read = 0;
+        -:  312:
+        -:  313:	      /* Is there any input to read immediately?
+        -:  314:		 If not, we are about to wait,
+        -:  315:		 so write all buffered output before waiting.  */
+        -:  316:
+    #####:  317:	      if (use_fionread
+    #####:  318:		  && ioctl (input_desc, FIONREAD, &n_to_read) < 0)
+        -:  319:		{
+        -:  320:		  /* Ultrix returns EOPNOTSUPP on NFS;
+        -:  321:		     HP-UX returns ENOTTY on pipes.
+        -:  322:		     SunOS returns EINVAL and
+        -:  323:		     More/BSD returns ENODEV on special files
+        -:  324:		     like /dev/null.
+        -:  325:		     Irix-5 returns ENOSYS on pipes.  */
+    #####:  326:		  if (errno == EOPNOTSUPP || errno == ENOTTY
+    #####:  327:		      || errno == EINVAL || errno == ENODEV
+    #####:  328:		      || errno == ENOSYS)
+    #####:  329:		    use_fionread = false;
+        -:  330:		  else
+        -:  331:		    {
+    #####:  332:		      error (0, errno, _("cannot do ioctl on %s"), quote (infile));
+    #####:  333:		      newlines2 = newlines;
+    #####:  334:		      return false;
+        -:  335:		    }
+        -:  336:		}
+    #####:  337:	      if (n_to_read != 0)
+    #####:  338:		input_pending = true;
+        -:  339:#endif
+        -:  340:
+    #####:  341:	      if (input_pending)
+    #####:  342:		write_pending (outbuf, &bpout);
+        -:  343:
+        -:  344:	      /* Read more input into INBUF.  */
+        -:  345:
+    #####:  346:	      n_read = safe_read (input_desc, inbuf, insize);
+    #####:  347:	      if (n_read == SAFE_READ_ERROR)
+        -:  348:		{
+    #####:  349:		  error (0, errno, "%s", infile);
+    #####:  350:		  write_pending (outbuf, &bpout);
+    #####:  351:		  newlines2 = newlines;
+    #####:  352:		  return false;
+        -:  353:		}
+    #####:  354:	      if (n_read == 0)
+        -:  355:		{
+    #####:  356:		  write_pending (outbuf, &bpout);
+    #####:  357:		  newlines2 = newlines;
+    #####:  358:		  return true;
+        -:  359:		}
+        -:  360:
+        -:  361:	      /* Update the pointers and insert a sentinel at the buffer
+        -:  362:		 end.  */
+        -:  363:
+    #####:  364:	      bpin = inbuf;
+    #####:  365:	      eob = bpin + n_read;
+    #####:  366:	      *eob = '\n';
+        -:  367:	    }
+        -:  368:	  else
+        -:  369:	    {
+        -:  370:	      /* It was a real (not a sentinel) newline.  */
+        -:  371:
+        -:  372:	      /* Was the last line empty?
+        -:  373:		 (i.e. have two or more consecutive newlines been read?)  */
+        -:  374:
+    #####:  375:	      if (++newlines > 0)
+        -:  376:		{
+    #####:  377:		  if (newlines >= 2)
+        -:  378:		    {
+        -:  379:		      /* Limit this to 2 here.  Otherwise, with lots of
+        -:  380:			 consecutive newlines, the counter could wrap
+        -:  381:			 around at INT_MAX.  */
+    #####:  382:		      newlines = 2;
+        -:  383:
+        -:  384:		      /* Are multiple adjacent empty lines to be substituted
+        -:  385:			 by single ditto (-s), and this was the second empty
+        -:  386:			 line?  */
+    #####:  387:		      if (squeeze_blank)
+        -:  388:			{
+    #####:  389:			  ch = *bpin++;
+    #####:  390:			  continue;
+        -:  391:			}
+        -:  392:		    }
+        -:  393:
+        -:  394:		  /* Are line numbers to be written at empty lines (-n)?  */
+        -:  395:
+    #####:  396:		  if (number & !number_nonblank)
+        -:  397:		    {
+    #####:  398:		      next_line_num ();
+    #####:  399:		      bpout = stpcpy (bpout, line_num_print);
+        -:  400:		    }
+        -:  401:		}
+        -:  402:
+        -:  403:	      /* Output a currency symbol if requested (-e).  */
+        -:  404:
+    #####:  405:	      if (show_ends)
+    #####:  406:		*bpout++ = '$';
+        -:  407:
+        -:  408:	      /* Output the newline.  */
+        -:  409:
+    #####:  410:	      *bpout++ = '\n';
+        -:  411:	    }
+    #####:  412:	  ch = *bpin++;
+        -:  413:	}
+    #####:  414:      while (ch == '\n');
+        -:  415:
+        -:  416:      /* Are we at the beginning of a line, and line numbers are requested?  */
+        -:  417:
+    #####:  418:      if (newlines >= 0 && number)
+        -:  419:	{
+    #####:  420:	  next_line_num ();
+    #####:  421:	  bpout = stpcpy (bpout, line_num_print);
+        -:  422:	}
+        -:  423:
+        -:  424:      /* Here CH cannot contain a newline character.  */
+        -:  425:
+        -:  426:      /* The loops below continue until a newline character is found,
+        -:  427:	 which means that the buffer is empty or that a proper newline
+        -:  428:	 has been found.  */
+        -:  429:
+        -:  430:      /* If quoting, i.e. at least one of -v, -e, or -t specified,
+        -:  431:	 scan for chars that need conversion.  */
+    #####:  432:      if (show_nonprinting)
+        -:  433:	{
+        -:  434:	  for (;;)
+        -:  435:	    {
+    #####:  436:	      if (ch >= 32)
+        -:  437:		{
+    #####:  438:		  if (ch < 127)
+    #####:  439:		    *bpout++ = ch;
+    #####:  440:		  else if (ch == 127)
+        -:  441:		    {
+    #####:  442:		      *bpout++ = '^';
+    #####:  443:		      *bpout++ = '?';
+        -:  444:		    }
+        -:  445:		  else
+        -:  446:		    {
+    #####:  447:		      *bpout++ = 'M';
+    #####:  448:		      *bpout++ = '-';
+    #####:  449:		      if (ch >= 128 + 32)
+        -:  450:			{
+    #####:  451:			  if (ch < 128 + 127)
+    #####:  452:			    *bpout++ = ch - 128;
+        -:  453:			  else
+        -:  454:			    {
+    #####:  455:			      *bpout++ = '^';
+    #####:  456:			      *bpout++ = '?';
+        -:  457:			    }
+        -:  458:			}
+        -:  459:		      else
+        -:  460:			{
+    #####:  461:			  *bpout++ = '^';
+    #####:  462:			  *bpout++ = ch - 128 + 64;
+        -:  463:			}
+        -:  464:		    }
+        -:  465:		}
+    #####:  466:	      else if (ch == '\t' && !show_tabs)
+    #####:  467:		*bpout++ = '\t';
+    #####:  468:	      else if (ch == '\n')
+        -:  469:		{
+    #####:  470:		  newlines = -1;
+    #####:  471:		  break;
+        -:  472:		}
+        -:  473:	      else
+        -:  474:		{
+    #####:  475:		  *bpout++ = '^';
+    #####:  476:		  *bpout++ = ch + 64;
+        -:  477:		}
+        -:  478:
+    #####:  479:	      ch = *bpin++;
+    #####:  480:	    }
+        -:  481:	}
+        -:  482:      else
+        -:  483:	{
+        -:  484:	  /* Not quoting, neither of -v, -e, or -t specified.  */
+        -:  485:	  for (;;)
+        -:  486:	    {
+    #####:  487:	      if (ch == '\t' && show_tabs)
+        -:  488:		{
+    #####:  489:		  *bpout++ = '^';
+    #####:  490:		  *bpout++ = ch + 64;
+        -:  491:		}
+    #####:  492:	      else if (ch != '\n')
+    #####:  493:		*bpout++ = ch;
+        -:  494:	      else
+        -:  495:		{
+    #####:  496:		  newlines = -1;
+    #####:  497:		  break;
+        -:  498:		}
+        -:  499:
+    #####:  500:	      ch = *bpin++;
+    #####:  501:	    }
+        -:  502:	}
+    #####:  503:    }
+        -:  504:}
+        -:  505:
+        -:  506:int
+        2:  507:main (int argc, char **argv)
+        -:  508:{
+        -:  509:  /* Optimal size of i/o operations of output.  */
+        -:  510:  size_t outsize;
+        -:  511:
+        -:  512:  /* Optimal size of i/o operations of input.  */
+        -:  513:  size_t insize;
+        -:  514:
+        2:  515:  size_t page_size = getpagesize ();
+        -:  516:
+        -:  517:  /* Pointer to the input buffer.  */
+        -:  518:  char *inbuf;
+        -:  519:
+        -:  520:  /* Pointer to the output buffer.  */
+        -:  521:  char *outbuf;
+        -:  522:
+        2:  523:  bool ok = true;
+        -:  524:  int c;
+        -:  525:
+        -:  526:  /* Index in argv to processed argument.  */
+        -:  527:  int argind;
+        -:  528:
+        -:  529:  /* Device number of the output (file or whatever).  */
+        -:  530:  dev_t out_dev;
+        -:  531:
+        -:  532:  /* I-node number of the output.  */
+        -:  533:  ino_t out_ino;
+        -:  534:
+        -:  535:  /* True if the output file should not be the same as any input file.  */
+        2:  536:  bool check_redirection = true;
+        -:  537:
+        -:  538:  /* Nonzero if we have ever read standard input.  */
+        2:  539:  bool have_read_stdin = false;
+        -:  540:
+        -:  541:  struct stat stat_buf;
+        -:  542:
+        -:  543:  /* Variables that are set according to the specified options.  */
+        2:  544:  bool number = false;
+        2:  545:  bool number_nonblank = false;
+        2:  546:  bool squeeze_blank = false;
+        2:  547:  bool show_ends = false;
+        2:  548:  bool show_nonprinting = false;
+        2:  549:  bool show_tabs = false;
+        2:  550:  int file_open_mode = O_RDONLY;
+        -:  551:
+        -:  552:  static struct option const long_options[] =
+        -:  553:  {
+        -:  554:    {"number-nonblank", no_argument, NULL, 'b'},
+        -:  555:    {"number", no_argument, NULL, 'n'},
+        -:  556:    {"squeeze-blank", no_argument, NULL, 's'},
+        -:  557:    {"show-nonprinting", no_argument, NULL, 'v'},
+        -:  558:    {"show-ends", no_argument, NULL, 'E'},
+        -:  559:    {"show-tabs", no_argument, NULL, 'T'},
+        -:  560:    {"show-all", no_argument, NULL, 'A'},
+        -:  561:    {GETOPT_HELP_OPTION_DECL},
+        -:  562:    {GETOPT_VERSION_OPTION_DECL},
+        -:  563:    {NULL, 0, NULL, 0}
+        -:  564:  };
+        -:  565:
+        -:  566:  initialize_main (&argc, &argv);
+        2:  567:  program_name = argv[0];
+        2:  568:  setlocale (LC_ALL, "");
+        -:  569:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  570:  textdomain (PACKAGE);
+        -:  571:
+        -:  572:  /* Arrange to close stdout if we exit via the
+        -:  573:     case_GETOPT_HELP_CHAR or case_GETOPT_VERSION_CHAR code.
+        -:  574:     Normally STDOUT_FILENO is used rather than stdout, so
+        -:  575:     close_stdout does nothing.  */
+        2:  576:  atexit (close_stdout);
+        -:  577:
+        -:  578:  /* Parse command line options.  */
+        -:  579:
+        4:  580:  while ((c = getopt_long (argc, argv, "benstuvAET", long_options, NULL))
+        -:  581:	 != -1)
+        -:  582:    {
+    #####:  583:      switch (c)
+        -:  584:	{
+        -:  585:	case 'b':
+    #####:  586:	  number = true;
+    #####:  587:	  number_nonblank = true;
+    #####:  588:	  break;
+        -:  589:
+        -:  590:	case 'e':
+    #####:  591:	  show_ends = true;
+    #####:  592:	  show_nonprinting = true;
+    #####:  593:	  break;
+        -:  594:
+        -:  595:	case 'n':
+    #####:  596:	  number = true;
+    #####:  597:	  break;
+        -:  598:
+        -:  599:	case 's':
+    #####:  600:	  squeeze_blank = true;
+    #####:  601:	  break;
+        -:  602:
+        -:  603:	case 't':
+    #####:  604:	  show_tabs = true;
+    #####:  605:	  show_nonprinting = true;
+    #####:  606:	  break;
+        -:  607:
+        -:  608:	case 'u':
+        -:  609:	  /* We provide the -u feature unconditionally.  */
+    #####:  610:	  break;
+        -:  611:
+        -:  612:	case 'v':
+    #####:  613:	  show_nonprinting = true;
+    #####:  614:	  break;
+        -:  615:
+        -:  616:	case 'A':
+    #####:  617:	  show_nonprinting = true;
+    #####:  618:	  show_ends = true;
+    #####:  619:	  show_tabs = true;
+    #####:  620:	  break;
+        -:  621:
+        -:  622:	case 'E':
+    #####:  623:	  show_ends = true;
+    #####:  624:	  break;
+        -:  625:
+        -:  626:	case 'T':
+    #####:  627:	  show_tabs = true;
+    #####:  628:	  break;
+        -:  629:
+    #####:  630:	case_GETOPT_HELP_CHAR;
+        -:  631:
+    #####:  632:	case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  633:
+        -:  634:	default:
+    #####:  635:	  usage (EXIT_FAILURE);
+        -:  636:	}
+        -:  637:    }
+        -:  638:
+        -:  639:  /* Get device, i-node number, and optimal blocksize of output.  */
+        -:  640:
+        2:  641:  if (fstat (STDOUT_FILENO, &stat_buf) < 0)
+    #####:  642:    error (EXIT_FAILURE, errno, _("standard output"));
+        -:  643:
+        2:  644:  outsize = ST_BLKSIZE (stat_buf);
+        -:  645:  /* Input file can be output file for non-regular files.
+        -:  646:     fstat on pipes returns S_IFSOCK on some systems, S_IFIFO
+        -:  647:     on others, so the checking should not be done for those types,
+        -:  648:     and to allow things like cat < /dev/tty > /dev/tty, checking
+        -:  649:     is not done for device files either.  */
+        -:  650:
+        2:  651:  if (S_ISREG (stat_buf.st_mode))
+        -:  652:    {
+    #####:  653:      out_dev = stat_buf.st_dev;
+    #####:  654:      out_ino = stat_buf.st_ino;
+        -:  655:    }
+        -:  656:  else
+        -:  657:    {
+        2:  658:      check_redirection = false;
+        -:  659:#ifdef lint  /* Suppress `used before initialized' warning.  */
+        -:  660:      out_dev = 0;
+        -:  661:      out_ino = 0;
+        -:  662:#endif
+        -:  663:    }
+        -:  664:
+        2:  665:  if (! (number | show_ends | squeeze_blank))
+        -:  666:    {
+        2:  667:      file_open_mode |= O_BINARY;
+        -:  668:      if (O_BINARY && ! isatty (STDOUT_FILENO))
+        -:  669:	freopen (NULL, "wb", stdout);
+        -:  670:    }
+        -:  671:
+        -:  672:  /* Check if any of the input files are the same as the output file.  */
+        -:  673:
+        -:  674:  /* Main loop.  */
+        -:  675:
+        2:  676:  infile = "-";
+        2:  677:  argind = optind;
+        -:  678:
+        -:  679:  do
+        -:  680:    {
+        2:  681:      if (argind < argc)
+        2:  682:	infile = argv[argind];
+        -:  683:
+        2:  684:      if (STREQ (infile, "-"))
+        -:  685:	{
+    #####:  686:	  have_read_stdin = true;
+    #####:  687:	  input_desc = STDIN_FILENO;
+        -:  688:	  if ((file_open_mode & O_BINARY) && ! isatty (STDIN_FILENO))
+        -:  689:	    freopen (NULL, "rb", stdin);
+        -:  690:	}
+        -:  691:      else
+        -:  692:	{
+        2:  693:	  input_desc = open (infile, file_open_mode);
+        2:  694:	  if (input_desc < 0)
+        -:  695:	    {
+    #####:  696:	      error (0, errno, "%s", infile);
+    #####:  697:	      ok = false;
+    #####:  698:	      continue;
+        -:  699:	    }
+        -:  700:	}
+        -:  701:
+        2:  702:      if (fstat (input_desc, &stat_buf) < 0)
+        -:  703:	{
+    #####:  704:	  error (0, errno, "%s", infile);
+    #####:  705:	  ok = false;
+    #####:  706:	  goto contin;
+        -:  707:	}
+        2:  708:      insize = ST_BLKSIZE (stat_buf);
+        -:  709:
+        -:  710:      /* Compare the device and i-node numbers of this input file with
+        -:  711:	 the corresponding values of the (output file associated with)
+        -:  712:	 stdout, and skip this input file if they coincide.  Input
+        -:  713:	 files cannot be redirected to themselves.  */
+        -:  714:
+        2:  715:      if (check_redirection
+    #####:  716:	  && stat_buf.st_dev == out_dev && stat_buf.st_ino == out_ino
+    #####:  717:	  && (input_desc != STDIN_FILENO))
+        -:  718:	{
+    #####:  719:	  error (0, 0, _("%s: input file is output file"), infile);
+    #####:  720:	  ok = false;
+    #####:  721:	  goto contin;
+        -:  722:	}
+        -:  723:
+        -:  724:      /* Select which version of `cat' to use.  If any format-oriented
+        -:  725:	 options were given use `cat'; otherwise use `simple_cat'.  */
+        -:  726:
+        4:  727:      if (! (number | show_ends | show_nonprinting
+        2:  728:	     | show_tabs | squeeze_blank))
+        -:  729:	{
+        2:  730:	  insize = max (insize, outsize);
+        2:  731:	  inbuf = xmalloc (insize + page_size - 1);
+        -:  732:
+        2:  733:	  ok &= simple_cat (ptr_align (inbuf, page_size), insize);
+        -:  734:	}
+        -:  735:      else
+        -:  736:	{
+    #####:  737:	  inbuf = xmalloc (insize + 1 + page_size - 1);
+        -:  738:
+        -:  739:	  /* Why are
+        -:  740:	     (OUTSIZE - 1 + INSIZE * 4 + LINE_COUNTER_BUF_LEN + PAGE_SIZE - 1)
+        -:  741:	     bytes allocated for the output buffer?
+        -:  742:
+        -:  743:	     A test whether output needs to be written is done when the input
+        -:  744:	     buffer empties or when a newline appears in the input.  After
+        -:  745:	     output is written, at most (OUTSIZE - 1) bytes will remain in the
+        -:  746:	     buffer.  Now INSIZE bytes of input is read.  Each input character
+        -:  747:	     may grow by a factor of 4 (by the prepending of M-^).  If all
+        -:  748:	     characters do, and no newlines appear in this block of input, we
+        -:  749:	     will have at most (OUTSIZE - 1 + INSIZE * 4) bytes in the buffer.
+        -:  750:	     If the last character in the preceding block of input was a
+        -:  751:	     newline, a line number may be written (according to the given
+        -:  752:	     options) as the first thing in the output buffer. (Done after the
+        -:  753:	     new input is read, but before processing of the input begins.)
+        -:  754:	     A line number requires seldom more than LINE_COUNTER_BUF_LEN
+        -:  755:	     positions.
+        -:  756:
+        -:  757:	     Align the output buffer to a page size boundary, for efficency on
+        -:  758:	     some paging implementations, so add PAGE_SIZE - 1 bytes to the
+        -:  759:	     request to make room for the alignment.  */
+        -:  760:
+    #####:  761:	  outbuf = xmalloc (outsize - 1 + insize * 4 + LINE_COUNTER_BUF_LEN
+    #####:  762:			    + page_size - 1);
+        -:  763:
+    #####:  764:	  ok &= cat (ptr_align (inbuf, page_size), insize,
+    #####:  765:		     ptr_align (outbuf, page_size), outsize, show_nonprinting,
+        -:  766:		     show_tabs, number, number_nonblank, show_ends,
+        -:  767:		     squeeze_blank);
+        -:  768:
+    #####:  769:	  free (outbuf);
+        -:  770:	}
+        -:  771:
+        2:  772:      free (inbuf);
+        -:  773:
+        -:  774:    contin:
+        2:  775:      if (!STREQ (infile, "-") && close (input_desc) < 0)
+        -:  776:	{
+    #####:  777:	  error (0, errno, "%s", infile);
+    #####:  778:	  ok = false;
+        -:  779:	}
+        -:  780:    }
+        2:  781:  while (++argind < argc);
+        -:  782:
+        2:  783:  if (have_read_stdin && close (STDIN_FILENO) < 0)
+    #####:  784:    error (EXIT_FAILURE, errno, _("closing standard input"));
+        -:  785:
+        2:  786:  exit (ok ? EXIT_SUCCESS : EXIT_FAILURE);
+        -:  787:}

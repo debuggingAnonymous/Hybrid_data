@@ -1,0 +1,233 @@
+diff --git a/NEWS b/NEWS
+index 0db53d7..fc05b8a 100644
+--- a/NEWS
++++ b/NEWS
+@@ -13,6 +13,11 @@ GNU coreutils NEWS                                    -*- outline -*-
+   the relative link on the dereferenced path of an existing link.
+   [This bug was introduced when --relative was added in coreutils-8.16.]
+ 
++  tail --retry -f now waits for the files specified to appear.  Before, tail
++  would immediately exit when such a file is inaccessible during the initial
++  open.
++  [This bug was introduced when inotify support was added in coreutils-7.5]
++
+ ** New features
+ 
+   join accepts a new option: --zero-terminated (-z). As with the sort,uniq
+diff --git a/doc/coreutils.texi b/doc/coreutils.texi
+index 92917f1..f6f2eb4 100644
+--- a/doc/coreutils.texi
++++ b/doc/coreutils.texi
+@@ -3155,9 +3155,17 @@ will keep trying until it becomes accessible again.
+ 
+ @item --retry
+ @opindex --retry
+-This option is useful mainly when following by name (i.e., with
+-@option{--follow=name}).
+-Without this option, when tail encounters a file that doesn't
++Indefinitely try to open the specified file.
++This option is useful mainly when following (and otherwise issues a warning).
++
++When following by file descriptor (i.e., with @option{--follow=descriptor}),
++this option only affects the initial open of the file, as after a successful
++open, @command{tail} will start following the file descriptor.
++
++When following by name (i.e., with @option{--follow=name}), @command{tail}
++infinitely retries to re-open the given files until killed.
++
++Without this option, when @command{tail} encounters a file that doesn't
+ exist or is otherwise inaccessible, it reports that fact and
+ never checks it again.
+ 
+diff --git a/init.cfg b/init.cfg
+index 7976b61..33122cc 100644
+--- a/init.cfg
++++ b/init.cfg
+@@ -556,11 +556,13 @@ working_umask_or_skip_()
+ # Note ensure you do _not_ quote the parameter to GNU sleep in
+ # your function, as it may contain separate values that sleep
+ # needs to accumulate.
++# Further function arguments will be forwarded to the test function.
+ retry_delay_()
+ {
+   local test_func=$1
+   local init_delay=$2
+   local max_n_tries=$3
++  shift 3 || return 1
+ 
+   local attempt=1
+   local num_sleeps=$attempt
+@@ -568,7 +570,7 @@ retry_delay_()
+   while test $attempt -le $max_n_tries; do
+     local delay=$($AWK -v n=$num_sleeps -v s="$init_delay" \
+                   'BEGIN { print s * n }')
+-    "$test_func" "$delay" && { time_fail=0; break; } || time_fail=1
++    "$test_func" "$delay" "$@" && { time_fail=0; break; } || time_fail=1
+     attempt=$(expr $attempt + 1)
+     num_sleeps=$(expr $num_sleeps '*' 2)
+   done
+diff --git a/src/tail.c b/src/tail.c
+index cdaecdd..3735757 100644
+--- a/src/tail.c
++++ b/src/tail.c
+@@ -294,9 +294,7 @@ With no FILE, or when FILE is -, read standard input.\n\
+      fputs (_("\
+       --pid=PID            with -f, terminate after process ID, PID dies\n\
+   -q, --quiet, --silent    never output headers giving file names\n\
+-      --retry              keep trying to open a file even when it is or\n\
+-                             becomes inaccessible; useful when following by\n\
+-                             name, i.e., with --follow=name\n\
++      --retry              keep trying to open a file if it is inaccessible\n\
+ "), stdout);
+      fputs (_("\
+   -s, --sleep-interval=N   with -f, sleep for approximately N seconds\n\
+@@ -2030,8 +2028,14 @@ parse_options (int argc, char **argv,
+         }
+     }
+ 
+-  if (reopen_inaccessible_files && follow_mode != Follow_name)
+-    error (0, 0, _("warning: --retry is useful mainly when following by name"));
++  if (reopen_inaccessible_files)
++    {
++      if (!forever)
++        error (0, 0, _("warning: --retry ignored; --retry is useful"
++                       " only when following"));
++      else if (follow_mode == Follow_descriptor)
++        error (0, 0, _("warning: --retry only effective for the initial open"));
++    }
+ 
+   if (pid && !forever)
+     error (0, 0,
+@@ -2182,6 +2186,10 @@ main (int argc, char **argv)
+          in this case because it would miss any updates to the file
+          that were not initiated from the local system.
+ 
++         ok is false when one of the files specified could not be opened for
++         reading.  In this case and when following by descriptor,
++         tail_forever_inotify() cannot be used (in its current implementation).
++
+          FIXME: inotify doesn't give any notification when a new
+          (remote) file or directory is mounted on top a watched file.
+          When follow_mode == Follow_name we would ideally like to detect that.
+@@ -2193,7 +2201,8 @@ main (int argc, char **argv)
+          is recreated, then we don't recheck any new file when
+          follow_mode == Follow_name  */
+       if (!disable_inotify && (tailable_stdin (F, n_files)
+-                               || any_remote_file (F, n_files)))
++                               || any_remote_file (F, n_files)
++                               || (!ok && follow_mode == Follow_descriptor)))
+         disable_inotify = true;
+ 
+       if (!disable_inotify)
+diff --git a/tests/local.mk b/tests/local.mk
+index 0b019d9..f47da8d 100644
+--- a/tests/local.mk
++++ b/tests/local.mk
+@@ -390,6 +390,7 @@ all_tests =					\
+   tests/misc/uniq-perf.sh			\
+   tests/misc/xattr.sh				\
+   tests/tail-2/wait.sh				\
++  tests/tail-2/retry.sh			\
+   tests/chmod/c-option.sh			\
+   tests/chmod/equal-x.sh			\
+   tests/chmod/equals.sh				\
+diff --git a/tests/tail-2/retry.sh b/tests/tail-2/retry.sh
+new file mode 100644
+index 0000000..71d1015
+--- /dev/null
++++ b/tests/tail-2/retry.sh
+@@ -0,0 +1,94 @@
++#!/bin/sh
++# Exercise tail's behavior regarding missing files with/without --retry.
++
++# Copyright (C) 2013 Free Software Foundation, Inc.
++
++# This program is free software: you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation, either version 3 of the License, or
++# (at your option) any later version.
++
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++. "${srcdir=.}/tests/init.sh"; path_prepend_ ./src
++print_ver_ tail
++
++# Function to check the expected line count in 'out'.
++# Called via retry_delay_().  Sleep some time - see retry_delay_() - if the
++# line count is still smaller than expected.
++wait4lines_ ()
++{
++  local delay=$1
++  local elc=$2   # Expected line count.
++  [ $( wc -l < out ) -ge $elc ] || { sleep $delay; return 1; }
++}
++
++# === Test:
++# Retry without --follow results in a warning.
++touch file
++tail --retry file > out 2>&1 || fail=1
++[ $( wc -l < out ) = 1 ]                     || fail=1
++grep -F 'tail: warning: --retry ignored' out || fail=1
++
++# === Test:
++# The same with a missing file: expect error message and exit 1.
++tail --retry missing > out 2>&1 && fail=1
++[ $( wc -l < out ) = 2 ]                     || fail=1
++grep -F 'tail: warning: --retry ignored' out || fail=1
++
++# === Test:
++# Ensure that "tail --retry --follow=name" waits for the file to appear.
++timeout 10 tail -s.1 --follow=name --retry missing >out 2>&1 & pid=$!
++retry_delay_ wait4lines_ .1 6 1 || fail=1  # Wait for "cannot open" error.
++echo "X" > missing              || fail=1  # Write "X" into 'missing'.
++retry_delay_ wait4lines_ .1 6 3 || fail=1  # Wait for the expected output.
++kill $pid
++wait $pid
++# Expect 3 lines in the output file.
++[ $( wc -l < out ) = 3 ]            || { fail=1; cat out; }
++grep -F 'cannot open' out           || { fail=1; cat out; }
++grep -F 'has become accessible' out || { fail=1; cat out; }
++grep '^X$' out                      || { fail=1; cat out; }
++rm -f missing out                   || fail=1
++
++# === Test:
++# Ensure that "tail --retry --follow=descriptor" waits for the file to appear.
++# tail-8.21 failed at this (since the implementation of the inotify support).
++timeout 10 tail -s.1 --follow=descriptor --retry missing >out 2>&1 & pid=$!
++retry_delay_ wait4lines_ .1 6 2 || fail=1  # Wait for "cannot open" error.
++echo "X" > missing              || fail=1  # Write "X" into 'missing'.
++retry_delay_ wait4lines_ .1 6 4 || fail=1  # Wait for the expected output.
++kill $pid
++wait $pid
++# Expect 4 lines in the output file.
++[ $( wc -l < out ) = 4 ]   || { fail=1; cat out; }
++grep -F 'retry only effective for the initial open' out \
++                           || { fail=1; cat out; }
++grep -F 'cannot open' out  || { fail=1; cat out; }
++grep -F 'has appeared' out || { fail=1; cat out; }
++grep '^X$' out             || { fail=1; cat out; }
++rm -f missing out          || fail=1
++
++# === Test:
++# Ensure that --follow=descriptor (without --retry) does *not wait* for the
++# file to appear.  Expect 2 lines in the output file ("cannot open" +
++# "no files remaining") and exit status 1.
++tail --follow=descriptor missing >out 2>&1 && fail=1
++[ $( wc -l < out ) = 2 ]         || { fail=1; cat out; }
++grep -F 'cannot open' out        || { fail=1; cat out; }
++grep -F 'no files remaining' out || { fail=1; cat out; }
++
++# === Test:
++# Likewise for --follow=name (without --retry).
++tail --follow=name missing >out 2>&1 && fail=1
++[ $( wc -l < out ) = 2 ]         || { fail=1; cat out; }
++grep -F 'cannot open' out        || { fail=1; cat out; }
++grep -F 'no files remaining' out || { fail=1; cat out; }
++
++Exit $fail

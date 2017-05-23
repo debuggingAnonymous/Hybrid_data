@@ -1,0 +1,776 @@
+        -:    0:Source:ftsfind.c
+        -:    0:Graph:ftsfind.gcno
+        -:    0:Data:ftsfind.gcda
+        -:    0:Runs:5
+        -:    0:Programs:1
+        -:    1:/* find -- search for files in a directory hierarchy (fts version)
+        -:    2:   Copyright (C) 1990, 91, 92, 93, 94, 2000, 2003, 2004, 2005, 2006,
+        -:    3:                 2007, 2008, 2009 Free Software Foundation, Inc.
+        -:    4:
+        -:    5:   This program is free software: you can redistribute it and/or modify
+        -:    6:   it under the terms of the GNU General Public License as published by
+        -:    7:   the Free Software Foundation, either version 3 of the License, or
+        -:    8:   (at your option) any later version.
+        -:    9:
+        -:   10:   This program is distributed in the hope that it will be useful,
+        -:   11:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   12:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   13:   GNU General Public License for more details.
+        -:   14:
+        -:   15:   You should have received a copy of the GNU General Public License
+        -:   16:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   17:*/
+        -:   18:
+        -:   19:/* This file was written by James Youngman, based on find.c.
+        -:   20:
+        -:   21:   GNU find was written by Eric Decker <cire@soe.ucsc.edu>,
+        -:   22:   with enhancements by David MacKenzie <djm@gnu.org>,
+        -:   23:   Jay Plett <jay@silence.princeton.nj.us>,
+        -:   24:   and Tim Wood <axolotl!tim@toad.com>.
+        -:   25:   The idea for -print0 and xargs -0 came from
+        -:   26:   Dan Bernstein <brnstnd@kramden.acf.nyu.edu>.
+        -:   27:*/
+        -:   28:
+        -:   29:
+        -:   30:#include <config.h>
+        -:   31:#include "defs.h"
+        -:   32:
+        -:   33:
+        -:   34:#define USE_SAFE_CHDIR 1
+        -:   35:#undef  STAT_MOUNTPOINTS
+        -:   36:
+        -:   37:
+        -:   38:#include <errno.h>
+        -:   39:#include <assert.h>
+        -:   40:
+        -:   41:#include <fcntl.h>
+        -:   42:#include <sys/stat.h>
+        -:   43:
+        -:   44:#include <unistd.h>
+        -:   45:
+        -:   46:#include "xalloc.h"
+        -:   47:#include "closeout.h"
+        -:   48:#include <modetype.h>
+        -:   49:#include "quotearg.h"
+        -:   50:#include "quote.h"
+        -:   51:#include "fts_.h"
+        -:   52:#include "openat.h"
+        -:   53:#include "save-cwd.h"
+        -:   54:#include "xgetcwd.h"
+        -:   55:#include "error.h"
+        -:   56:#include "dircallback.h"
+        -:   57:
+        -:   58:#ifdef HAVE_LOCALE_H
+        -:   59:#include <locale.h>
+        -:   60:#endif
+        -:   61:
+        -:   62:#if ENABLE_NLS
+        -:   63:# include <libintl.h>
+        -:   64:# define _(Text) gettext (Text)
+        -:   65:#else
+        -:   66:# define _(Text) Text
+        -:   67:#define textdomain(Domain)
+        -:   68:#define bindtextdomain(Package, Directory)
+        -:   69:#endif
+        -:   70:#ifdef gettext_noop
+        -:   71:# define N_(String) gettext_noop (String)
+        -:   72:#else
+        -:   73:/* See locate.c for explanation as to why not use (String) */
+        -:   74:# define N_(String) String
+        -:   75:#endif
+        -:   76:
+        -:   77:
+        8:   78:static void set_close_on_exec(int fd)
+        -:   79:{
+        -:   80:#if defined F_GETFD && defined FD_CLOEXEC
+        -:   81:  int flags;
+        8:   82:  flags = fcntl(fd, F_GETFD);
+        8:   83:  if (flags >= 0)
+        -:   84:    {
+        8:   85:      flags |= FD_CLOEXEC;
+        8:   86:      fcntl(fd, F_SETFD, flags);
+        -:   87:    }
+        -:   88:#endif
+        8:   89:}
+        -:   90:
+        -:   91:
+        -:   92:
+        -:   93:/* FTS_TIGHT_CYCLE_CHECK tries to work around Savannah bug #17877
+        -:   94: * (but actually using it doesn't fix the bug).
+        -:   95: */
+        -:   96:static int ftsoptions = FTS_NOSTAT|FTS_TIGHT_CYCLE_CHECK|FTS_CWDFD;
+        -:   97:
+        -:   98:static int prev_depth = INT_MIN; /* fts_level can be < 0 */
+        -:   99:static int curr_fd = -1;
+        -:  100:
+        4:  101:int get_current_dirfd(void)
+        -:  102:{
+        4:  103:  if (ftsoptions & FTS_CWDFD)
+        -:  104:    {
+        4:  105:      assert (curr_fd != -1);
+        4:  106:      assert ( (AT_FDCWD == curr_fd) || (curr_fd >= 0) );
+        -:  107:
+        4:  108:      if (AT_FDCWD == curr_fd)
+        4:  109:	return starting_desc;
+        -:  110:      else
+    #####:  111:	return curr_fd;
+        -:  112:    }
+        -:  113:  else
+        -:  114:    {
+    #####:  115:      return AT_FDCWD;
+        -:  116:    }
+        -:  117:}
+        -:  118:
+       24:  119:static void left_dir(void)
+        -:  120:{
+       24:  121:  if (ftsoptions & FTS_CWDFD)
+        -:  122:    {
+       24:  123:      if (curr_fd >= 0)
+        -:  124:	{
+        8:  125:	  close(curr_fd);
+        8:  126:	  curr_fd = -1;
+        -:  127:	}
+        -:  128:    }
+        -:  129:  else
+        -:  130:    {
+        -:  131:      /* do nothing. */
+        -:  132:    }
+       24:  133:}
+        -:  134:
+        -:  135:/*
+        -:  136: * Signal that we are now inside a directory pointed to by dir_fd.
+        -:  137: * The caller can't tell if this is the first time this happens, so
+        -:  138: * we have to be careful not to call dup() more than once
+        -:  139: */
+       32:  140:static void inside_dir(int dir_fd)
+        -:  141:{
+       32:  142:  if (ftsoptions & FTS_CWDFD)
+        -:  143:    {
+       32:  144:      assert (dir_fd == AT_FDCWD || dir_fd >= 0);
+        -:  145:
+       32:  146:      state.cwd_dir_fd = dir_fd;
+       32:  147:      if (curr_fd < 0)
+        -:  148:	{
+       32:  149:	  if (AT_FDCWD == dir_fd)
+        -:  150:	    {
+       24:  151:	      curr_fd = AT_FDCWD;
+        -:  152:	    }
+        8:  153:	  else if (dir_fd >= 0)
+        -:  154:	    {
+        8:  155:	      curr_fd = dup(dir_fd);
+        8:  156:	      set_close_on_exec(curr_fd);
+        -:  157:	    }
+        -:  158:	  else
+        -:  159:	    {
+        -:  160:	      /* curr_fd is invalid, but dir_fd is also invalid.
+        -:  161:	       * This should not have happened.
+        -:  162:	       */
+    #####:  163:	      assert (curr_fd >= 0 || dir_fd >= 0);
+        -:  164:	    }
+        -:  165:	}
+        -:  166:    }
+        -:  167:  else
+        -:  168:    {
+        -:  169:      /* FTS_CWDFD is not in use.  We can always assume that
+        -:  170:       * AT_FDCWD refers to the directory we are currentl searching.
+        -:  171:       *
+        -:  172:       * Therefore there is nothing to do.
+        -:  173:       */
+        -:  174:    }
+       32:  175:}
+        -:  176:
+        -:  177:
+        -:  178:
+        -:  179:#ifdef STAT_MOUNTPOINTS
+        -:  180:static void init_mounted_dev_list(void);
+        -:  181:#endif
+        -:  182:
+        -:  183:/* We have encountered an error which should affect the exit status.
+        -:  184: * This is normally used to change the exit status from 0 to 1.
+        -:  185: * However, if the exit status is already 2 for example, we don't want to
+        -:  186: * reduce it to 1.
+        -:  187: */
+        -:  188:static void
+    #####:  189:error_severity(int level)
+        -:  190:{
+    #####:  191:  if (state.exit_status < level)
+    #####:  192:    state.exit_status = level;
+    #####:  193:}
+        -:  194:
+        -:  195:
+        -:  196:#define STRINGIFY(X) #X
+        -:  197:#define HANDLECASE(N) case N: return #N;
+        -:  198:
+        -:  199:static char *
+    #####:  200:get_fts_info_name(int info)
+        -:  201:{
+        -:  202:  static char buf[10];
+    #####:  203:  switch (info)
+        -:  204:    {
+    #####:  205:      HANDLECASE(FTS_D);
+    #####:  206:      HANDLECASE(FTS_DC);
+    #####:  207:      HANDLECASE(FTS_DEFAULT);
+    #####:  208:      HANDLECASE(FTS_DNR);
+    #####:  209:      HANDLECASE(FTS_DOT);
+    #####:  210:      HANDLECASE(FTS_DP);
+    #####:  211:      HANDLECASE(FTS_ERR);
+    #####:  212:      HANDLECASE(FTS_F);
+    #####:  213:      HANDLECASE(FTS_INIT);
+    #####:  214:      HANDLECASE(FTS_NS);
+    #####:  215:      HANDLECASE(FTS_NSOK);
+    #####:  216:      HANDLECASE(FTS_SL);
+    #####:  217:      HANDLECASE(FTS_SLNONE);
+    #####:  218:      HANDLECASE(FTS_W);
+        -:  219:    default:
+    #####:  220:      sprintf(buf, "[%d]", info);
+    #####:  221:      return buf;
+        -:  222:    }
+        -:  223:}
+        -:  224:
+        -:  225:static void
+       16:  226:visit(FTS *p, FTSENT *ent, struct stat *pstat)
+        -:  227:{
+        -:  228:  struct predicate *eval_tree;
+        -:  229:
+       16:  230:  state.have_stat = (ent->fts_info != FTS_NS) && (ent->fts_info != FTS_NSOK);
+       16:  231:  state.rel_pathname = ent->fts_accpath;
+       16:  232:  state.cwd_dir_fd   = p->fts_cwd_fd;
+        -:  233:
+        -:  234:  /* Apply the predicates to this path. */
+       16:  235:  eval_tree = get_eval_tree();
+       16:  236:  apply_predicate(ent->fts_path, pstat, eval_tree);
+        -:  237:
+        -:  238:  /* Deal with any side effects of applying the predicates. */
+       16:  239:  if (state.stop_at_current_level)
+        -:  240:    {
+    #####:  241:      fts_set(p, ent, FTS_SKIP);
+        -:  242:    }
+       16:  243:}
+        -:  244:
+        -:  245:static const char*
+    #####:  246:partial_quotearg_n(int n, char *s, size_t len, enum quoting_style style)
+        -:  247:{
+    #####:  248:  if (0 == len)
+        -:  249:    {
+    #####:  250:      return quotearg_n_style(n, style, "");
+        -:  251:    }
+        -:  252:  else
+        -:  253:    {
+        -:  254:      char saved;
+        -:  255:      const char *result;
+        -:  256:
+    #####:  257:      saved = s[len];
+    #####:  258:      s[len] = 0;
+    #####:  259:      result = quotearg_n_style(n, style, s);
+    #####:  260:      s[len] = saved;
+    #####:  261:      return result;
+        -:  262:    }
+        -:  263:}
+        -:  264:
+        -:  265:
+        -:  266:/* We've detected a file system loop.   This is caused by one of
+        -:  267: * two things:
+        -:  268: *
+        -:  269: * 1. Option -L is in effect and we've hit a symbolic link that
+        -:  270: *    points to an ancestor.  This is harmless.  We won't traverse the
+        -:  271: *    symbolic link.
+        -:  272: *
+        -:  273: * 2. We have hit a real cycle in the directory hierarchy.  In this
+        -:  274: *    case, we issue a diagnostic message (POSIX requires this) and we
+        -:  275: *    skip that directory entry.
+        -:  276: */
+        -:  277:static void
+    #####:  278:issue_loop_warning(FTSENT * ent)
+        -:  279:{
+    #####:  280:  if (S_ISLNK(ent->fts_statp->st_mode))
+        -:  281:    {
+    #####:  282:      error(0, 0,
+        -:  283:	    _("Symbolic link %s is part of a loop in the directory hierarchy; we have already visited the directory to which it points."),
+    #####:  284:	    safely_quote_err_filename(0, ent->fts_path));
+        -:  285:    }
+        -:  286:  else
+        -:  287:    {
+        -:  288:      /* We have found an infinite loop.  POSIX requires us to
+        -:  289:       * issue a diagnostic.  Usually we won't get to here
+        -:  290:       * because when the leaf optimisation is on, it will cause
+        -:  291:       * the subdirectory to be skipped.  If /a/b/c/d is a hard
+        -:  292:       * link to /a/b, then the link count of /a/b/c is 2,
+        -:  293:       * because the ".." entry of /a/b/c/d points to /a, not
+        -:  294:       * to /a/b/c.
+        -:  295:       */
+    #####:  296:      error(0, 0,
+        -:  297:	    _("File system loop detected; "
+        -:  298:	      "%s is part of the same file system loop as %s."),
+    #####:  299:	    safely_quote_err_filename(0, ent->fts_path),
+        -:  300:	    partial_quotearg_n(1,
+    #####:  301:			       ent->fts_cycle->fts_path,
+    #####:  302:			       ent->fts_cycle->fts_pathlen,
+        -:  303:			       options.err_quoting_style));
+        -:  304:    }
+    #####:  305:}
+        -:  306:
+        -:  307:/*
+        -:  308: * Return true if NAME corresponds to a file which forms part of a
+        -:  309: * symbolic link loop.  The command
+        -:  310: *      rm -f a b; ln -s a b; ln -s b a
+        -:  311: * produces such a loop.
+        -:  312: */
+        -:  313:static boolean
+    #####:  314:symlink_loop(const char *name)
+        -:  315:{
+        -:  316:  struct stat stbuf;
+        -:  317:  int rv;
+    #####:  318:  if (following_links())
+    #####:  319:    rv = stat(name, &stbuf);
+        -:  320:  else
+    #####:  321:    rv = lstat(name, &stbuf);
+    #####:  322:  return (0 != rv) && (ELOOP == errno);
+        -:  323:}
+        -:  324:
+        -:  325:
+        -:  326:static int
+    #####:  327:complete_execdirs_cb(void *context)
+        -:  328:{
+        -:  329:  (void) context;
+        -:  330:  /* By the tme this callback is called, the current directory is correct. */
+    #####:  331:  complete_pending_execdirs(AT_FDCWD);
+    #####:  332:  return 0;
+        -:  333:}
+        -:  334:
+        -:  335:static void
+    #####:  336:show_outstanding_execdirs(FILE *fp)
+        -:  337:{
+    #####:  338:  if (options.debug_options & DebugExec)
+        -:  339:    {
+    #####:  340:      int seen=0;
+        -:  341:      struct predicate *p;
+    #####:  342:      p = get_eval_tree();
+    #####:  343:      fprintf(fp, "Outstanding execdirs:");
+        -:  344:
+    #####:  345:      while (p)
+        -:  346:	{
+        -:  347:	  const char *pfx;
+        -:  348:
+    #####:  349:	  if (pred_is(p, pred_execdir))
+    #####:  350:	    pfx = "-execdir";
+    #####:  351:	  else if (pred_is(p, pred_okdir))
+    #####:  352:	    pfx = "-okdir";
+        -:  353:	  else
+    #####:  354:	    pfx = NULL;
+    #####:  355:	  if (pfx)
+        -:  356:	    {
+        -:  357:	      int i;
+    #####:  358:	      const struct exec_val *execp = &p->args.exec_vec;
+    #####:  359:	      ++seen;
+        -:  360:
+    #####:  361:	      fprintf(fp, "%s ", pfx);
+    #####:  362:	      if (execp->multiple)
+    #####:  363:		fprintf(fp, "multiple ");
+    #####:  364:	      fprintf(fp, "%d args: ", execp->state.cmd_argc);
+    #####:  365:	      for (i=0; i<execp->state.cmd_argc; ++i)
+        -:  366:		{
+    #####:  367:		  fprintf(fp, "%s ", execp->state.cmd_argv[i]);
+        -:  368:		}
+    #####:  369:	      fprintf(fp, "\n");
+        -:  370:	    }
+    #####:  371:	  p = p->pred_next;
+        -:  372:	}
+    #####:  373:      if (!seen)
+    #####:  374:	fprintf(fp, " none\n");
+        -:  375:    }
+        -:  376:  else
+        -:  377:    {
+        -:  378:      /* No debug output is wanted. */
+        -:  379:    }
+    #####:  380:}
+        -:  381:
+        -:  382:
+        -:  383:
+        -:  384:
+        -:  385:static void
+       24:  386:consider_visiting(FTS *p, FTSENT *ent)
+        -:  387:{
+        -:  388:  struct stat statbuf;
+        -:  389:  mode_t mode;
+        -:  390:  int ignore, isdir;
+        -:  391:
+       24:  392:  if (options.debug_options & DebugSearch)
+    #####:  393:    fprintf(stderr,
+        -:  394:	    "consider_visiting (early): %s: "
+        -:  395:	    "fts_info=%-6s, fts_level=%2d, prev_depth=%d "
+        -:  396:            "fts_path=%s, fts_accpath=%s\n",
+    #####:  397:	    quotearg_n_style(0, options.err_quoting_style, ent->fts_path),
+    #####:  398:	    get_fts_info_name(ent->fts_info),
+    #####:  399:            (int)ent->fts_level, prev_depth,
+    #####:  400:	    quotearg_n_style(1, options.err_quoting_style, ent->fts_path),
+    #####:  401:	    quotearg_n_style(2, options.err_quoting_style, ent->fts_accpath));
+        -:  402:
+       24:  403:  if (ent->fts_info == FTS_DP)
+        -:  404:    {
+        8:  405:      left_dir();
+        -:  406:    }
+       16:  407:  else if (ent->fts_level > prev_depth || ent->fts_level==0)
+        -:  408:    {
+       16:  409:      left_dir();
+        -:  410:    }
+       24:  411:  inside_dir(p->fts_cwd_fd);
+       24:  412:  prev_depth = ent->fts_level;
+        -:  413:
+       24:  414:  statbuf.st_ino = ent->fts_statp->st_ino;
+        -:  415:
+        -:  416:  /* Cope with various error conditions. */
+       24:  417:  if (ent->fts_info == FTS_ERR
+       24:  418:      || ent->fts_info == FTS_DNR)
+        -:  419:    {
+    #####:  420:      error(0, ent->fts_errno, "%s",
+    #####:  421:	    safely_quote_err_filename(0, ent->fts_path));
+    #####:  422:      error_severity(1);
+    #####:  423:      return;
+        -:  424:    }
+       24:  425:  else if (ent->fts_info == FTS_DC)
+        -:  426:    {
+    #####:  427:      issue_loop_warning(ent);
+    #####:  428:      error_severity(1);
+    #####:  429:      return;
+        -:  430:    }
+       24:  431:  else if (ent->fts_info == FTS_SLNONE)
+        -:  432:    {
+        -:  433:      /* fts_read() claims that ent->fts_accpath is a broken symbolic
+        -:  434:       * link.  That would be fine, but if this is part of a symbolic
+        -:  435:       * link loop, we diagnose the problem and also ensure that the
+        -:  436:       * eventual return value is nonzero.   Note that while the path
+        -:  437:       * we stat is local (fts_accpath), we print the full path name
+        -:  438:       * of the file (fts_path) in the error message.
+        -:  439:       */
+    #####:  440:      if (symlink_loop(ent->fts_accpath))
+        -:  441:	{
+    #####:  442:	  error(0, ELOOP, "%s", safely_quote_err_filename(0, ent->fts_path));
+    #####:  443:	  error_severity(1);
+    #####:  444:	  return;
+        -:  445:	}
+        -:  446:    }
+       24:  447:  else if (ent->fts_info == FTS_NS)
+        -:  448:    {
+    #####:  449:      if (ent->fts_level == 0)
+        -:  450:	{
+        -:  451:	  /* e.g., nonexistent starting point */
+    #####:  452:	  error(0, ent->fts_errno, "%s",
+    #####:  453:		safely_quote_err_filename(0, ent->fts_path));
+    #####:  454:	  error_severity(1);	/* remember problem */
+    #####:  455:	  return;
+        -:  456:	}
+        -:  457:      else
+        -:  458:	{
+        -:  459:	  /* The following if statement fixes Savannah bug #19605
+        -:  460:	   * (failure to diagnose a symbolic link loop)
+        -:  461:	   */
+    #####:  462:	  if (symlink_loop(ent->fts_accpath))
+        -:  463:	    {
+    #####:  464:	      error(0, ELOOP, "%s",
+    #####:  465:		    safely_quote_err_filename(0, ent->fts_path));
+    #####:  466:	      error_severity(1);
+    #####:  467:	      return;
+        -:  468:	    }
+        -:  469:	}
+        -:  470:    }
+        -:  471:
+        -:  472:  /* Cope with the usual cases. */
+       24:  473:  if (ent->fts_info == FTS_NSOK
+       16:  474:      || ent->fts_info == FTS_NS /* e.g. symlink loop */)
+        -:  475:    {
+        8:  476:      assert (!state.have_stat);
+        8:  477:      assert (ent->fts_info == FTS_NSOK || state.type != 0);
+        8:  478:      mode = state.type;
+        -:  479:    }
+        -:  480:  else
+        -:  481:    {
+       16:  482:      state.have_stat = true;
+       16:  483:      state.have_type = true;
+       16:  484:      statbuf = *(ent->fts_statp);
+       16:  485:      state.type = mode = statbuf.st_mode;
+        -:  486:
+       16:  487:      if (00000 == mode)
+        -:  488:	{
+        -:  489:	  /* Savannah bug #16378. */
+    #####:  490:	  error(0, 0, _("Warning: file %s appears to have mode 0000"),
+    #####:  491:		quotearg_n_style(0, options.err_quoting_style, ent->fts_path));
+        -:  492:	}
+        -:  493:    }
+        -:  494:
+        -:  495:  /* update state.curdepth before calling digest_mode(), because digest_mode
+        -:  496:   * may call following_links().
+        -:  497:   */
+       24:  498:  state.curdepth = ent->fts_level;
+       24:  499:  if (mode)
+        -:  500:    {
+       24:  501:      if (!digest_mode(&mode, ent->fts_path, ent->fts_name, &statbuf, 0))
+    #####:  502:	return;
+        -:  503:    }
+        -:  504:
+        -:  505:  /* examine this item. */
+       24:  506:  ignore = 0;
+       48:  507:  isdir = S_ISDIR(mode)
+        8:  508:    || (FTS_D  == ent->fts_info)
+        8:  509:    || (FTS_DP == ent->fts_info)
+       32:  510:    || (FTS_DC == ent->fts_info);
+        -:  511:
+       24:  512:  if (isdir && (ent->fts_info == FTS_NSOK))
+        -:  513:    {
+        -:  514:      /* This is a directory, but fts did not stat it, so
+        -:  515:       * presumably would not be planning to search its
+        -:  516:       * children.  Force a stat of the file so that the
+        -:  517:       * children can be checked.
+        -:  518:       */
+    #####:  519:      fts_set(p, ent, FTS_AGAIN);
+    #####:  520:      return;
+        -:  521:    }
+        -:  522:
+       24:  523:  if (options.maxdepth >= 0)
+        -:  524:    {
+    #####:  525:      if (ent->fts_level >= options.maxdepth)
+        -:  526:	{
+    #####:  527:	  fts_set(p, ent, FTS_SKIP); /* descend no further */
+        -:  528:
+    #####:  529:	  if (ent->fts_level > options.maxdepth)
+    #####:  530:	    ignore = 1;		/* don't even look at this one */
+        -:  531:	}
+        -:  532:    }
+        -:  533:
+       24:  534:  if ( (ent->fts_info == FTS_D) && !options.do_dir_first )
+        -:  535:    {
+        -:  536:      /* this is the preorder visit, but user said -depth */
+    #####:  537:      ignore = 1;
+        -:  538:    }
+       24:  539:  else if ( (ent->fts_info == FTS_DP) && options.do_dir_first )
+        -:  540:    {
+        -:  541:      /* this is the postorder visit, but user didn't say -depth */
+        8:  542:      ignore = 1;
+        -:  543:    }
+       16:  544:  else if (ent->fts_level < options.mindepth)
+        -:  545:    {
+    #####:  546:      ignore = 1;
+        -:  547:    }
+        -:  548:
+       24:  549:  if (options.debug_options & DebugSearch)
+    #####:  550:    fprintf (stderr,
+        -:  551:	     "consider_visiting (late): %s: "
+        -:  552:	     "fts_info=%-6s, isdir=%d ignore=%d have_stat=%d have_type=%d \n",
+    #####:  553:	     quotearg_n_style(0, options.err_quoting_style, ent->fts_path),
+    #####:  554:	     get_fts_info_name(ent->fts_info),
+    #####:  555:	     isdir, ignore, state.have_stat, state.have_type);
+        -:  556:
+       24:  557:  if (!ignore)
+        -:  558:    {
+       16:  559:      visit(p, ent, &statbuf);
+        -:  560:    }
+        -:  561:
+        -:  562:  /* XXX: if we allow a build-up of pending arguments for "-execdir foo {} +"
+        -:  563:   * we need to execute them in the same directory as we found the item.
+        -:  564:   * If we are trying to do "find a -execdir echo {} +", we will need to
+        -:  565:   * echo
+        -:  566:   *      a while in the original working directory
+        -:  567:   *      b while in a
+        -:  568:   *      c while in b (just before leaving b)
+        -:  569:   *
+        -:  570:   * These restrictions are hard to satisfy while using fts().   The reason is
+        -:  571:   * that it doesn't tell us just before we leave a directory.  For the moment,
+        -:  572:   * we punt and don't allow the arguments to build up.
+        -:  573:   */
+       24:  574:  if (state.execdirs_outstanding)
+        -:  575:    {
+    #####:  576:      show_outstanding_execdirs(stderr);
+    #####:  577:      run_in_dir(p->fts_cwd_fd, complete_execdirs_cb, NULL);
+        -:  578:    }
+        -:  579:
+       24:  580:  if (ent->fts_info == FTS_DP)
+        -:  581:    {
+        -:  582:      /* we're leaving a directory. */
+        8:  583:      state.stop_at_current_level = false;
+        -:  584:    }
+        -:  585:}
+        -:  586:
+        -:  587:
+        -:  588:
+        -:  589:static void
+        8:  590:find(char *arg)
+        -:  591:{
+        -:  592:  char * arglist[2];
+        -:  593:  FTS *p;
+        -:  594:  FTSENT *ent;
+        -:  595:
+        -:  596:
+        8:  597:  state.starting_path_length = strlen(arg);
+        8:  598:  inside_dir(AT_FDCWD);
+        -:  599:
+        8:  600:  arglist[0] = arg;
+        8:  601:  arglist[1] = NULL;
+        -:  602:
+        8:  603:  switch (options.symlink_handling)
+        -:  604:    {
+        -:  605:    case SYMLINK_ALWAYS_DEREF:
+    #####:  606:      ftsoptions |= FTS_COMFOLLOW|FTS_LOGICAL;
+    #####:  607:      break;
+        -:  608:
+        -:  609:    case SYMLINK_DEREF_ARGSONLY:
+    #####:  610:      ftsoptions |= FTS_COMFOLLOW|FTS_PHYSICAL;
+    #####:  611:      break;
+        -:  612:
+        -:  613:    case SYMLINK_NEVER_DEREF:
+        8:  614:      ftsoptions |= FTS_PHYSICAL;
+        8:  615:      break;
+        -:  616:    }
+        -:  617:
+        8:  618:  if (options.stay_on_filesystem)
+    #####:  619:    ftsoptions |= FTS_XDEV;
+        -:  620:
+        8:  621:  p = fts_open(arglist, ftsoptions, NULL);
+        8:  622:  if (NULL == p)
+        -:  623:    {
+    #####:  624:      error (0, errno, _("cannot search %s"),
+        -:  625:	     safely_quote_err_filename(0, arg));
+        -:  626:    }
+        -:  627:  else
+        -:  628:    {
+       40:  629:      while ( (ent=fts_read(p)) != NULL )
+        -:  630:	{
+       24:  631:	  state.have_stat = false;
+       24:  632:	  state.have_type = !!ent->fts_statp->st_mode;
+       24:  633:	  state.type = state.have_type ? ent->fts_statp->st_mode : 0;
+       24:  634:	  consider_visiting(p, ent);
+        -:  635:	}
+        8:  636:      fts_close(p);
+        8:  637:      p = NULL;
+        -:  638:    }
+        8:  639:}
+        -:  640:
+        -:  641:
+        -:  642:static void
+        4:  643:process_all_startpoints(int argc, char *argv[])
+        -:  644:{
+        -:  645:  int i;
+        -:  646:
+        -:  647:  /* figure out how many start points there are */
+       12:  648:  for (i = 0; i < argc && !looks_like_expression(argv[i], true); i++)
+        -:  649:    {
+        8:  650:      state.starting_path_length = strlen(argv[i]); /* TODO: is this redundant? */
+        8:  651:      find(argv[i]);
+        -:  652:    }
+        -:  653:
+        4:  654:  if (i == 0)
+        -:  655:    {
+        -:  656:      /*
+        -:  657:       * We use a temporary variable here because some actions modify
+        -:  658:       * the path temporarily.  Hence if we use a string constant,
+        -:  659:       * we get a coredump.  The best example of this is if we say
+        -:  660:       * "find -printf %H" (note, not "find . -printf %H").
+        -:  661:       */
+    #####:  662:      char defaultpath[2] = ".";
+    #####:  663:      find(defaultpath);
+        -:  664:    }
+        4:  665:}
+        -:  666:
+        -:  667:
+        -:  668:
+        -:  669:
+        -:  670:int
+        5:  671:main (int argc, char **argv)
+        -:  672:{
+        5:  673:  int end_of_leading_options = 0; /* First arg after any -H/-L etc. */
+        -:  674:  struct predicate *eval_tree;
+        -:  675:
+        5:  676:  program_name = argv[0];
+        5:  677:  state.exit_status = 0;
+        5:  678:  state.execdirs_outstanding = false;
+        5:  679:  state.cwd_dir_fd = AT_FDCWD;
+        -:  680:
+        5:  681:  state.shared_files = sharefile_init("w");
+        5:  682:  if (NULL == state.shared_files)
+        -:  683:    {
+    #####:  684:      error (1, errno, _("Failed initialise shared-file hash table"));
+        -:  685:    }
+        -:  686:
+        -:  687:  /* Set the option defaults before we do the locale initialisation as
+        -:  688:   * check_nofollow() needs to be executed in the POSIX locale.
+        -:  689:   */
+        5:  690:  set_option_defaults(&options);
+        -:  691:
+        -:  692:#ifdef HAVE_SETLOCALE
+        5:  693:  setlocale (LC_ALL, "");
+        -:  694:#endif
+        -:  695:
+        -:  696:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  697:  textdomain (PACKAGE);
+        5:  698:  atexit (close_stdout);
+        -:  699:
+        -:  700:  /* Check for -P, -H or -L options.  Also -D and -O, which are
+        -:  701:   * both GNU extensions.
+        -:  702:   */
+        5:  703:  end_of_leading_options = process_leading_options(argc, argv);
+        -:  704:
+        5:  705:  if (options.debug_options & DebugStat)
+    #####:  706:    options.xstat = debug_stat;
+        -:  707:
+        -:  708:#ifdef DEBUG
+        -:  709:  fprintf (stderr, "cur_day_start = %s", ctime (&options.cur_day_start));
+        -:  710:#endif /* DEBUG */
+        -:  711:
+        -:  712:
+        -:  713:  /* We are now processing the part of the "find" command line
+        -:  714:   * after the -H/-L options (if any).
+        -:  715:   */
+        5:  716:  eval_tree = build_expression_tree(argc, argv, end_of_leading_options);
+        -:  717:
+        -:  718:  /* safely_chdir() needs to check that it has ended up in the right place.
+        -:  719:   * To avoid bailing out when something gets automounted, it checks if
+        -:  720:   * the target directory appears to have had a directory mounted on it as
+        -:  721:   * we chdir()ed.  The problem with this is that in order to notice that
+        -:  722:   * a file system was mounted, we would need to lstat() all the mount points.
+        -:  723:   * That strategy loses if our machine is a client of a dead NFS server.
+        -:  724:   *
+        -:  725:   * Hence if safely_chdir() and wd_sanity_check() can manage without needing
+        -:  726:   * to know the mounted device list, we do that.
+        -:  727:   */
+        4:  728:  if (!options.open_nofollow_available)
+        -:  729:    {
+        -:  730:#ifdef STAT_MOUNTPOINTS
+        -:  731:      init_mounted_dev_list();
+        -:  732:#endif
+        -:  733:    }
+        -:  734:
+        -:  735:
+        4:  736:  starting_desc = open (".", O_RDONLY
+        -:  737:#if defined O_LARGEFILE
+        -:  738:			|O_LARGEFILE
+        -:  739:#endif
+        -:  740:			);
+        4:  741:  if (0 <= starting_desc && fchdir (starting_desc) != 0)
+        -:  742:    {
+    #####:  743:      close (starting_desc);
+    #####:  744:      starting_desc = -1;
+        -:  745:    }
+        4:  746:  if (starting_desc < 0)
+        -:  747:    {
+    #####:  748:      starting_dir = xgetcwd ();
+    #####:  749:      if (! starting_dir)
+    #####:  750:	error (1, errno, _("cannot get current directory"));
+        -:  751:    }
+        -:  752:
+        -:  753:
+        4:  754:  process_all_startpoints(argc-end_of_leading_options, argv+end_of_leading_options);
+        -:  755:
+        -:  756:  /* If "-exec ... {} +" has been used, there may be some
+        -:  757:   * partially-full command lines which have been built,
+        -:  758:   * but which are not yet complete.   Execute those now.
+        -:  759:   */
+        4:  760:  show_success_rates(eval_tree);
+        4:  761:  cleanup();
+        4:  762:  return state.exit_status;
+        -:  763:}
+        -:  764:
+        -:  765:boolean
+        1:  766:is_fts_enabled(int *fts_options)
+        -:  767:{
+        -:  768:  /* this version of find (i.e. this main()) uses fts. */
+        1:  769:  *fts_options = ftsoptions;
+        1:  770:  return true;
+        -:  771:}

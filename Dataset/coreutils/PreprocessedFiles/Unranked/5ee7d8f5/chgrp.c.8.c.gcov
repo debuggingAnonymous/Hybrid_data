@@ -1,0 +1,322 @@
+        -:    0:Source:src/chgrp.c
+        -:    0:Graph:src/chgrp.gcno
+        -:    0:Data:src/chgrp.gcda
+        -:    0:Runs:2
+        -:    0:Programs:1
+        -:    1:/* chgrp -- change group ownership of files
+        -:    2:   Copyright (C) 1989-2013 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by David MacKenzie <djm@gnu.ai.mit.edu>. */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <stdio.h>
+        -:   21:#include <sys/types.h>
+        -:   22:#include <grp.h>
+        -:   23:#include <getopt.h>
+        -:   24:
+        -:   25:#include "system.h"
+        -:   26:#include "chown-core.h"
+        -:   27:#include "error.h"
+        -:   28:#include "fts_.h"
+        -:   29:#include "quote.h"
+        -:   30:#include "root-dev-ino.h"
+        -:   31:#include "xstrtol.h"
+        -:   32:
+        -:   33:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   34:#define PROGRAM_NAME "chgrp"
+        -:   35:
+        -:   36:#define AUTHORS \
+        -:   37:  proper_name ("David MacKenzie"), \
+        -:   38:  proper_name ("Jim Meyering")
+        -:   39:
+        -:   40:#if ! HAVE_ENDGRENT
+        -:   41:# define endgrent() ((void) 0)
+        -:   42:#endif
+        -:   43:
+        -:   44:/* The argument to the --reference option.  Use the group ID of this file.
+        -:   45:   This file must exist.  */
+        -:   46:static char *reference_file;
+        -:   47:
+        -:   48:/* For long options that have no equivalent short option, use a
+        -:   49:   non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
+        -:   50:enum
+        -:   51:{
+        -:   52:  DEREFERENCE_OPTION = CHAR_MAX + 1,
+        -:   53:  NO_PRESERVE_ROOT,
+        -:   54:  PRESERVE_ROOT,
+        -:   55:  REFERENCE_FILE_OPTION
+        -:   56:};
+        -:   57:
+        -:   58:static struct option const long_options[] =
+        -:   59:{
+        -:   60:  {"recursive", no_argument, NULL, 'R'},
+        -:   61:  {"changes", no_argument, NULL, 'c'},
+        -:   62:  {"dereference", no_argument, NULL, DEREFERENCE_OPTION},
+        -:   63:  {"no-dereference", no_argument, NULL, 'h'},
+        -:   64:  {"no-preserve-root", no_argument, NULL, NO_PRESERVE_ROOT},
+        -:   65:  {"preserve-root", no_argument, NULL, PRESERVE_ROOT},
+        -:   66:  {"quiet", no_argument, NULL, 'f'},
+        -:   67:  {"silent", no_argument, NULL, 'f'},
+        -:   68:  {"reference", required_argument, NULL, REFERENCE_FILE_OPTION},
+        -:   69:  {"verbose", no_argument, NULL, 'v'},
+        -:   70:  {GETOPT_HELP_OPTION_DECL},
+        -:   71:  {GETOPT_VERSION_OPTION_DECL},
+        -:   72:  {NULL, 0, NULL, 0}
+        -:   73:};
+        -:   74:
+        -:   75:/* Return the group ID of NAME, or -1 if no name was specified.  */
+        -:   76:
+        -:   77:static gid_t
+        2:   78:parse_group (const char *name)
+        -:   79:{
+        2:   80:  gid_t gid = -1;
+        -:   81:
+        2:   82:  if (*name)
+        -:   83:    {
+        2:   84:      struct group *grp = getgrnam (name);
+        2:   85:      if (grp)
+    #####:   86:        gid = grp->gr_gid;
+        -:   87:      else
+        -:   88:        {
+        -:   89:          unsigned long int tmp;
+        4:   90:          if (! (xstrtoul (name, NULL, 10, &tmp, "") == LONGINT_OK
+        2:   91:                 && tmp <= GID_T_MAX))
+    #####:   92:            error (EXIT_FAILURE, 0, _("invalid group: %s"), quote (name));
+        2:   93:          gid = tmp;
+        -:   94:        }
+        2:   95:      endgrent ();		/* Save a file descriptor. */
+        -:   96:    }
+        -:   97:
+        2:   98:  return gid;
+        -:   99:}
+        -:  100:
+        -:  101:void
+    #####:  102:usage (int status)
+        -:  103:{
+    #####:  104:  if (status != EXIT_SUCCESS)
+    #####:  105:    emit_try_help ();
+        -:  106:  else
+        -:  107:    {
+    #####:  108:      printf (_("\
+        -:  109:Usage: %s [OPTION]... GROUP FILE...\n\
+        -:  110:  or:  %s [OPTION]... --reference=RFILE FILE...\n\
+        -:  111:"),
+        -:  112:              program_name, program_name);
+    #####:  113:      fputs (_("\
+        -:  114:Change the group of each FILE to GROUP.\n\
+        -:  115:With --reference, change the group of each FILE to that of RFILE.\n\
+        -:  116:\n\
+        -:  117:"), stdout);
+    #####:  118:      fputs (_("\
+        -:  119:  -c, --changes          like verbose but report only when a change is made\n\
+        -:  120:  -f, --silent, --quiet  suppress most error messages\n\
+        -:  121:  -v, --verbose          output a diagnostic for every file processed\n\
+        -:  122:"), stdout);
+    #####:  123:      fputs (_("\
+        -:  124:      --dereference      affect the referent of each symbolic link (this is\n\
+        -:  125:                         the default), rather than the symbolic link itself\n\
+        -:  126:  -h, --no-dereference   affect symbolic links instead of any referenced file\n\
+        -:  127:"), stdout);
+    #####:  128:      fputs (_("\
+        -:  129:                         (useful only on systems that can change the\n\
+        -:  130:                         ownership of a symlink)\n\
+        -:  131:"), stdout);
+    #####:  132:      fputs (_("\
+        -:  133:      --no-preserve-root  do not treat '/' specially (the default)\n\
+        -:  134:      --preserve-root    fail to operate recursively on '/'\n\
+        -:  135:"), stdout);
+    #####:  136:      fputs (_("\
+        -:  137:      --reference=RFILE  use RFILE's group rather than specifying a\n\
+        -:  138:                         GROUP value\n\
+        -:  139:"), stdout);
+    #####:  140:      fputs (_("\
+        -:  141:  -R, --recursive        operate on files and directories recursively\n\
+        -:  142:"), stdout);
+    #####:  143:      fputs (_("\
+        -:  144:\n\
+        -:  145:The following options modify how a hierarchy is traversed when the -R\n\
+        -:  146:option is also specified.  If more than one is specified, only the final\n\
+        -:  147:one takes effect.\n\
+        -:  148:\n\
+        -:  149:  -H                     if a command line argument is a symbolic link\n\
+        -:  150:                         to a directory, traverse it\n\
+        -:  151:  -L                     traverse every symbolic link to a directory\n\
+        -:  152:                         encountered\n\
+        -:  153:  -P                     do not traverse any symbolic links (default)\n\
+        -:  154:\n\
+        -:  155:"), stdout);
+    #####:  156:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  157:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  158:      printf (_("\
+        -:  159:\n\
+        -:  160:Examples:\n\
+        -:  161:  %s staff /u      Change the group of /u to \"staff\".\n\
+        -:  162:  %s -hR staff /u  Change the group of /u and subfiles to \"staff\".\n\
+        -:  163:"),
+        -:  164:              program_name, program_name);
+    #####:  165:      emit_ancillary_info ();
+        -:  166:    }
+    #####:  167:  exit (status);
+        -:  168:}
+        -:  169:
+        -:  170:int
+        2:  171:main (int argc, char **argv)
+        -:  172:{
+        2:  173:  bool preserve_root = false;
+        -:  174:  gid_t gid;
+        -:  175:
+        -:  176:  /* Bit flags that control how fts works.  */
+        2:  177:  int bit_flags = FTS_PHYSICAL;
+        -:  178:
+        -:  179:  /* 1 if --dereference, 0 if --no-dereference, -1 if neither has been
+        -:  180:     specified.  */
+        2:  181:  int dereference = -1;
+        -:  182:
+        -:  183:  struct Chown_option chopt;
+        -:  184:  bool ok;
+        -:  185:  int optc;
+        -:  186:
+        -:  187:  initialize_main (&argc, &argv);
+        2:  188:  set_program_name (argv[0]);
+        2:  189:  setlocale (LC_ALL, "");
+        -:  190:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  191:  textdomain (PACKAGE);
+        -:  192:
+        2:  193:  atexit (close_stdout);
+        -:  194:
+        2:  195:  chopt_init (&chopt);
+        -:  196:
+        2:  197:  while ((optc = getopt_long (argc, argv, "HLPRcfhv", long_options, NULL))
+        -:  198:         != -1)
+        -:  199:    {
+    #####:  200:      switch (optc)
+        -:  201:        {
+        -:  202:        case 'H': /* Traverse command-line symlinks-to-directories.  */
+    #####:  203:          bit_flags = FTS_COMFOLLOW | FTS_PHYSICAL;
+    #####:  204:          break;
+        -:  205:
+        -:  206:        case 'L': /* Traverse all symlinks-to-directories.  */
+    #####:  207:          bit_flags = FTS_LOGICAL;
+    #####:  208:          break;
+        -:  209:
+        -:  210:        case 'P': /* Traverse no symlinks-to-directories.  */
+    #####:  211:          bit_flags = FTS_PHYSICAL;
+    #####:  212:          break;
+        -:  213:
+        -:  214:        case 'h': /* --no-dereference: affect symlinks */
+    #####:  215:          dereference = 0;
+    #####:  216:          break;
+        -:  217:
+        -:  218:        case DEREFERENCE_OPTION: /* --dereference: affect the referent
+        -:  219:                                    of each symlink */
+    #####:  220:          dereference = 1;
+    #####:  221:          break;
+        -:  222:
+        -:  223:        case NO_PRESERVE_ROOT:
+    #####:  224:          preserve_root = false;
+    #####:  225:          break;
+        -:  226:
+        -:  227:        case PRESERVE_ROOT:
+    #####:  228:          preserve_root = true;
+    #####:  229:          break;
+        -:  230:
+        -:  231:        case REFERENCE_FILE_OPTION:
+    #####:  232:          reference_file = optarg;
+    #####:  233:          break;
+        -:  234:
+        -:  235:        case 'R':
+    #####:  236:          chopt.recurse = true;
+    #####:  237:          break;
+        -:  238:
+        -:  239:        case 'c':
+    #####:  240:          chopt.verbosity = V_changes_only;
+    #####:  241:          break;
+        -:  242:
+        -:  243:        case 'f':
+    #####:  244:          chopt.force_silent = true;
+    #####:  245:          break;
+        -:  246:
+        -:  247:        case 'v':
+    #####:  248:          chopt.verbosity = V_high;
+    #####:  249:          break;
+        -:  250:
+    #####:  251:        case_GETOPT_HELP_CHAR;
+    #####:  252:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  253:        default:
+    #####:  254:          usage (EXIT_FAILURE);
+        -:  255:        }
+        -:  256:    }
+        -:  257:
+        2:  258:  if (chopt.recurse)
+        -:  259:    {
+    #####:  260:      if (bit_flags == FTS_PHYSICAL)
+        -:  261:        {
+    #####:  262:          if (dereference == 1)
+    #####:  263:            error (EXIT_FAILURE, 0,
+        -:  264:                   _("-R --dereference requires either -H or -L"));
+    #####:  265:          dereference = 0;
+        -:  266:        }
+        -:  267:    }
+        -:  268:  else
+        -:  269:    {
+        2:  270:      bit_flags = FTS_PHYSICAL;
+        -:  271:    }
+        2:  272:  chopt.affect_symlink_referent = (dereference != 0);
+        -:  273:
+        2:  274:  if (argc - optind < (reference_file ? 1 : 2))
+        -:  275:    {
+    #####:  276:      if (argc <= optind)
+    #####:  277:        error (0, 0, _("missing operand"));
+        -:  278:      else
+    #####:  279:        error (0, 0, _("missing operand after %s"), quote (argv[argc - 1]));
+    #####:  280:      usage (EXIT_FAILURE);
+        -:  281:    }
+        -:  282:
+        2:  283:  if (reference_file)
+        -:  284:    {
+        -:  285:      struct stat ref_stats;
+    #####:  286:      if (stat (reference_file, &ref_stats))
+    #####:  287:        error (EXIT_FAILURE, errno, _("failed to get attributes of %s"),
+        -:  288:               quote (reference_file));
+        -:  289:
+    #####:  290:      gid = ref_stats.st_gid;
+    #####:  291:      chopt.group_name = gid_to_name (ref_stats.st_gid);
+        -:  292:    }
+        -:  293:  else
+        -:  294:    {
+        2:  295:      char *group_name = argv[optind++];
+        2:  296:      chopt.group_name = (*group_name ? group_name : NULL);
+        2:  297:      gid = parse_group (group_name);
+        -:  298:    }
+        -:  299:
+        2:  300:  if (chopt.recurse && preserve_root)
+        -:  301:    {
+        -:  302:      static struct dev_ino dev_ino_buf;
+    #####:  303:      chopt.root_dev_ino = get_root_dev_ino (&dev_ino_buf);
+    #####:  304:      if (chopt.root_dev_ino == NULL)
+    #####:  305:        error (EXIT_FAILURE, errno, _("failed to get attributes of %s"),
+        -:  306:               quote ("/"));
+        -:  307:    }
+        -:  308:
+        2:  309:  bit_flags |= FTS_DEFER_STAT;
+        2:  310:  ok = chown_files (argv + optind, bit_flags,
+        -:  311:                    (uid_t) -1, gid,
+        -:  312:                    (uid_t) -1, (gid_t) -1, &chopt);
+        -:  313:
+        2:  314:  chopt_free (&chopt);
+        -:  315:
+        2:  316:  exit (ok ? EXIT_SUCCESS : EXIT_FAILURE);
+        -:  317:}

@@ -1,0 +1,1596 @@
+        -:    0:Source:remove.c
+        -:    0:Graph:remove.gcno
+        -:    0:Data:remove.gcda
+        -:    0:Runs:12
+        -:    0:Programs:1
+        -:    1:/* remove.c -- core functions for removing files and directories
+        -:    2:   Copyright (C) 88, 90, 91, 1994-2007 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software; you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation; either version 2, or (at your option)
+        -:    7:   any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program; if not, write to the Free Software Foundation,
+        -:   16:   Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.  */
+        -:   17:
+        -:   18:/* Extracted from rm.c and librarified, then rewritten by Jim Meyering.  */
+        -:   19:
+        -:   20:#include <config.h>
+        -:   21:#include <stdio.h>
+        -:   22:#include <sys/types.h>
+        -:   23:#include <setjmp.h>
+        -:   24:#include <assert.h>
+        -:   25:
+        -:   26:#include "system.h"
+        -:   27:#include "cycle-check.h"
+        -:   28:#include "dirfd.h"
+        -:   29:#include "error.h"
+        -:   30:#include "euidaccess.h"
+        -:   31:#include "euidaccess-stat.h"
+        -:   32:#include "file-type.h"
+        -:   33:#include "hash.h"
+        -:   34:#include "hash-pjw.h"
+        -:   35:#include "lstat.h"
+        -:   36:#include "obstack.h"
+        -:   37:#include "openat.h"
+        -:   38:#include "quote.h"
+        -:   39:#include "remove.h"
+        -:   40:#include "root-dev-ino.h"
+        -:   41:#include "unlinkdir.h"
+        -:   42:#include "write-any-file.h"
+        -:   43:#include "yesno.h"
+        -:   44:
+        -:   45:/* Avoid shadowing warnings because these are functions declared
+        -:   46:   in dirname.h as well as locals used below.  */
+        -:   47:#define dir_name rm_dir_name
+        -:   48:#define dir_len rm_dir_len
+        -:   49:
+        -:   50:#define obstack_chunk_alloc malloc
+        -:   51:#define obstack_chunk_free free
+        -:   52:
+        -:   53:/* This is the maximum number of consecutive readdir/unlink calls that
+        -:   54:   can be made (with no intervening rewinddir or closedir/opendir) before
+        -:   55:   triggering a bug that makes readdir return NULL even though some
+        -:   56:   directory entries have not been processed.  The bug afflicts SunOS's
+        -:   57:   readdir when applied to ufs file systems and Darwin 6.5's (and OSX
+        -:   58:   v.10.3.8's) HFS+.  This maximum is conservative in that demonstrating
+        -:   59:   the problem requires a directory containing at least 16 deletable
+        -:   60:   entries (which doesn't count . and ..).
+        -:   61:   This problem also affects Darwin 7.9.0 (aka MacOS X 10.3.9) on HFS+
+        -:   62:   and NFS-mounted file systems, but not vfat ones.  */
+        -:   63:enum
+        -:   64:  {
+        -:   65:    CONSECUTIVE_READDIR_UNLINK_THRESHOLD = 10
+        -:   66:  };
+        -:   67:
+        -:   68:/* FIXME: in 2009, or whenever Darwin 7.9.0 (aka MacOS X 10.3.9) is no
+        -:   69:   longer relevant, remove this work-around code.  Then, there will be
+        -:   70:   no need to perform the extra rewinddir call, ever.  */
+        -:   71:#define NEED_REWIND(readdir_unlink_count) \
+        -:   72:  (CONSECUTIVE_READDIR_UNLINK_THRESHOLD <= (readdir_unlink_count))
+        -:   73:
+        -:   74:enum Ternary
+        -:   75:  {
+        -:   76:    T_UNKNOWN = 2,
+        -:   77:    T_NO,
+        -:   78:    T_YES
+        -:   79:  };
+        -:   80:typedef enum Ternary Ternary;
+        -:   81:
+        -:   82:/* The prompt function may be called twice for a given directory.
+        -:   83:   The first time, we ask whether to descend into it, and the
+        -:   84:   second time, we ask whether to remove it.  */
+        -:   85:enum Prompt_action
+        -:   86:  {
+        -:   87:    PA_DESCEND_INTO_DIR = 2,
+        -:   88:    PA_REMOVE_DIR
+        -:   89:  };
+        -:   90:
+        -:   91:/* Initial capacity of per-directory hash table of entries that have
+        -:   92:   been processed but not been deleted.  */
+        -:   93:enum { HT_UNREMOVABLE_INITIAL_CAPACITY = 13 };
+        -:   94:
+        -:   95:/* An entry in the active directory stack.
+        -:   96:   Each entry corresponds to an `active' directory.  */
+        -:   97:struct AD_ent
+        -:   98:{
+        -:   99:  /* For a given active directory, this is the set of names of
+        -:  100:     entries in that directory that could/should not be removed.
+        -:  101:     For example, `.' and `..', as well as files/dirs for which
+        -:  102:     unlink/rmdir failed e.g., due to access restrictions.  */
+        -:  103:  Hash_table *unremovable;
+        -:  104:
+        -:  105:  /* Record the status for a given active directory; we need to know
+        -:  106:     whether an entry was not removed, either because of an error or
+        -:  107:     because the user declined.  */
+        -:  108:  enum RM_status status;
+        -:  109:
+        -:  110:  /* The directory's dev/ino.  Used to ensure that a malicious user does
+        -:  111:     not replace a directory we're about to process with a symlink to
+        -:  112:     some other directory.  */
+        -:  113:  struct dev_ino dev_ino;
+        -:  114:};
+        -:  115:
+        -:  116:/* D_TYPE(D) is the type of directory entry D if known, DT_UNKNOWN
+        -:  117:   otherwise.  */
+        -:  118:#if HAVE_STRUCT_DIRENT_D_TYPE
+        -:  119:# define D_TYPE(d) ((d)->d_type)
+        -:  120:#else
+        -:  121:# define D_TYPE(d) DT_UNKNOWN
+        -:  122:
+        -:  123:/* Any int values will do here, so long as they're distinct.
+        -:  124:   Undef any existing macros out of the way.  */
+        -:  125:# undef DT_UNKNOWN
+        -:  126:# undef DT_DIR
+        -:  127:# undef DT_LNK
+        -:  128:# define DT_UNKNOWN 0
+        -:  129:# define DT_DIR 1
+        -:  130:# define DT_LNK 2
+        -:  131:#endif
+        -:  132:
+        -:  133:extern char *program_name;
+        -:  134:
+        -:  135:struct dirstack_state
+        -:  136:{
+        -:  137:  /* The name of the directory (starting with and relative to a command
+        -:  138:     line argument) being processed.  When a subdirectory is entered, a new
+        -:  139:     component is appended (pushed).  Remove (pop) the top component
+        -:  140:     upon chdir'ing out of a directory.  This is used to form the full
+        -:  141:     name of the current directory or a file therein, when necessary.  */
+        -:  142:  struct obstack dir_stack;
+        -:  143:
+        -:  144:  /* Stack of lengths of directory names (including trailing slash)
+        -:  145:     appended to dir_stack.  We have to have a separate stack of lengths
+        -:  146:     (rather than just popping back to previous slash) because the first
+        -:  147:     element pushed onto the dir stack may contain slashes.  */
+        -:  148:  struct obstack len_stack;
+        -:  149:
+        -:  150:  /* Stack of active directory entries.
+        -:  151:     The first `active' directory is the initial working directory.
+        -:  152:     Additional active dirs are pushed onto the stack as we `chdir'
+        -:  153:     into each directory to be processed.  When finished with the
+        -:  154:     hierarchy under a directory, pop the active dir stack.  */
+        -:  155:  struct obstack Active_dir;
+        -:  156:
+        -:  157:  /* Used to detect cycles.  */
+        -:  158:  struct cycle_check_state cycle_check_state;
+        -:  159:
+        -:  160:  /* Target of a longjmp in case rm has to stop processing the current
+        -:  161:     command-line argument.  This happens 1) when rm detects a directory
+        -:  162:     cycle or 2) when it has processed one or more directories, but then
+        -:  163:     is unable to return to the initial working directory to process
+        -:  164:     additional `.'-relative command-line arguments.  */
+        -:  165:  jmp_buf current_arg_jumpbuf;
+        -:  166:};
+        -:  167:typedef struct dirstack_state Dirstack_state;
+        -:  168:
+        -:  169:/* Like fstatat, but cache the result.  If ST->st_size is -1, the
+        -:  170:   status has not been gotten yet.  If less than -1, fstatat failed
+        -:  171:   with errno == -1 - ST->st_size.  Otherwise, the status has already
+        -:  172:   been gotten, so return 0.  */
+        -:  173:static int
+    #####:  174:cache_fstatat (int fd, char const *file, struct stat *st, int flag)
+        -:  175:{
+    #####:  176:  if (st->st_size == -1 && fstatat (fd, file, st, flag) != 0)
+    #####:  177:    st->st_size = -1 - errno;
+    #####:  178:  if (0 <= st->st_size)
+    #####:  179:    return 0;
+    #####:  180:  errno = -1 - st->st_size;
+    #####:  181:  return -1;
+        -:  182:}
+        -:  183:
+        -:  184:/* Initialize a fstatat cache *ST.  Return ST for convenience.  */
+        -:  185:static inline struct stat *
+       14:  186:cache_stat_init (struct stat *st)
+        -:  187:{
+       14:  188:  st->st_size = -1;
+       14:  189:  return st;
+        -:  190:}
+        -:  191:
+        -:  192:/* Return true if *ST has been statted.  */
+        -:  193:static inline bool
+        -:  194:cache_statted (struct stat *st)
+        -:  195:{
+        -:  196:  return (st->st_size != -1);
+        -:  197:}
+        -:  198:
+        -:  199:/* Return true if *ST has been statted successfully.  */
+        -:  200:static inline bool
+    #####:  201:cache_stat_ok (struct stat *st)
+        -:  202:{
+    #####:  203:  return (0 <= st->st_size);
+        -:  204:}
+        -:  205:
+        -:  206:
+        -:  207:static void
+    #####:  208:hash_freer (void *x)
+        -:  209:{
+    #####:  210:  free (x);
+    #####:  211:}
+        -:  212:
+        -:  213:static bool
+    #####:  214:hash_compare_strings (void const *x, void const *y)
+        -:  215:{
+    #####:  216:  return STREQ (x, y) ? true : false;
+        -:  217:}
+        -:  218:
+        -:  219:static inline void
+    #####:  220:push_dir (Dirstack_state *ds, const char *dir_name)
+        -:  221:{
+    #####:  222:  size_t len = strlen (dir_name);
+        -:  223:
+        -:  224:  /* Append the string onto the stack.  */
+    #####:  225:  obstack_grow (&ds->dir_stack, dir_name, len);
+        -:  226:
+        -:  227:  /* Append a trailing slash.  */
+    #####:  228:  obstack_1grow (&ds->dir_stack, '/');
+        -:  229:
+        -:  230:  /* Add one for the slash.  */
+    #####:  231:  ++len;
+        -:  232:
+        -:  233:  /* Push the length (including slash) onto its stack.  */
+    #####:  234:  obstack_grow (&ds->len_stack, &len, sizeof (len));
+    #####:  235:}
+        -:  236:
+        -:  237:/* Return the entry name of the directory on the top of the stack
+        -:  238:   in malloc'd storage.  */
+        -:  239:static inline char *
+    #####:  240:top_dir (Dirstack_state const *ds)
+        -:  241:{
+    #####:  242:  size_t n_lengths = obstack_object_size (&ds->len_stack) / sizeof (size_t);
+    #####:  243:  size_t *length = obstack_base (&ds->len_stack);
+    #####:  244:  size_t top_len = length[n_lengths - 1];
+    #####:  245:  char const *p = obstack_next_free (&ds->dir_stack) - top_len;
+    #####:  246:  char *q = xmalloc (top_len);
+    #####:  247:  memcpy (q, p, top_len - 1);
+    #####:  248:  q[top_len - 1] = 0;
+    #####:  249:  return q;
+        -:  250:}
+        -:  251:
+        -:  252:static inline void
+    #####:  253:pop_dir (Dirstack_state *ds)
+        -:  254:{
+    #####:  255:  size_t n_lengths = obstack_object_size (&ds->len_stack) / sizeof (size_t);
+    #####:  256:  size_t *length = obstack_base (&ds->len_stack);
+        -:  257:
+    #####:  258:  assert (n_lengths > 0);
+    #####:  259:  size_t top_len = length[n_lengths - 1];
+    #####:  260:  assert (top_len >= 2);
+        -:  261:
+        -:  262:  /* Pop the specified length of file name.  */
+    #####:  263:  assert (obstack_object_size (&ds->dir_stack) >= top_len);
+    #####:  264:  obstack_blank (&ds->dir_stack, -top_len);
+        -:  265:
+        -:  266:  /* Pop the length stack, too.  */
+    #####:  267:  assert (obstack_object_size (&ds->len_stack) >= sizeof (size_t));
+    #####:  268:  obstack_blank (&ds->len_stack, -(int) sizeof (size_t));
+    #####:  269:}
+        -:  270:
+        -:  271:/* Copy the SRC_LEN bytes of data beginning at SRC into the DST_LEN-byte
+        -:  272:   buffer, DST, so that the last source byte is at the end of the destination
+        -:  273:   buffer.  If SRC_LEN is longer than DST_LEN, then set *TRUNCATED.
+        -:  274:   Set *RESULT to point to the beginning of (the portion of) the source data
+        -:  275:   in DST.  Return the number of bytes remaining in the destination buffer.  */
+        -:  276:
+        -:  277:static size_t
+    #####:  278:right_justify (char *dst, size_t dst_len, const char *src, size_t src_len,
+        -:  279:	       char **result, bool *truncated)
+        -:  280:{
+        -:  281:  const char *sp;
+        -:  282:  char *dp;
+        -:  283:
+    #####:  284:  if (src_len <= dst_len)
+        -:  285:    {
+    #####:  286:      sp = src;
+    #####:  287:      dp = dst + (dst_len - src_len);
+    #####:  288:      *truncated = false;
+        -:  289:    }
+        -:  290:  else
+        -:  291:    {
+    #####:  292:      sp = src + (src_len - dst_len);
+    #####:  293:      dp = dst;
+    #####:  294:      src_len = dst_len;
+    #####:  295:      *truncated = true;
+        -:  296:    }
+        -:  297:
+    #####:  298:  *result = memcpy (dp, sp, src_len);
+    #####:  299:  return dst_len - src_len;
+        -:  300:}
+        -:  301:
+        -:  302:/* Using the global directory name obstack, create the full name FILENAME.
+        -:  303:   Return it in sometimes-realloc'd space that should not be freed by the
+        -:  304:   caller.  Realloc as necessary.  If realloc fails, use a static buffer
+        -:  305:   and put as long a suffix in that buffer as possible.  */
+        -:  306:
+        -:  307:#define full_filename(Filename) full_filename_ (ds, Filename)
+        -:  308:static char *
+    #####:  309:full_filename_ (Dirstack_state const *ds, const char *filename)
+        -:  310:{
+        -:  311:  static char *buf = NULL;
+        -:  312:  static size_t n_allocated = 0;
+        -:  313:
+    #####:  314:  size_t dir_len = obstack_object_size (&ds->dir_stack);
+    #####:  315:  char *dir_name = obstack_base (&ds->dir_stack);
+        -:  316:  size_t n_bytes_needed;
+        -:  317:  size_t filename_len;
+        -:  318:
+    #####:  319:  filename_len = strlen (filename);
+    #####:  320:  n_bytes_needed = dir_len + filename_len + 1;
+        -:  321:
+    #####:  322:  if (n_allocated < n_bytes_needed)
+        -:  323:    {
+        -:  324:      /* This code requires that realloc accept NULL as the first arg.
+        -:  325:         This function must not use xrealloc.  Otherwise, an out-of-memory
+        -:  326:	 error involving a file name to be expanded here wouldn't ever
+        -:  327:	 be issued.  Use realloc and fall back on using a static buffer
+        -:  328:	 if memory allocation fails.  */
+    #####:  329:      char *new_buf = realloc (buf, n_bytes_needed);
+    #####:  330:      n_allocated = n_bytes_needed;
+        -:  331:
+    #####:  332:      if (new_buf == NULL)
+        -:  333:	{
+        -:  334:#define SBUF_SIZE 512
+        -:  335:#define ELLIPSES_PREFIX "[...]"
+        -:  336:	  static char static_buf[SBUF_SIZE];
+        -:  337:	  bool truncated;
+        -:  338:	  size_t len;
+        -:  339:	  char *p;
+        -:  340:
+    #####:  341:	  free (buf);
+    #####:  342:	  len = right_justify (static_buf, SBUF_SIZE, filename,
+        -:  343:			       filename_len + 1, &p, &truncated);
+    #####:  344:	  right_justify (static_buf, len, dir_name, dir_len, &p, &truncated);
+    #####:  345:	  if (truncated)
+        -:  346:	    {
+    #####:  347:	      memcpy (static_buf, ELLIPSES_PREFIX,
+        -:  348:		      sizeof (ELLIPSES_PREFIX) - 1);
+        -:  349:	    }
+    #####:  350:	  return p;
+        -:  351:	}
+        -:  352:
+    #####:  353:      buf = new_buf;
+        -:  354:    }
+        -:  355:
+    #####:  356:  if (filename_len == 1 && *filename == '.' && dir_len)
+    #####:  357:    {
+        -:  358:      /* FILENAME is just `.' and dir_len is nonzero.
+        -:  359:	 Copy the directory part, omitting the trailing slash,
+        -:  360:	 and append a trailing zero byte.  */
+    #####:  361:      char *p = mempcpy (buf, dir_name, dir_len - 1);
+    #####:  362:      *p = 0;
+        -:  363:    }
+        -:  364:  else
+        -:  365:    {
+        -:  366:      /* Copy the directory part, including trailing slash, and then
+        -:  367:	 append the filename part, including a trailing zero byte.  */
+    #####:  368:      memcpy (mempcpy (buf, dir_name, dir_len), filename, filename_len + 1);
+    #####:  369:      assert (strlen (buf) + 1 == n_bytes_needed);
+        -:  370:    }
+        -:  371:
+    #####:  372:  return buf;
+        -:  373:}
+        -:  374:
+        -:  375:static inline size_t
+       42:  376:AD_stack_height (Dirstack_state const *ds)
+        -:  377:{
+       42:  378:  return obstack_object_size (&ds->Active_dir) / sizeof (struct AD_ent);
+        -:  379:}
+        -:  380:
+        -:  381:static inline struct AD_ent *
+       42:  382:AD_stack_top (Dirstack_state const *ds)
+        -:  383:{
+       42:  384:  return (struct AD_ent *)
+       42:  385:    ((char *) obstack_next_free (&ds->Active_dir) - sizeof (struct AD_ent));
+        -:  386:}
+        -:  387:
+        -:  388:static void
+       14:  389:AD_stack_pop (Dirstack_state *ds)
+        -:  390:{
+       14:  391:  assert (0 < AD_stack_height (ds));
+        -:  392:
+        -:  393:  /* operate on Active_dir.  pop and free top entry */
+       14:  394:  struct AD_ent *top = AD_stack_top (ds);
+       14:  395:  if (top->unremovable)
+    #####:  396:    hash_free (top->unremovable);
+       14:  397:  obstack_blank (&ds->Active_dir, -(int) sizeof (struct AD_ent));
+       14:  398:}
+        -:  399:
+        -:  400:static void
+    #####:  401:AD_stack_clear (Dirstack_state *ds)
+        -:  402:{
+    #####:  403:  while (0 < AD_stack_height (ds))
+        -:  404:    {
+    #####:  405:      AD_stack_pop (ds);
+        -:  406:    }
+    #####:  407:}
+        -:  408:
+        -:  409:static Dirstack_state *
+       12:  410:ds_init (void)
+        -:  411:{
+       12:  412:  Dirstack_state *ds = xmalloc (sizeof *ds);
+       12:  413:  obstack_init (&ds->dir_stack);
+       12:  414:  obstack_init (&ds->len_stack);
+       12:  415:  obstack_init (&ds->Active_dir);
+       12:  416:  return ds;
+        -:  417:}
+        -:  418:
+        -:  419:static void
+       14:  420:ds_clear (Dirstack_state *ds)
+        -:  421:{
+       14:  422:  obstack_free (&ds->dir_stack, obstack_finish (&ds->dir_stack));
+       14:  423:  obstack_free (&ds->len_stack, obstack_finish (&ds->len_stack));
+       42:  424:  while (0 < AD_stack_height (ds))
+       14:  425:    AD_stack_pop (ds);
+       14:  426:  obstack_free (&ds->Active_dir, obstack_finish (&ds->Active_dir));
+       14:  427:}
+        -:  428:
+        -:  429:static void
+       12:  430:ds_free (Dirstack_state *ds)
+        -:  431:{
+       12:  432:  obstack_free (&ds->dir_stack, NULL);
+       12:  433:  obstack_free (&ds->len_stack, NULL);
+       12:  434:  obstack_free (&ds->Active_dir, NULL);
+       12:  435:  free (ds);
+       12:  436:}
+        -:  437:
+        -:  438:/* Pop the active directory (AD) stack and prepare to move `up' one level,
+        -:  439:   safely.  Moving `up' usually means opening `..', but when we've just
+        -:  440:   finished recursively processing a command-line directory argument,
+        -:  441:   there's nothing left on the stack, so set *FDP to AT_FDCWD in that case.
+        -:  442:   The idea is to return with *FDP opened on the parent directory,
+        -:  443:   assuming there are entries in that directory that we need to remove.
+        -:  444:
+        -:  445:   Note that we must not call opendir (or fdopendir) just yet, since
+        -:  446:   the caller must first remove the directory we're coming from.
+        -:  447:   That is because some file system implementations cache readdir
+        -:  448:   results at opendir time; so calling opendir, rmdir, readdir would
+        -:  449:   return an entry for the just-removed directory.
+        -:  450:
+        -:  451:   Whenever using chdir '..' (virtually, now, via openat), verify
+        -:  452:   that the post-chdir dev/ino numbers for `.' match the saved ones.
+        -:  453:   If any system call fails or if dev/ino don't match, then give a
+        -:  454:   diagnostic and longjump out.
+        -:  455:   Return the name (in malloc'd storage) of the
+        -:  456:   directory (usually now empty) from which we're coming, and which
+        -:  457:   corresponds to the input value of DIRP.
+        -:  458:
+        -:  459:   Finally, note that while this function's name is no longer as
+        -:  460:   accurate as it once was (it no longer calls chdir), it does open
+        -:  461:   the destination directory.  */
+        -:  462:static char *
+    #####:  463:AD_pop_and_chdir (DIR *dirp, int *fdp, Dirstack_state *ds)
+        -:  464:{
+    #####:  465:  struct AD_ent *leaf_dir_ent = AD_stack_top(ds);
+    #####:  466:  struct dev_ino leaf_dev_ino = leaf_dir_ent->dev_ino;
+    #####:  467:  enum RM_status old_status = leaf_dir_ent->status;
+        -:  468:  struct AD_ent *top;
+        -:  469:
+        -:  470:  /* Get the name of the current (but soon to be `previous') directory
+        -:  471:     from the top of the stack.  */
+    #####:  472:  char *prev_dir = top_dir (ds);
+        -:  473:
+    #####:  474:  AD_stack_pop (ds);
+    #####:  475:  pop_dir (ds);
+    #####:  476:  top = AD_stack_top (ds);
+        -:  477:
+        -:  478:  /* If the directory we're about to leave (and try to rmdir)
+        -:  479:     is the one whose dev_ino is being used to detect a cycle,
+        -:  480:     reset cycle_check_state.dev_ino to that of the parent.
+        -:  481:     Otherwise, once that directory is removed, its dev_ino
+        -:  482:     could be reused in the creation (by some other process)
+        -:  483:     of a directory that this rm process would encounter,
+        -:  484:     which would result in a false-positive cycle indication.  */
+    #####:  485:  CYCLE_CHECK_REFLECT_CHDIR_UP (&ds->cycle_check_state,
+        -:  486:				top->dev_ino, leaf_dev_ino);
+        -:  487:
+        -:  488:  /* Propagate any failure to parent.  */
+    #####:  489:  UPDATE_STATUS (top->status, old_status);
+        -:  490:
+    #####:  491:  assert (AD_stack_height (ds));
+        -:  492:
+    #####:  493:  if (1 < AD_stack_height (ds))
+        -:  494:    {
+        -:  495:      struct stat sb;
+    #####:  496:      int fd = openat (dirfd (dirp), "..", O_RDONLY);
+    #####:  497:      if (closedir (dirp) != 0)
+        -:  498:	{
+    #####:  499:	  error (0, errno, _("FATAL: failed to close directory %s"),
+    #####:  500:		 quote (full_filename (prev_dir)));
+    #####:  501:	  goto next_cmdline_arg;
+        -:  502:	}
+        -:  503:
+        -:  504:      /* The above fails with EACCES when DIRP is readable but not
+        -:  505:	 searchable, when using Solaris' openat.  Without this openat
+        -:  506:	 call, tests/rm2 would fail to remove directories a/2 and a/3.  */
+    #####:  507:      if (fd < 0)
+    #####:  508:	fd = openat (AT_FDCWD, full_filename ("."), O_RDONLY);
+        -:  509:
+    #####:  510:      if (fd < 0)
+        -:  511:	{
+    #####:  512:	  error (0, errno, _("FATAL: cannot open .. from %s"),
+    #####:  513:		 quote (full_filename (prev_dir)));
+    #####:  514:	  goto next_cmdline_arg;
+        -:  515:	}
+        -:  516:
+    #####:  517:      if (fstat (fd, &sb))
+        -:  518:	{
+    #####:  519:	  error (0, errno,
+        -:  520:		 _("FATAL: cannot ensure %s (returned to via ..) is safe"),
+    #####:  521:		 quote (full_filename (".")));
+    #####:  522:	  goto close_and_next;
+        -:  523:	}
+        -:  524:
+        -:  525:      /*  Ensure that post-chdir dev/ino match the stored ones.  */
+    #####:  526:      if ( ! SAME_INODE (sb, top->dev_ino))
+        -:  527:	{
+    #####:  528:	  error (0, 0, _("FATAL: directory %s changed dev/ino"),
+    #####:  529:		 quote (full_filename (".")));
+        -:  530:	close_and_next:;
+    #####:  531:	  close (fd);
+        -:  532:
+        -:  533:	next_cmdline_arg:;
+    #####:  534:	  free (prev_dir);
+    #####:  535:	  longjmp (ds->current_arg_jumpbuf, 1);
+        -:  536:	}
+    #####:  537:      *fdp = fd;
+        -:  538:    }
+        -:  539:  else
+        -:  540:    {
+    #####:  541:      if (closedir (dirp) != 0)
+        -:  542:	{
+    #####:  543:	  error (0, errno, _("FATAL: failed to close directory %s"),
+    #####:  544:		 quote (full_filename (prev_dir)));
+    #####:  545:	  goto next_cmdline_arg;
+        -:  546:	}
+    #####:  547:      *fdp = AT_FDCWD;
+        -:  548:    }
+        -:  549:
+    #####:  550:  return prev_dir;
+        -:  551:}
+        -:  552:
+        -:  553:/* Initialize *HT if it is NULL.  Return *HT.  */
+        -:  554:static Hash_table *
+    #####:  555:AD_ensure_initialized (Hash_table **ht)
+        -:  556:{
+    #####:  557:  if (*ht == NULL)
+        -:  558:    {
+    #####:  559:      *ht = hash_initialize (HT_UNREMOVABLE_INITIAL_CAPACITY, NULL, hash_pjw,
+        -:  560:			     hash_compare_strings, hash_freer);
+    #####:  561:      if (*ht == NULL)
+    #####:  562:	xalloc_die ();
+        -:  563:    }
+        -:  564:
+    #####:  565:  return *ht;
+        -:  566:}
+        -:  567:
+        -:  568:/* Initialize *HT if it is NULL.
+        -:  569:   Insert FILENAME into HT.  */
+        -:  570:static void
+    #####:  571:AD_mark_helper (Hash_table **ht, char *filename)
+        -:  572:{
+    #####:  573:  void *ent = hash_insert (AD_ensure_initialized (ht), filename);
+    #####:  574:  if (ent == NULL)
+    #####:  575:    xalloc_die ();
+        -:  576:  else
+        -:  577:    {
+    #####:  578:      if (ent != filename)
+    #####:  579:	free (filename);
+        -:  580:    }
+    #####:  581:}
+        -:  582:
+        -:  583:/* Mark FILENAME (in current directory) as unremovable.  */
+        -:  584:static void
+    #####:  585:AD_mark_as_unremovable (Dirstack_state *ds, char const *filename)
+        -:  586:{
+    #####:  587:  AD_mark_helper (&AD_stack_top(ds)->unremovable, xstrdup (filename));
+    #####:  588:}
+        -:  589:
+        -:  590:/* Mark the current directory as unremovable.  I.e., mark the entry
+        -:  591:   in the parent directory corresponding to `.'.
+        -:  592:   This happens e.g., when an opendir fails and the only name
+        -:  593:   the caller has conveniently at hand is `.'.  */
+        -:  594:static void
+    #####:  595:AD_mark_current_as_unremovable (Dirstack_state *ds)
+        -:  596:{
+    #####:  597:  struct AD_ent *top = AD_stack_top (ds);
+    #####:  598:  char *curr = top_dir (ds);
+        -:  599:
+    #####:  600:  assert (1 < AD_stack_height (ds));
+        -:  601:
+    #####:  602:  --top;
+    #####:  603:  AD_mark_helper (&top->unremovable, curr);
+    #####:  604:}
+        -:  605:
+        -:  606:/* Push an initial dummy entry onto the stack.
+        -:  607:   This will always be the bottommost entry on the stack.  */
+        -:  608:static void
+       14:  609:AD_push_initial (Dirstack_state *ds)
+        -:  610:{
+        -:  611:  struct AD_ent *top;
+        -:  612:
+        -:  613:  /* Extend the stack.  */
+       14:  614:  obstack_blank (&ds->Active_dir, sizeof (struct AD_ent));
+        -:  615:
+        -:  616:  /* Fill in the new values.  */
+       14:  617:  top = AD_stack_top (ds);
+       14:  618:  top->unremovable = NULL;
+        -:  619:
+        -:  620:  /* These should never be used.
+        -:  621:     Give them values that might look suspicious
+        -:  622:     in a debugger or in a diagnostic.  */
+       14:  623:  top->dev_ino.st_dev = TYPE_MAXIMUM (dev_t);
+       14:  624:  top->dev_ino.st_ino = TYPE_MAXIMUM (ino_t);
+       14:  625:}
+        -:  626:
+        -:  627:/* Push info about the current working directory (".") onto the
+        -:  628:   active directory stack.  DIR is the ./-relative name through
+        -:  629:   which we've just `chdir'd to this directory.  DIR_SB_FROM_PARENT
+        -:  630:   is the result of calling lstat on DIR from the parent of DIR.
+        -:  631:   Longjump out (skipping the entire command line argument we're
+        -:  632:   dealing with) if `fstat (FD_CWD, ...' fails or if someone has
+        -:  633:   replaced DIR with e.g., a symlink to some other directory.  */
+        -:  634:static void
+    #####:  635:AD_push (int fd_cwd, Dirstack_state *ds, char const *dir,
+        -:  636:	 struct stat const *dir_sb_from_parent)
+        -:  637:{
+        -:  638:  struct AD_ent *top;
+        -:  639:
+    #####:  640:  push_dir (ds, dir);
+        -:  641:
+        -:  642:  /* If our uses of openat are guaranteed not to
+        -:  643:     follow a symlink, then we can skip this check.  */
+        -:  644:  if (! HAVE_WORKING_O_NOFOLLOW)
+        -:  645:    {
+        -:  646:      struct stat sb;
+        -:  647:      if (fstat (fd_cwd, &sb) != 0)
+        -:  648:	{
+        -:  649:	  error (0, errno, _("FATAL: cannot enter directory %s"),
+        -:  650:		 quote (full_filename (".")));
+        -:  651:	  longjmp (ds->current_arg_jumpbuf, 1);
+        -:  652:	}
+        -:  653:
+        -:  654:      if ( ! SAME_INODE (sb, *dir_sb_from_parent))
+        -:  655:	{
+        -:  656:	  error (0, 0,
+        -:  657:		 _("FATAL: just-changed-to directory %s changed dev/ino"),
+        -:  658:		 quote (full_filename (".")));
+        -:  659:	  longjmp (ds->current_arg_jumpbuf, 1);
+        -:  660:	}
+        -:  661:    }
+        -:  662:
+    #####:  663:  if (cycle_check (&ds->cycle_check_state, dir_sb_from_parent))
+        -:  664:    {
+    #####:  665:      error (0, 0, _("\
+        -:  666:WARNING: Circular directory structure.\n\
+        -:  667:This almost certainly means that you have a corrupted file system.\n\
+        -:  668:NOTIFY YOUR SYSTEM MANAGER.\n\
+        -:  669:The following directory is part of the cycle:\n  %s\n"),
+    #####:  670:	     quote (full_filename (".")));
+    #####:  671:      longjmp (ds->current_arg_jumpbuf, 1);
+        -:  672:    }
+        -:  673:
+        -:  674:  /* Extend the stack.  */
+    #####:  675:  obstack_blank (&ds->Active_dir, sizeof (struct AD_ent));
+        -:  676:
+        -:  677:  /* The active directory stack must be one larger than the length stack.  */
+    #####:  678:  assert (AD_stack_height (ds) ==
+        -:  679:	  1 + obstack_object_size (&ds->len_stack) / sizeof (size_t));
+        -:  680:
+        -:  681:  /* Fill in the new values.  */
+    #####:  682:  top = AD_stack_top (ds);
+    #####:  683:  top->dev_ino.st_dev = dir_sb_from_parent->st_dev;
+    #####:  684:  top->dev_ino.st_ino = dir_sb_from_parent->st_ino;
+    #####:  685:  top->unremovable = NULL;
+    #####:  686:}
+        -:  687:
+        -:  688:static inline bool
+    #####:  689:AD_is_removable (Dirstack_state const *ds, char const *file)
+        -:  690:{
+    #####:  691:  struct AD_ent *top = AD_stack_top (ds);
+    #####:  692:  return ! (top->unremovable && hash_lookup (top->unremovable, file));
+        -:  693:}
+        -:  694:
+        -:  695:/* Return true if DIR is determined to be an empty directory.  */
+        -:  696:static bool
+    #####:  697:is_empty_dir (int fd_cwd, char const *dir)
+        -:  698:{
+        -:  699:  DIR *dirp;
+        -:  700:  struct dirent const *dp;
+        -:  701:  int saved_errno;
+    #####:  702:  int fd = openat (fd_cwd, dir,
+        -:  703:		   (O_RDONLY | O_DIRECTORY
+        -:  704:		    | O_NOCTTY | O_NOFOLLOW | O_NONBLOCK));
+        -:  705:
+    #####:  706:  if (fd < 0)
+    #####:  707:    return false;
+        -:  708:
+    #####:  709:  dirp = fdopendir (fd);
+    #####:  710:  if (dirp == NULL)
+        -:  711:    {
+    #####:  712:      close (fd);
+    #####:  713:      return false;
+        -:  714:    }
+        -:  715:
+    #####:  716:  errno = 0;
+    #####:  717:  dp = readdir_ignoring_dot_and_dotdot (dirp);
+    #####:  718:  saved_errno = errno;
+    #####:  719:  closedir (dirp);
+    #####:  720:  if (dp != NULL)
+    #####:  721:    return false;
+    #####:  722:  return saved_errno == 0 ? true : false;
+        -:  723:}
+        -:  724:
+        -:  725:/* Return -1 if FILE is an unwritable non-symlink,
+        -:  726:   0 if it is writable or some other type of file,
+        -:  727:   a positive error number if there is some problem in determining the answer.
+        -:  728:   Set *BUF to the file status.
+        -:  729:   This is to avoid calling euidaccess when FILE is a symlink.  */
+        -:  730:static int
+       10:  731:write_protected_non_symlink (int fd_cwd,
+        -:  732:			     char const *file,
+        -:  733:			     Dirstack_state const *ds,
+        -:  734:			     struct stat *buf)
+        -:  735:{
+       10:  736:  if (can_write_any_file ())
+       10:  737:    return 0;
+    #####:  738:  if (cache_fstatat (fd_cwd, file, buf, AT_SYMLINK_NOFOLLOW) != 0)
+    #####:  739:    return errno;
+    #####:  740:  if (S_ISLNK (buf->st_mode))
+    #####:  741:    return 0;
+        -:  742:  /* Here, we know FILE is not a symbolic link.  */
+        -:  743:
+        -:  744:  /* In order to be reentrant -- i.e., to avoid changing the working
+        -:  745:     directory, and at the same time to be able to deal with alternate
+        -:  746:     access control mechanisms (ACLs, xattr-style attributes) and
+        -:  747:     arbitrarily deep trees -- we need a function like eaccessat, i.e.,
+        -:  748:     like Solaris' eaccess, but fd-relative, in the spirit of openat.  */
+        -:  749:
+        -:  750:  /* In the absence of a native eaccessat function, here are some of
+        -:  751:     the implementation choices [#4 and #5 were suggested by Paul Eggert]:
+        -:  752:     1) call openat with O_WRONLY|O_NOCTTY
+        -:  753:	Disadvantage: may create the file and doesn't work for directory,
+        -:  754:	may mistakenly report `unwritable' for EROFS or ACLs even though
+        -:  755:	perm bits say the file is writable.
+        -:  756:
+        -:  757:     2) fake eaccessat (save_cwd, fchdir, call euidaccess, restore_cwd)
+        -:  758:	Disadvantage: changes working directory (not reentrant) and can't
+        -:  759:	work if save_cwd fails.
+        -:  760:
+        -:  761:     3) if (euidaccess (full_filename (file), W_OK) == 0)
+        -:  762:	Disadvantage: doesn't work if full_filename is too long.
+        -:  763:	Inefficient for very deep trees (O(Depth^2)).
+        -:  764:
+        -:  765:     4) If the full pathname is sufficiently short (say, less than
+        -:  766:	PATH_MAX or 8192 bytes, whichever is shorter):
+        -:  767:	use method (3) (i.e., euidaccess (full_filename (file), W_OK));
+        -:  768:	Otherwise: vfork, fchdir in the child, run euidaccess in the
+        -:  769:	child, then the child exits with a status that tells the parent
+        -:  770:	whether euidaccess succeeded.
+        -:  771:
+        -:  772:	This avoids the O(N**2) algorithm of method (3), and it also avoids
+        -:  773:	the failure-due-to-too-long-file-names of method (3), but it's fast
+        -:  774:	in the normal shallow case.  It also avoids the lack-of-reentrancy
+        -:  775:	and the save_cwd problems.
+        -:  776:	Disadvantage; it uses a process slot for very-long file names,
+        -:  777:	and would be very slow for hierarchies with many such files.
+        -:  778:
+        -:  779:     5) If the full file name is sufficiently short (say, less than
+        -:  780:	PATH_MAX or 8192 bytes, whichever is shorter):
+        -:  781:	use method (3) (i.e., euidaccess (full_filename (file), W_OK));
+        -:  782:	Otherwise: look just at the file bits.  Perhaps issue a warning
+        -:  783:	the first time this occurs.
+        -:  784:
+        -:  785:	This is like (4), except for the "Otherwise" case where it isn't as
+        -:  786:	"perfect" as (4) but is considerably faster.  It conforms to current
+        -:  787:	POSIX, and is uniformly better than what Solaris and FreeBSD do (they
+        -:  788:	mess up with long file names). */
+        -:  789:
+        -:  790:  {
+        -:  791:    /* This implements #5: */
+    #####:  792:    size_t file_name_len
+    #####:  793:      = obstack_object_size (&ds->dir_stack) + strlen (file);
+        -:  794:
+    #####:  795:    if (MIN (PATH_MAX, 8192) <= file_name_len)
+    #####:  796:      return - euidaccess_stat (buf, W_OK);
+    #####:  797:    if (euidaccess (full_filename (file), W_OK) == 0)
+    #####:  798:      return 0;
+    #####:  799:    if (errno == EACCES)
+    #####:  800:      return -1;
+        -:  801:
+        -:  802:    /* Perhaps some other process has removed the file, or perhaps this
+        -:  803:       is a buggy NFS client.  */
+    #####:  804:    return errno;
+        -:  805:  }
+        -:  806:}
+        -:  807:
+        -:  808:/* Prompt whether to remove FILENAME, if required via a combination of
+        -:  809:   the options specified by X and/or file attributes.  If the file may
+        -:  810:   be removed, return RM_OK.  If the user declines to remove the file,
+        -:  811:   return RM_USER_DECLINED.  If not ignoring missing files and we
+        -:  812:   cannot lstat FILENAME, then return RM_ERROR.
+        -:  813:
+        -:  814:   *PDIRENT_TYPE is the type of the directory entry; update it to DT_DIR
+        -:  815:   or DT_LNK as needed.  *SBUF is the file's status.
+        -:  816:
+        -:  817:   Depending on MODE, ask whether to `descend into' or to `remove' the
+        -:  818:   directory FILENAME.  MODE is ignored when FILENAME is not a directory.
+        -:  819:   Set *IS_EMPTY to T_YES if FILENAME is an empty directory, and it is
+        -:  820:   appropriate to try to remove it with rmdir (e.g. recursive mode).
+        -:  821:   Don't even try to set *IS_EMPTY when MODE == PA_REMOVE_DIR.  */
+        -:  822:static enum RM_status
+       14:  823:prompt (int fd_cwd, Dirstack_state const *ds, char const *filename,
+        -:  824:	int *pdirent_type, struct stat *sbuf,
+        -:  825:	struct rm_options const *x, enum Prompt_action mode,
+        -:  826:	Ternary *is_empty)
+        -:  827:{
+       14:  828:  int write_protected = 0;
+       14:  829:  int dirent_type = *pdirent_type;
+        -:  830:
+       14:  831:  *is_empty = T_UNKNOWN;
+        -:  832:
+       14:  833:  if (x->interactive == RMI_NEVER)
+        4:  834:    return RM_OK;
+        -:  835:
+       10:  836:  if (!x->ignore_missing_files
+       10:  837:      && ((x->interactive == RMI_ALWAYS) || x->stdin_tty)
+       10:  838:      && dirent_type != DT_LNK)
+       10:  839:    write_protected = write_protected_non_symlink (fd_cwd, filename, ds, sbuf);
+        -:  840:
+       10:  841:  if (write_protected || x->interactive == RMI_ALWAYS)
+        -:  842:    {
+    #####:  843:      if (write_protected <= 0 && dirent_type == DT_UNKNOWN)
+        -:  844:	{
+    #####:  845:	  if (cache_fstatat (fd_cwd, filename, sbuf, AT_SYMLINK_NOFOLLOW) == 0)
+        -:  846:	    {
+    #####:  847:	      if (S_ISLNK (sbuf->st_mode))
+    #####:  848:		dirent_type = DT_LNK;
+    #####:  849:	      else if (S_ISDIR (sbuf->st_mode))
+    #####:  850:		dirent_type = DT_DIR;
+        -:  851:	      /* Otherwise it doesn't matter, so leave it DT_UNKNOWN.  */
+    #####:  852:	      *pdirent_type = dirent_type;
+        -:  853:	    }
+        -:  854:	  else
+        -:  855:	    {
+        -:  856:	      /* This happens, e.g., with `rm '''.  */
+    #####:  857:	      write_protected = errno;
+        -:  858:	    }
+        -:  859:	}
+        -:  860:
+    #####:  861:      if (write_protected <= 0)
+    #####:  862:	switch (dirent_type)
+        -:  863:	  {
+        -:  864:	  case DT_LNK:
+        -:  865:	    /* Using permissions doesn't make sense for symlinks.  */
+    #####:  866:	    if (x->interactive != RMI_ALWAYS)
+    #####:  867:	      return RM_OK;
+    #####:  868:	    break;
+        -:  869:
+        -:  870:	  case DT_DIR:
+    #####:  871:	    if (!x->recursive)
+    #####:  872:	      write_protected = EISDIR;
+    #####:  873:	    break;
+        -:  874:	  }
+        -:  875:
+    #####:  876:      char const *quoted_name = quote (full_filename (filename));
+        -:  877:
+    #####:  878:      if (0 < write_protected)
+        -:  879:	{
+    #####:  880:	  error (0, write_protected, _("cannot remove %s"), quoted_name);
+    #####:  881:	  return RM_ERROR;
+        -:  882:	}
+        -:  883:
+        -:  884:      /* Issue the prompt.  */
+        -:  885:      /* FIXME: use a variant of error (instead of fprintf) that doesn't
+        -:  886:	 append a newline.  Then we won't have to declare program_name in
+        -:  887:	 this file.  */
+    #####:  888:      if (dirent_type == DT_DIR
+    #####:  889:	  && mode == PA_DESCEND_INTO_DIR
+    #####:  890:	  && ((*is_empty = (is_empty_dir (fd_cwd, filename) ? T_YES : T_NO))
+    #####:  891:	      == T_NO))
+    #####:  892:	fprintf (stderr,
+        -:  893:		 (write_protected
+        -:  894:		  ? _("%s: descend into write-protected directory %s? ")
+        -:  895:		  : _("%s: descend into directory %s? ")),
+        -:  896:		 program_name, quoted_name);
+        -:  897:      else
+        -:  898:	{
+    #####:  899:	  if (cache_fstatat (fd_cwd, filename, sbuf, AT_SYMLINK_NOFOLLOW) != 0)
+        -:  900:	    {
+    #####:  901:	      error (0, errno, _("cannot remove %s"), quoted_name);
+    #####:  902:	      return RM_ERROR;
+        -:  903:	    }
+        -:  904:
+        -:  905:	  /* TRANSLATORS: You may find it more convenient to translate
+        -:  906:	     the equivalent of _("%s: remove %s (write-protected) %s? ").
+        -:  907:	     It should avoid grammatical problems with the output
+        -:  908:	     of file_type.  */
+    #####:  909:	  fprintf (stderr,
+        -:  910:		   (write_protected
+        -:  911:		    ? _("%s: remove write-protected %s %s? ")
+        -:  912:		    : _("%s: remove %s %s? ")),
+        -:  913:		   program_name, file_type (sbuf), quoted_name);
+        -:  914:	}
+        -:  915:
+    #####:  916:      if (!yesno ())
+    #####:  917:	return RM_USER_DECLINED;
+        -:  918:    }
+       10:  919:  return RM_OK;
+        -:  920:}
+        -:  921:
+        -:  922:/* Return true if FILENAME is a directory (and not a symlink to a directory).
+        -:  923:   Otherwise, including the case in which lstat fails, return false.
+        -:  924:   *ST is FILENAME's tstatus.
+        -:  925:   Do not modify errno.  */
+        -:  926:static inline bool
+    #####:  927:is_dir_lstat (char const *filename, struct stat *st)
+        -:  928:{
+    #####:  929:  int saved_errno = errno;
+    #####:  930:  bool is_dir =
+    #####:  931:    (cache_fstatat (AT_FDCWD, filename, st, AT_SYMLINK_NOFOLLOW) == 0
+    #####:  932:     && S_ISDIR (st->st_mode));
+    #####:  933:  errno = saved_errno;
+    #####:  934:  return is_dir;
+        -:  935:}
+        -:  936:
+        -:  937:#define DO_UNLINK(Fd_cwd, Filename, X)					\
+        -:  938:  do									\
+        -:  939:    {									\
+        -:  940:      if (unlinkat (Fd_cwd, Filename, 0) == 0)				\
+        -:  941:	{								\
+        -:  942:	  if ((X)->verbose)						\
+        -:  943:	    printf (_("removed %s\n"), quote (full_filename (Filename))); \
+        -:  944:	  return RM_OK;							\
+        -:  945:	}								\
+        -:  946:									\
+        -:  947:      if (ignorable_missing (X, errno))					\
+        -:  948:	return RM_OK;							\
+        -:  949:    }									\
+        -:  950:  while (0)
+        -:  951:
+        -:  952:#define DO_RMDIR(Fd_cwd, Filename, X)			\
+        -:  953:  do							\
+        -:  954:    {							\
+        -:  955:      if (unlinkat (Fd_cwd, Filename, AT_REMOVEDIR) == 0) /* rmdir */ \
+        -:  956:	{						\
+        -:  957:	  if ((X)->verbose)				\
+        -:  958:	    printf (_("removed directory: %s\n"),	\
+        -:  959:		    quote (full_filename (Filename)));	\
+        -:  960:	  return RM_OK;					\
+        -:  961:	}						\
+        -:  962:							\
+        -:  963:      if (ignorable_missing (X, errno))			\
+        -:  964:	return RM_OK;					\
+        -:  965:							\
+        -:  966:      if (errno == ENOTEMPTY || errno == EEXIST)	\
+        -:  967:	return RM_NONEMPTY_DIR;				\
+        -:  968:    }							\
+        -:  969:  while (0)
+        -:  970:
+        -:  971:/* When a function like unlink, rmdir, or fstatat fails with an errno
+        -:  972:   value of ERRNUM, return true if the specified file system object
+        -:  973:   is guaranteed not to exist;  otherwise, return false.  */
+        -:  974:static inline bool
+    #####:  975:nonexistent_file_errno (int errnum)
+        -:  976:{
+        -:  977:  /* Do not include ELOOP here, since the specified file may indeed
+        -:  978:     exist, but be (in)accessible only via too long a symlink chain.
+        -:  979:     Likewise for ENAMETOOLONG, since rm -f ./././.../foo may fail
+        -:  980:     if the "..." part expands to a long enough sequence of "./"s,
+        -:  981:     even though ./foo does indeed exist.  */
+        -:  982:
+    #####:  983:  switch (errnum)
+        -:  984:    {
+        -:  985:    case ENOENT:
+        -:  986:    case ENOTDIR:
+    #####:  987:      return true;
+        -:  988:    default:
+    #####:  989:      return false;
+        -:  990:    }
+        -:  991:}
+        -:  992:
+        -:  993:/* Encapsulate the test for whether the errno value, ERRNUM, is ignorable.  */
+        -:  994:static inline bool
+    #####:  995:ignorable_missing (struct rm_options const *x, int errnum)
+        -:  996:{
+    #####:  997:  return x->ignore_missing_files && nonexistent_file_errno (errnum);
+        -:  998:}
+        -:  999:
+        -: 1000:/* Remove the file or directory specified by FILENAME.
+        -: 1001:   Return RM_OK if it is removed, and RM_ERROR or RM_USER_DECLINED if not.
+        -: 1002:   But if FILENAME specifies a non-empty directory, return RM_NONEMPTY_DIR. */
+        -: 1003:
+        -: 1004:static enum RM_status
+       14: 1005:remove_entry (int fd_cwd, Dirstack_state const *ds, char const *filename,
+        -: 1006:	      int dirent_type_arg, struct stat *st,
+        -: 1007:	      struct rm_options const *x)
+        -: 1008:{
+        -: 1009:  Ternary is_empty_directory;
+       14: 1010:  enum RM_status s = prompt (fd_cwd, ds, filename, &dirent_type_arg, st, x,
+        -: 1011:			     PA_DESCEND_INTO_DIR,
+        -: 1012:			     &is_empty_directory);
+       14: 1013:  int dirent_type = dirent_type_arg;
+       14: 1014:  if (s != RM_OK)
+    #####: 1015:    return s;
+        -: 1016:
+        -: 1017:  /* Why bother with the following if/else block?  Because on systems with
+        -: 1018:     an unlink function that *can* unlink directories, we must determine the
+        -: 1019:     type of each entry before removing it.  Otherwise, we'd risk unlinking
+        -: 1020:     an entire directory tree simply by unlinking a single directory;  then
+        -: 1021:     all the storage associated with that hierarchy would not be freed until
+        -: 1022:     the next fsck.  Not nice.  To avoid that, on such slightly losing
+        -: 1023:     systems, we need to call lstat to determine the type of each entry,
+        -: 1024:     and that represents extra overhead that -- it turns out -- we can
+        -: 1025:     avoid on non-losing systems, since there, unlink will never remove
+        -: 1026:     a directory.  Also, on systems where unlink may unlink directories,
+        -: 1027:     we're forced to allow a race condition: we lstat a non-directory, then
+        -: 1028:     go to unlink it, but in the mean time, a malicious someone could have
+        -: 1029:     replaced it with a directory.  */
+        -: 1030:
+        -: 1031:  if (cannot_unlink_dir ())
+        -: 1032:    {
+       14: 1033:      if (dirent_type == DT_DIR && ! x->recursive)
+        -: 1034:	{
+    #####: 1035:	  error (0, EISDIR, _("cannot remove %s"),
+    #####: 1036:		 quote (full_filename (filename)));
+    #####: 1037:	  return RM_ERROR;
+        -: 1038:	}
+        -: 1039:
+        -: 1040:      /* is_empty_directory is set iff it's ok to use rmdir.
+        -: 1041:	 Note that it's set only in interactive mode -- in which case it's
+        -: 1042:	 an optimization that arranges so that the user is asked just
+        -: 1043:	 once whether to remove the directory.  */
+       14: 1044:      if (is_empty_directory == T_YES)
+    #####: 1045:	DO_RMDIR (fd_cwd, filename, x);
+        -: 1046:
+        -: 1047:      /* If we happen to know that FILENAME is a directory, return now
+        -: 1048:	 and let the caller remove it -- this saves the overhead of a failed
+        -: 1049:	 unlink call.  If FILENAME is a command-line argument, then
+        -: 1050:	 DIRENT_TYPE is DT_UNKNOWN so we'll first try to unlink it.
+        -: 1051:	 Using unlink here is ok, because it cannot remove a
+        -: 1052:	 directory.  */
+       14: 1053:      if (dirent_type == DT_DIR)
+    #####: 1054:	return RM_NONEMPTY_DIR;
+        -: 1055:
+       14: 1056:      DO_UNLINK (fd_cwd, filename, x);
+        -: 1057:
+        -: 1058:      /* Upon a failed attempt to unlink a directory, most non-Linux systems
+        -: 1059:	 set errno to the POSIX-required value EPERM.  In that case, change
+        -: 1060:	 errno to EISDIR so that we emit a better diagnostic.  */
+    #####: 1061:      if (! x->recursive && errno == EPERM && is_dir_lstat (filename, st))
+    #####: 1062:	errno = EISDIR;
+        -: 1063:
+    #####: 1064:      if (! x->recursive
+    #####: 1065:	  || (cache_stat_ok (st) && !S_ISDIR (st->st_mode)))
+        -: 1066:	{
+    #####: 1067:	  if (ignorable_missing (x, errno))
+    #####: 1068:	    return RM_OK;
+        -: 1069:
+        -: 1070:	  /* Either --recursive is not in effect, or the file cannot be a
+        -: 1071:	     directory.  Report the unlink problem and fail.  */
+    #####: 1072:	  error (0, errno, _("cannot remove %s"),
+    #####: 1073:		 quote (full_filename (filename)));
+    #####: 1074:	  return RM_ERROR;
+        -: 1075:	}
+    #####: 1076:      assert (!cache_stat_ok (st) || S_ISDIR (st->st_mode));
+        -: 1077:    }
+        -: 1078:  else
+        -: 1079:    {
+        -: 1080:      /* If we don't already know whether FILENAME is a directory,
+        -: 1081:	 find out now.  Then, if it's a non-directory, we can use
+        -: 1082:	 unlink on it.  */
+        -: 1083:
+        -: 1084:      if (dirent_type == DT_UNKNOWN)
+        -: 1085:	{
+        -: 1086:	  if (fstatat (fd_cwd, filename, st, AT_SYMLINK_NOFOLLOW))
+        -: 1087:	    {
+        -: 1088:	      if (ignorable_missing (x, errno))
+        -: 1089:		return RM_OK;
+        -: 1090:
+        -: 1091:	      error (0, errno, _("cannot remove %s"),
+        -: 1092:		     quote (full_filename (filename)));
+        -: 1093:	      return RM_ERROR;
+        -: 1094:	    }
+        -: 1095:
+        -: 1096:	  if (S_ISDIR (st->st_mode))
+        -: 1097:	    dirent_type = DT_DIR;
+        -: 1098:	}
+        -: 1099:
+        -: 1100:      if (dirent_type == DT_DIR)
+        -: 1101:	{
+        -: 1102:	  /* At this point, barring race conditions, FILENAME is known
+        -: 1103:	     to be a non-directory, so it's ok to try to unlink it.  */
+        -: 1104:	  DO_UNLINK (fd_cwd, filename, x);
+        -: 1105:
+        -: 1106:	  /* unlink failed with some other error code.  report it.  */
+        -: 1107:	  error (0, errno, _("cannot remove %s"),
+        -: 1108:		 quote (full_filename (filename)));
+        -: 1109:	  return RM_ERROR;
+        -: 1110:	}
+        -: 1111:
+        -: 1112:      if (! x->recursive)
+        -: 1113:	{
+        -: 1114:	  error (0, EISDIR, _("cannot remove %s"),
+        -: 1115:		 quote (full_filename (filename)));
+        -: 1116:	  return RM_ERROR;
+        -: 1117:	}
+        -: 1118:
+        -: 1119:      if (is_empty_directory == T_YES)
+        -: 1120:	{
+        -: 1121:	  DO_RMDIR (fd_cwd, filename, x);
+        -: 1122:	  /* Don't diagnose any failure here.
+        -: 1123:	     It'll be detected when the caller tries another way.  */
+        -: 1124:	}
+        -: 1125:    }
+        -: 1126:
+    #####: 1127:  return RM_NONEMPTY_DIR;
+        -: 1128:}
+        -: 1129:
+        -: 1130:/* Given FD_CWD, the file descriptor for an open directory,
+        -: 1131:   open its subdirectory F (F is already `known' to be a directory,
+        -: 1132:   so if it is no longer one, someone is playing games), return a DIR*
+        -: 1133:   pointer for F, and put F's `stat' data in *SUBDIR_SB.
+        -: 1134:   Upon failure give a diagnostic and return NULL.
+        -: 1135:   If PREV_ERRNO is nonzero, it is the errno value from a preceding failed
+        -: 1136:   unlink- or rmdir-like system call -- use that value instead of ENOTDIR
+        -: 1137:   if an opened file turns out not to be a directory.  This is important
+        -: 1138:   when the preceding non-dir-unlink failed due to e.g., EPERM or EACCES.
+        -: 1139:   The caller must use a nonnnull CWD_ERRNO the first
+        -: 1140:   time this function is called for each command-line-specified directory.
+        -: 1141:   If CWD_ERRNO is not null, set *CWD_ERRNO to the appropriate error number
+        -: 1142:   if this function fails to restore the initial working directory.
+        -: 1143:   If it is null, report an error and exit if the working directory
+        -: 1144:   isn't restored.  */
+        -: 1145:static DIR *
+    #####: 1146:fd_to_subdirp (int fd_cwd, char const *f,
+        -: 1147:	       struct rm_options const *x, int prev_errno,
+        -: 1148:	       struct stat *subdir_sb,
+        -: 1149:	       int *cwd_errno ATTRIBUTE_UNUSED)
+        -: 1150:{
+    #####: 1151:  int open_flags = O_RDONLY | O_NOCTTY | O_NOFOLLOW | O_NONBLOCK;
+    #####: 1152:  int fd_sub = openat_permissive (fd_cwd, f, open_flags, 0, cwd_errno);
+        -: 1153:  int saved_errno;
+        -: 1154:
+        -: 1155:  /* Record dev/ino of F.  We may compare them against saved values
+        -: 1156:     to thwart any attempt to subvert the traversal.  They are also used
+        -: 1157:     to detect directory cycles.  */
+    #####: 1158:  if (fd_sub < 0)
+    #####: 1159:    return NULL;
+    #####: 1160:  else if (fstat (fd_sub, subdir_sb) != 0)
+    #####: 1161:    saved_errno = errno;
+    #####: 1162:  else if (S_ISDIR (subdir_sb->st_mode))
+        -: 1163:    {
+    #####: 1164:      DIR *subdir_dirp = fdopendir (fd_sub);
+    #####: 1165:      if (subdir_dirp)
+    #####: 1166:	return subdir_dirp;
+    #####: 1167:      saved_errno = errno;
+        -: 1168:    }
+        -: 1169:  else
+    #####: 1170:    saved_errno = (prev_errno ? prev_errno : ENOTDIR);
+        -: 1171:
+    #####: 1172:  close (fd_sub);
+    #####: 1173:  errno = saved_errno;
+    #####: 1174:  return NULL;
+        -: 1175:}
+        -: 1176:
+        -: 1177:/* Remove entries in the directory open on DIRP
+        -: 1178:   Upon finding a directory that is both non-empty and that can be chdir'd
+        -: 1179:   into, return RM_OK and set *SUBDIR and fill in SUBDIR_SB, where
+        -: 1180:   SUBDIR is the malloc'd name of the subdirectory if the chdir succeeded,
+        -: 1181:   NULL otherwise (e.g., if opendir failed or if there was no subdirectory).
+        -: 1182:   Likewise, SUBDIR_SB is the result of calling lstat on SUBDIR.
+        -: 1183:   Return RM_OK if all entries are removed.  Return RM_ERROR if any
+        -: 1184:   entry cannot be removed.  Otherwise, return RM_USER_DECLINED if
+        -: 1185:   the user declines to remove at least one entry.  Remove as much as
+        -: 1186:   possible, continuing even if we fail to remove some entries.  */
+        -: 1187:static enum RM_status
+    #####: 1188:remove_cwd_entries (DIR **dirp,
+        -: 1189:		    Dirstack_state *ds, char **subdir, struct stat *subdir_sb,
+        -: 1190:		    struct rm_options const *x)
+        -: 1191:{
+    #####: 1192:  struct AD_ent *top = AD_stack_top (ds);
+    #####: 1193:  enum RM_status status = top->status;
+    #####: 1194:  size_t n_unlinked_since_opendir_or_last_rewind = 0;
+        -: 1195:
+    #####: 1196:  assert (VALID_STATUS (status));
+    #####: 1197:  *subdir = NULL;
+        -: 1198:
+        -: 1199:  while (1)
+        -: 1200:    {
+        -: 1201:      struct dirent const *dp;
+        -: 1202:      enum RM_status tmp_status;
+        -: 1203:      const char *f;
+        -: 1204:
+        -: 1205:      /* Set errno to zero so we can distinguish between a readdir failure
+        -: 1206:	 and when readdir simply finds that there are no more entries.  */
+    #####: 1207:      errno = 0;
+    #####: 1208:      dp = readdir_ignoring_dot_and_dotdot (*dirp);
+    #####: 1209:      if (dp == NULL)
+        -: 1210:	{
+    #####: 1211:	  if (errno)
+        -: 1212:	    {
+        -: 1213:	      /* fall through */
+        -: 1214:	    }
+    #####: 1215:	  else if (NEED_REWIND (n_unlinked_since_opendir_or_last_rewind))
+        -: 1216:	    {
+        -: 1217:	      /* Call rewinddir if we've called unlink or rmdir so many times
+        -: 1218:		 (since the opendir or the previous rewinddir) that this
+        -: 1219:		 NULL-return may be the symptom of a buggy readdir.  */
+    #####: 1220:	      rewinddir (*dirp);
+    #####: 1221:	      n_unlinked_since_opendir_or_last_rewind = 0;
+    #####: 1222:	      continue;
+        -: 1223:	    }
+    #####: 1224:	  break;
+        -: 1225:	}
+        -: 1226:
+    #####: 1227:      f = dp->d_name;
+        -: 1228:
+        -: 1229:      /* Skip files we've already tried/failed to remove.  */
+    #####: 1230:      if ( ! AD_is_removable (ds, f))
+    #####: 1231:	continue;
+        -: 1232:
+        -: 1233:      /* Pass dp->d_type info to remove_entry so the non-glibc
+        -: 1234:	 case can decide whether to use unlink or chdir.
+        -: 1235:	 Systems without the d_type member will have to endure
+        -: 1236:	 the performance hit of first calling lstat F. */
+    #####: 1237:      cache_stat_init (subdir_sb);
+    #####: 1238:      tmp_status = remove_entry (dirfd (*dirp), ds, f,
+    #####: 1239:				 D_TYPE (dp), subdir_sb, x);
+    #####: 1240:      switch (tmp_status)
+        -: 1241:	{
+        -: 1242:	case RM_OK:
+        -: 1243:	  /* Count how many files we've unlinked since the initial
+        -: 1244:	     opendir or the last rewinddir.  On buggy systems, if you
+        -: 1245:	     remove too many, readdir returns NULL even though there
+        -: 1246:	     remain unprocessed directory entries.  */
+    #####: 1247:	  ++n_unlinked_since_opendir_or_last_rewind;
+    #####: 1248:	  break;
+        -: 1249:
+        -: 1250:	case RM_ERROR:
+        -: 1251:	case RM_USER_DECLINED:
+    #####: 1252:	  AD_mark_as_unremovable (ds, f);
+    #####: 1253:	  UPDATE_STATUS (status, tmp_status);
+    #####: 1254:	  break;
+        -: 1255:
+        -: 1256:	case RM_NONEMPTY_DIR:
+        -: 1257:	  {
+    #####: 1258:	    DIR *subdir_dirp = fd_to_subdirp (dirfd (*dirp), f,
+    #####: 1259:					      x, errno, subdir_sb, NULL);
+    #####: 1260:	    if (subdir_dirp == NULL)
+        -: 1261:	      {
+    #####: 1262:		status = RM_ERROR;
+        -: 1263:
+        -: 1264:		/* CAUTION: this test and diagnostic are identical to
+        -: 1265:		   those following the other use of fd_to_subdirp.  */
+    #####: 1266:		if (ignorable_missing (x, errno))
+        -: 1267:		  {
+        -: 1268:		    /* With -f, don't report "file not found".  */
+        -: 1269:		  }
+        -: 1270:		else
+        -: 1271:		  {
+        -: 1272:		    /* Upon fd_to_subdirp failure, try to remove F directly,
+        -: 1273:		       in case it's just an empty directory.  */
+    #####: 1274:		    int saved_errno = errno;
+    #####: 1275:		    if (unlinkat (dirfd (*dirp), f, AT_REMOVEDIR) == 0)
+    #####: 1276:		      status = RM_OK;
+        -: 1277:		    else
+    #####: 1278:		      error (0, saved_errno,
+    #####: 1279:			     _("cannot remove %s"), quote (full_filename (f)));
+        -: 1280:		  }
+        -: 1281:
+    #####: 1282:		if (status == RM_ERROR)
+    #####: 1283:		  AD_mark_as_unremovable (ds, f);
+    #####: 1284:		break;
+        -: 1285:	      }
+        -: 1286:
+    #####: 1287:	    *subdir = xstrdup (f);
+    #####: 1288:	    if (closedir (*dirp) != 0)
+        -: 1289:	      {
+    #####: 1290:		error (0, 0, _("failed to close directory %s"),
+    #####: 1291:		       quote (full_filename (".")));
+    #####: 1292:		status = RM_ERROR;
+        -: 1293:	      }
+    #####: 1294:	    *dirp = subdir_dirp;
+        -: 1295:
+    #####: 1296:	    break;
+        -: 1297:	  }
+        -: 1298:	}
+        -: 1299:
+        -: 1300:      /* Record status for this directory.  */
+    #####: 1301:      UPDATE_STATUS (top->status, status);
+        -: 1302:
+    #####: 1303:      if (*subdir)
+    #####: 1304:	break;
+    #####: 1305:    }
+        -: 1306:
+        -: 1307:  /* Ensure that *dirp is not NULL and that its file descriptor is valid.  */
+    #####: 1308:  assert (*dirp != NULL);
+    #####: 1309:  assert (0 <= fcntl (dirfd (*dirp), F_GETFD));
+        -: 1310:
+    #####: 1311:  return status;
+        -: 1312:}
+        -: 1313:
+        -: 1314:/* Do this after each call to AD_push or AD_push_initial.
+        -: 1315:   Because the status = RM_OK bit is too remove-specific to
+        -: 1316:   go into the general-purpose AD_* package.  */
+        -: 1317:#define AD_INIT_OTHER_MEMBERS()			\
+        -: 1318:  do						\
+        -: 1319:    {						\
+        -: 1320:      AD_stack_top(ds)->status = RM_OK;		\
+        -: 1321:    }						\
+        -: 1322:  while (0)
+        -: 1323:
+        -: 1324:/*  Remove the hierarchy rooted at DIR.
+        -: 1325:    Do that by changing into DIR, then removing its contents, then
+        -: 1326:    returning to the original working directory and removing DIR itself.
+        -: 1327:    Don't use recursion.  Be careful when using chdir ".." that we
+        -: 1328:    return to the same directory from which we came, if necessary.
+        -: 1329:    Return an RM_status value to indicate success or failure.  */
+        -: 1330:
+        -: 1331:static enum RM_status
+    #####: 1332:remove_dir (int fd_cwd, Dirstack_state *ds, char const *dir,
+        -: 1333:	    struct stat *dir_st,
+        -: 1334:	    struct rm_options const *x, int *cwd_errno)
+        -: 1335:{
+        -: 1336:  enum RM_status status;
+    #####: 1337:  dev_t current_dev = dir_st->st_dev;
+        -: 1338:
+        -: 1339:  /* There is a race condition in that an attacker could replace the nonempty
+        -: 1340:     directory, DIR, with a symlink between the preceding call to rmdir
+        -: 1341:     (unlinkat, in our caller) and fd_to_subdirp's openat call.  But on most
+        -: 1342:     systems, even those without openat, this isn't a problem, since we ensure
+        -: 1343:     that opening a symlink will fail, when that is possible.  Otherwise,
+        -: 1344:     fd_to_subdirp's fstat, along with the `fstat' and the dev/ino
+        -: 1345:     comparison in AD_push ensure that we detect it and fail.  */
+        -: 1346:
+    #####: 1347:  DIR *dirp = fd_to_subdirp (fd_cwd, dir, x, 0, dir_st, cwd_errno);
+        -: 1348:
+    #####: 1349:  if (dirp == NULL)
+        -: 1350:    {
+        -: 1351:      /* CAUTION: this test and diagnostic are identical to
+        -: 1352:	 those following the other use of fd_to_subdirp.  */
+    #####: 1353:      if (ignorable_missing (x, errno))
+        -: 1354:	{
+        -: 1355:	  /* With -f, don't report "file not found".  */
+        -: 1356:	}
+        -: 1357:      else
+        -: 1358:	{
+        -: 1359:	  /* Upon fd_to_subdirp failure, try to remove DIR directly,
+        -: 1360:	     in case it's just an empty directory.  */
+    #####: 1361:	  int saved_errno = errno;
+    #####: 1362:	  if (unlinkat (fd_cwd, dir, AT_REMOVEDIR) == 0)
+    #####: 1363:	    return RM_OK;
+        -: 1364:
+    #####: 1365:	  error (0, saved_errno,
+    #####: 1366:		 _("cannot remove %s"), quote (full_filename (dir)));
+        -: 1367:	}
+        -: 1368:
+    #####: 1369:      return RM_ERROR;
+        -: 1370:    }
+        -: 1371:
+    #####: 1372:  if (ROOT_DEV_INO_CHECK (x->root_dev_ino, dir_st))
+        -: 1373:    {
+    #####: 1374:      ROOT_DEV_INO_WARN (full_filename (dir));
+    #####: 1375:      status = RM_ERROR;
+    #####: 1376:      goto closedir_and_return;
+        -: 1377:    }
+        -: 1378:
+    #####: 1379:  AD_push (dirfd (dirp), ds, dir, dir_st);
+    #####: 1380:  AD_INIT_OTHER_MEMBERS ();
+        -: 1381:
+    #####: 1382:  status = RM_OK;
+        -: 1383:
+        -: 1384:  while (1)
+        -: 1385:    {
+    #####: 1386:      char *subdir = NULL;
+        -: 1387:      struct stat subdir_sb;
+        -: 1388:      enum RM_status tmp_status;
+        -: 1389:
+    #####: 1390:      tmp_status = remove_cwd_entries (&dirp, ds, &subdir, &subdir_sb, x);
+        -: 1391:
+    #####: 1392:      if (tmp_status != RM_OK)
+        -: 1393:	{
+    #####: 1394:	  UPDATE_STATUS (status, tmp_status);
+    #####: 1395:	  AD_mark_current_as_unremovable (ds);
+        -: 1396:	}
+    #####: 1397:      if (subdir)
+        -: 1398:	{
+    #####: 1399:	  if ( ! x->one_file_system
+    #####: 1400:	       || subdir_sb.st_dev == current_dev)
+        -: 1401:	    {
+    #####: 1402:	      AD_push (dirfd (dirp), ds, subdir, &subdir_sb);
+    #####: 1403:	      AD_INIT_OTHER_MEMBERS ();
+    #####: 1404:	      free (subdir);
+    #####: 1405:	      continue;
+        -: 1406:	    }
+        -: 1407:
+        -: 1408:	  /* Here, --one-file-system is in effect, and with remove_cwd_entries'
+        -: 1409:	     traversal into the current directory, (known as SUBDIR, from ..),
+        -: 1410:	     DIRP's device number is different from CURRENT_DEV.  Arrange not
+        -: 1411:	     to do anything more with this hierarchy.  */
+    #####: 1412:	  error (0, 0, _("skipping %s, since it's on a different device"),
+    #####: 1413:		 quote (full_filename (subdir)));
+    #####: 1414:	  free (subdir);
+    #####: 1415:	  AD_mark_current_as_unremovable (ds);
+    #####: 1416:	  tmp_status = RM_ERROR;
+    #####: 1417:	  UPDATE_STATUS (status, tmp_status);
+        -: 1418:	}
+        -: 1419:
+        -: 1420:      /* Execution reaches this point when we've removed the last
+        -: 1421:	 removable entry from the current directory -- or, with
+        -: 1422:	 --one-file-system, when the current directory is on a
+        -: 1423:	 different file system.  */
+        -: 1424:      {
+        -: 1425:	int fd;
+        -: 1426:	/* The name of the directory that we have just processed,
+        -: 1427:	   nominally removing all of its contents.  */
+    #####: 1428:	char *empty_dir = AD_pop_and_chdir (dirp, &fd, ds);
+    #####: 1429:	dirp = NULL;
+    #####: 1430:	assert (fd != AT_FDCWD || AD_stack_height (ds) == 1);
+        -: 1431:
+        -: 1432:	/* Try to remove EMPTY_DIR only if remove_cwd_entries succeeded.  */
+    #####: 1433:	if (tmp_status == RM_OK)
+        -: 1434:	  {
+        -: 1435:	    struct stat empty_st;
+        -: 1436:	    Ternary is_empty;
+    #####: 1437:	    int dirent_type = DT_DIR;
+    #####: 1438:	    enum RM_status s = prompt (fd, ds, empty_dir, &dirent_type,
+        -: 1439:				       cache_stat_init (&empty_st), x,
+        -: 1440:				       PA_REMOVE_DIR, &is_empty);
+        -: 1441:
+    #####: 1442:	    if (s != RM_OK)
+        -: 1443:	      {
+    #####: 1444:		free (empty_dir);
+    #####: 1445:		status = s;
+    #####: 1446:		if (fd != AT_FDCWD)
+    #####: 1447:		  close (fd);
+    #####: 1448:		goto closedir_and_return;
+        -: 1449:	      }
+        -: 1450:
+    #####: 1451:	    if (unlinkat (fd, empty_dir, AT_REMOVEDIR) == 0)
+        -: 1452:	      {
+    #####: 1453:		if (x->verbose)
+    #####: 1454:		  printf (_("removed directory: %s\n"),
+    #####: 1455:			  quote (full_filename (empty_dir)));
+        -: 1456:	      }
+        -: 1457:	    else
+        -: 1458:	      {
+    #####: 1459:		error (0, errno, _("cannot remove directory %s"),
+    #####: 1460:		       quote (full_filename (empty_dir)));
+    #####: 1461:		AD_mark_as_unremovable (ds, empty_dir);
+    #####: 1462:		status = RM_ERROR;
+    #####: 1463:		UPDATE_STATUS (AD_stack_top(ds)->status, status);
+        -: 1464:	      }
+        -: 1465:	  }
+        -: 1466:
+    #####: 1467:	free (empty_dir);
+        -: 1468:
+    #####: 1469:	if (fd == AT_FDCWD)
+    #####: 1470:	  break;
+        -: 1471:
+    #####: 1472:	dirp = fdopendir (fd);
+    #####: 1473:	if (dirp == NULL)
+        -: 1474:	  {
+    #####: 1475:	    error (0, errno, _("FATAL: cannot return to .. from %s"),
+    #####: 1476:		   quote (full_filename (".")));
+    #####: 1477:	    close (fd);
+    #####: 1478:	    longjmp (ds->current_arg_jumpbuf, 1);
+        -: 1479:	  }
+        -: 1480:      }
+    #####: 1481:    }
+        -: 1482:
+        -: 1483:  /* If the first/final hash table of unremovable entries was used,
+        -: 1484:     free it here.  */
+    #####: 1485:  AD_stack_pop (ds);
+        -: 1486:
+        -: 1487: closedir_and_return:;
+    #####: 1488:  if (dirp != NULL && closedir (dirp) != 0)
+        -: 1489:    {
+    #####: 1490:      error (0, 0, _("failed to close directory %s"),
+    #####: 1491:	     quote (full_filename (".")));
+    #####: 1492:      status = RM_ERROR;
+        -: 1493:    }
+        -: 1494:
+    #####: 1495:  return status;
+        -: 1496:}
+        -: 1497:
+        -: 1498:/* Remove the file or directory specified by FILENAME.
+        -: 1499:   Return RM_OK if it is removed, and RM_ERROR or RM_USER_DECLINED if not.  */
+        -: 1500:
+        -: 1501:static enum RM_status
+       14: 1502:rm_1 (Dirstack_state *ds, char const *filename,
+        -: 1503:      struct rm_options const *x, int *cwd_errno)
+        -: 1504:{
+       14: 1505:  char const *base = last_component (filename);
+       14: 1506:  if (dot_or_dotdot (base))
+        -: 1507:    {
+    #####: 1508:      error (0, 0, _(base == filename
+        -: 1509:		     ? "cannot remove directory %s"
+        -: 1510:		     : "cannot remove %s directory %s"),
+        -: 1511:	     quote_n (0, base), quote_n (1, filename));
+    #####: 1512:      return RM_ERROR;
+        -: 1513:    }
+        -: 1514:
+        -: 1515:  struct stat st;
+       14: 1516:  cache_stat_init (&st);
+       14: 1517:  cycle_check_init (&ds->cycle_check_state);
+       14: 1518:  if (x->root_dev_ino)
+        -: 1519:    {
+    #####: 1520:      if (cache_fstatat (AT_FDCWD, filename, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        -: 1521:	{
+    #####: 1522:	  if (ignorable_missing (x, errno))
+    #####: 1523:	    return RM_OK;
+    #####: 1524:	  error (0, errno, _("cannot remove %s"), quote (filename));
+    #####: 1525:	  return RM_ERROR;
+        -: 1526:	}
+    #####: 1527:      if (SAME_INODE (st, *(x->root_dev_ino)))
+        -: 1528:	{
+    #####: 1529:	  error (0, 0, _("cannot remove root directory %s"), quote (filename));
+    #####: 1530:	  return RM_ERROR;
+        -: 1531:	}
+        -: 1532:    }
+        -: 1533:
+       14: 1534:  AD_push_initial (ds);
+       14: 1535:  AD_INIT_OTHER_MEMBERS ();
+        -: 1536:
+       14: 1537:  enum RM_status status = remove_entry (AT_FDCWD, ds, filename,
+        -: 1538:					DT_UNKNOWN, &st, x);
+       14: 1539:  if (status == RM_NONEMPTY_DIR)
+        -: 1540:    {
+        -: 1541:      /* In the event that remove_dir->remove_cwd_entries detects
+        -: 1542:	 a directory cycle, arrange to fail, give up on this FILE, but
+        -: 1543:	 continue on with any other arguments.  */
+    #####: 1544:      if (setjmp (ds->current_arg_jumpbuf))
+    #####: 1545:	status = RM_ERROR;
+        -: 1546:      else
+    #####: 1547:	status = remove_dir (AT_FDCWD, ds, filename, &st, x, cwd_errno);
+        -: 1548:
+    #####: 1549:      AD_stack_clear (ds);
+        -: 1550:    }
+        -: 1551:
+       14: 1552:  ds_clear (ds);
+       14: 1553:  return status;
+        -: 1554:}
+        -: 1555:
+        -: 1556:/* Remove all files and/or directories specified by N_FILES and FILE.
+        -: 1557:   Apply the options in X.  */
+        -: 1558:extern enum RM_status
+       12: 1559:rm (size_t n_files, char const *const *file, struct rm_options const *x)
+        -: 1560:{
+       12: 1561:  enum RM_status status = RM_OK;
+       12: 1562:  Dirstack_state *ds = ds_init ();
+       12: 1563:  int cwd_errno = 0;
+        -: 1564:  size_t i;
+        -: 1565:
+       26: 1566:  for (i = 0; i < n_files; i++)
+        -: 1567:    {
+       14: 1568:      if (cwd_errno && IS_RELATIVE_FILE_NAME (file[i]))
+        -: 1569:	{
+    #####: 1570:	  error (0, 0, _("cannot remove relative-named %s"), quote (file[i]));
+    #####: 1571:	  status = RM_ERROR;
+        -: 1572:	}
+        -: 1573:      else
+        -: 1574:	{
+       14: 1575:	  enum RM_status s = rm_1 (ds, file[i], x, &cwd_errno);
+       14: 1576:	  assert (VALID_STATUS (s));
+       14: 1577:	  UPDATE_STATUS (status, s);
+        -: 1578:	}
+        -: 1579:    }
+        -: 1580:
+       12: 1581:  if (x->require_restore_cwd && cwd_errno)
+        -: 1582:    {
+    #####: 1583:      error (0, cwd_errno,
+        -: 1584:	     _("cannot restore current working directory"));
+    #####: 1585:      status = RM_ERROR;
+        -: 1586:    }
+        -: 1587:
+       12: 1588:  ds_free (ds);
+        -: 1589:
+       12: 1590:  return status;
+        -: 1591:}

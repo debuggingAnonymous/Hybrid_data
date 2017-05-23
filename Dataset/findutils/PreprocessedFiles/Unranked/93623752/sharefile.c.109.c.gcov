@@ -1,0 +1,202 @@
+        -:    0:Source:sharefile.c
+        -:    0:Graph:sharefile.gcno
+        -:    0:Data:sharefile.gcda
+        -:    0:Runs:17
+        -:    0:Programs:2
+        -:    1:/* sharefile.c -- open files just once.
+        -:    2:   Copyright (C) 2008,2009 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   16:*/
+        -:   17:
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:
+        -:   21:#include <errno.h>
+        -:   22:#include <string.h>
+        -:   23:#include <stdlib.h>
+        -:   24:#include <assert.h>
+        -:   25:#include <sys/types.h>
+        -:   26:#include <sys/stat.h>
+        -:   27:
+        -:   28:#include "stdio-safer.h"
+        -:   29:#include "hash.h"
+        -:   30:#include "sharefile.h"
+        -:   31:#include "defs.h"
+        -:   32:
+        -:   33:
+        -:   34:enum
+        -:   35:  {
+        -:   36:    DefaultHashTableSize = 11
+        -:   37:  };
+        -:   38:
+        -:   39:struct sharefile
+        -:   40:{
+        -:   41:  char *mode;
+        -:   42:  Hash_table *table;
+        -:   43:};
+        -:   44:
+        -:   45:
+        -:   46:/*
+        -:   47: * We cannot use the name to determine that two strings represent the
+        -:   48: * same file, since that test would be fooled by symbolic links.
+        -:   49: * Instead we use the device and inode number.
+        -:   50: *
+        -:   51: * However, we remember the name of each file that we opened.  This
+        -:   52: * allows us to issue a fatal error message when (flushing and)
+        -:   53: * closing a file fails.
+        -:   54: */
+        -:   55:struct SharefileEntry
+        -:   56:{
+        -:   57:  dev_t device;
+        -:   58:  ino_t inode;
+        -:   59:  char *name; /* not the only name for this file; error messages only */
+        -:   60:  FILE *fp;
+        -:   61:};
+        -:   62:
+        -:   63:
+        -:   64:static bool
+    #####:   65:entry_comparator (const void *av, const void *bv)
+        -:   66:{
+    #####:   67:  const struct SharefileEntry *a=av, *b=bv;
+    #####:   68:  return (a->inode == b->inode) && (a->device == b->device);
+        -:   69:}
+        -:   70:
+        -:   71:static void
+    #####:   72:entry_free (void *pv)
+        -:   73:{
+    #####:   74:  struct SharefileEntry *p = pv;
+    #####:   75:  if (p->fp)
+        -:   76:    {
+    #####:   77:      if (0 != fclose (p->fp))
+    #####:   78:	fatal_file_error (p->name);
+        -:   79:    }
+    #####:   80:  free (p->name);
+    #####:   81:  free (p);
+    #####:   82:}
+        -:   83:
+        -:   84:static size_t
+    #####:   85:entry_hashfunc (const void *pv, size_t buckets)
+        -:   86:{
+    #####:   87:  const struct SharefileEntry *p = pv;
+    #####:   88:  return (p->device ^ p->inode) % buckets;
+        -:   89:}
+        -:   90:
+        -:   91:
+        -:   92:
+        -:   93:sharefile_handle
+       17:   94:sharefile_init (const char *mode)
+        -:   95:{
+        -:   96:  struct Hash_tuning;
+        -:   97:
+       17:   98:  struct sharefile *p = malloc (sizeof(struct sharefile));
+       17:   99:  if (p)
+        -:  100:    {
+       17:  101:      p->mode = strdup (mode);
+       17:  102:      if (p->mode)
+        -:  103:	{
+       17:  104:	  p->table = hash_initialize (DefaultHashTableSize, NULL,
+        -:  105:				      entry_hashfunc,
+        -:  106:				      entry_comparator,
+        -:  107:				      entry_free);
+       17:  108:	  if (p->table)
+        -:  109:	    {
+       17:  110:	      return p;
+        -:  111:	    }
+        -:  112:	  else
+        -:  113:	    {
+    #####:  114:	      free (p->mode);
+    #####:  115:	      free (p);
+        -:  116:	    }
+        -:  117:	}
+        -:  118:      else
+        -:  119:	{
+    #####:  120:	  free (p);
+        -:  121:	}
+        -:  122:    }
+    #####:  123:  return NULL;
+        -:  124:}
+        -:  125:
+        -:  126:void
+    #####:  127:sharefile_destroy (sharefile_handle pv)
+        -:  128:{
+    #####:  129:  struct sharefile *p = pv;
+    #####:  130:  free (p->mode);
+    #####:  131:  hash_free (p->table);
+    #####:  132:}
+        -:  133:
+        -:  134:
+        -:  135:FILE *
+    #####:  136:sharefile_fopen (sharefile_handle h, const char *filename)
+        -:  137:{
+    #####:  138:  struct sharefile *p = h;
+        -:  139:  struct SharefileEntry *new_entry;
+        -:  140:
+    #####:  141:  new_entry = malloc (sizeof (struct SharefileEntry));
+    #####:  142:  if (!new_entry)
+    #####:  143:    return NULL;
+        -:  144:
+    #####:  145:  new_entry->name = strdup (filename);
+    #####:  146:  if (NULL == new_entry->name)
+        -:  147:    {
+    #####:  148:      free (new_entry);
+    #####:  149:      return NULL;
+        -:  150:    }
+        -:  151:
+    #####:  152:  if (NULL == (new_entry->fp = fopen_safer (filename, p->mode)))
+        -:  153:    {
+    #####:  154:      free (new_entry);
+    #####:  155:      return NULL;
+        -:  156:    }
+        -:  157:  else
+        -:  158:    {
+        -:  159:      struct stat st;
+    #####:  160:      const int fd = fileno (new_entry->fp);
+    #####:  161:      assert (fd >= 0);
+        -:  162:
+    #####:  163:      if (fstat (fd, &st) < 0)
+        -:  164:        {
+    #####:  165:	  entry_free (new_entry);
+    #####:  166:          return NULL;
+        -:  167:        }
+        -:  168:      else
+        -:  169:        {
+        -:  170:	  void *existing;
+        -:  171:
+    #####:  172:          new_entry->device = st.st_dev;
+    #####:  173:          new_entry->inode = st.st_ino;
+        -:  174:
+    #####:  175:          existing = hash_lookup (p->table, new_entry);
+    #####:  176:          if (existing)	    /* We have previously opened that file. */
+        -:  177:	    {
+    #####:  178:	      entry_free (new_entry); /* don't need new_entry. */
+    #####:  179:	      return ((const struct SharefileEntry*)existing)->fp;
+        -:  180:	    }
+        -:  181:          else /* We didn't open it already */
+        -:  182:	    {
+    #####:  183:	      if (hash_insert (p->table, new_entry))
+        -:  184:		{
+    #####:  185:		  return new_entry->fp;
+        -:  186:		}
+        -:  187:	      else			/* failed to insert in hashtable. */
+        -:  188:		{
+    #####:  189:		  const int save_errno = errno;
+    #####:  190:		  entry_free (new_entry);
+    #####:  191:		  errno = save_errno;
+    #####:  192:		  return NULL;
+        -:  193:		}
+        -:  194:	    }
+        -:  195:        }
+        -:  196:    }
+        -:  197:}

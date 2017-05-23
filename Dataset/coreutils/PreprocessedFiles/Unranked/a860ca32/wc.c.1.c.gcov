@@ -1,0 +1,700 @@
+        -:    0:Source:wc.c
+        -:    0:Graph:wc.gcno
+        -:    0:Data:wc.gcda
+        -:    0:Runs:2
+        -:    0:Programs:1
+        -:    1:/* wc - print the number of lines, words, and bytes in files
+        -:    2:   Copyright (C) 85, 91, 1995-2007 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by Paul Rubin, phr@ocf.berkeley.edu
+        -:   18:   and David MacKenzie, djm@gnu.ai.mit.edu. */
+        -:   19:
+        -:   20:#include <config.h>
+        -:   21:
+        -:   22:#include <stdio.h>
+        -:   23:#include <getopt.h>
+        -:   24:#include <sys/types.h>
+        -:   25:#include <wchar.h>
+        -:   26:#include <wctype.h>
+        -:   27:
+        -:   28:#include "system.h"
+        -:   29:#include "error.h"
+        -:   30:#include "inttostr.h"
+        -:   31:#include "quote.h"
+        -:   32:#include "readtokens0.h"
+        -:   33:#include "safe-read.h"
+        -:   34:
+        -:   35:#if !defined iswspace && !HAVE_ISWSPACE
+        -:   36:# define iswspace(wc) \
+        -:   37:    ((wc) == to_uchar (wc) && isspace (to_uchar (wc)))
+        -:   38:#endif
+        -:   39:
+        -:   40:/* The official name of this program (e.g., no `g' prefix).  */
+        -:   41:#define PROGRAM_NAME "wc"
+        -:   42:
+        -:   43:#define AUTHORS "Paul Rubin", "David MacKenzie"
+        -:   44:
+        -:   45:/* Size of atomic reads. */
+        -:   46:#define BUFFER_SIZE (16 * 1024)
+        -:   47:
+        -:   48:/* The name this program was run with. */
+        -:   49:char *program_name;
+        -:   50:
+        -:   51:/* Cumulative number of lines, words, chars and bytes in all files so far.
+        -:   52:   max_line_length is the maximum over all files processed so far.  */
+        -:   53:static uintmax_t total_lines;
+        -:   54:static uintmax_t total_words;
+        -:   55:static uintmax_t total_chars;
+        -:   56:static uintmax_t total_bytes;
+        -:   57:static uintmax_t max_line_length;
+        -:   58:
+        -:   59:/* Which counts to print. */
+        -:   60:static bool print_lines, print_words, print_chars, print_bytes;
+        -:   61:static bool print_linelength;
+        -:   62:
+        -:   63:/* The print width of each count.  */
+        -:   64:static int number_width;
+        -:   65:
+        -:   66:/* True if we have ever read the standard input. */
+        -:   67:static bool have_read_stdin;
+        -:   68:
+        -:   69:/* The result of calling fstat or stat on a file descriptor or file.  */
+        -:   70:struct fstatus
+        -:   71:{
+        -:   72:  /* If positive, fstat or stat has not been called yet.  Otherwise,
+        -:   73:     this is the value returned from fstat or stat.  */
+        -:   74:  int failed;
+        -:   75:
+        -:   76:  /* If FAILED is zero, this is the file's status.  */
+        -:   77:  struct stat st;
+        -:   78:};
+        -:   79:
+        -:   80:/* For long options that have no equivalent short option, use a
+        -:   81:   non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
+        -:   82:enum
+        -:   83:{
+        -:   84:  FILES0_FROM_OPTION = CHAR_MAX + 1
+        -:   85:};
+        -:   86:
+        -:   87:static struct option const longopts[] =
+        -:   88:{
+        -:   89:  {"bytes", no_argument, NULL, 'c'},
+        -:   90:  {"chars", no_argument, NULL, 'm'},
+        -:   91:  {"lines", no_argument, NULL, 'l'},
+        -:   92:  {"words", no_argument, NULL, 'w'},
+        -:   93:  {"files0-from", required_argument, NULL, FILES0_FROM_OPTION},
+        -:   94:  {"max-line-length", no_argument, NULL, 'L'},
+        -:   95:  {GETOPT_HELP_OPTION_DECL},
+        -:   96:  {GETOPT_VERSION_OPTION_DECL},
+        -:   97:  {NULL, 0, NULL, 0}
+        -:   98:};
+        -:   99:
+        -:  100:void
+    #####:  101:usage (int status)
+        -:  102:{
+    #####:  103:  if (status != EXIT_SUCCESS)
+    #####:  104:    fprintf (stderr, _("Try `%s --help' for more information.\n"),
+        -:  105:	     program_name);
+        -:  106:  else
+        -:  107:    {
+    #####:  108:      printf (_("\
+        -:  109:Usage: %s [OPTION]... [FILE]...\n\
+        -:  110:  or:  %s [OPTION]... --files0-from=F\n\
+        -:  111:"),
+        -:  112:	      program_name, program_name);
+    #####:  113:      fputs (_("\
+        -:  114:Print newline, word, and byte counts for each FILE, and a total line if\n\
+        -:  115:more than one FILE is specified.  With no FILE, or when FILE is -,\n\
+        -:  116:read standard input.\n\
+        -:  117:  -c, --bytes            print the byte counts\n\
+        -:  118:  -m, --chars            print the character counts\n\
+        -:  119:  -l, --lines            print the newline counts\n\
+        -:  120:"), stdout);
+    #####:  121:      fputs (_("\
+        -:  122:      --files0-from=F    read input from the files specified by\n\
+        -:  123:                           NUL-terminated names in file F\n\
+        -:  124:  -L, --max-line-length  print the length of the longest line\n\
+        -:  125:  -w, --words            print the word counts\n\
+        -:  126:"), stdout);
+    #####:  127:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  128:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  129:      emit_bug_reporting_address ();
+        -:  130:    }
+    #####:  131:  exit (status);
+        -:  132:}
+        -:  133:
+        -:  134:/* FILE is the name of the file (or NULL for standard input)
+        -:  135:   associated with the specified counters.  */
+        -:  136:static void
+        2:  137:write_counts (uintmax_t lines,
+        -:  138:	      uintmax_t words,
+        -:  139:	      uintmax_t chars,
+        -:  140:	      uintmax_t bytes,
+        -:  141:	      uintmax_t linelength,
+        -:  142:	      const char *file)
+        -:  143:{
+        -:  144:  static char const format_sp_int[] = " %*s";
+        2:  145:  char const *format_int = format_sp_int + 1;
+        -:  146:  char buf[INT_BUFSIZE_BOUND (uintmax_t)];
+        -:  147:
+        2:  148:  if (print_lines)
+        -:  149:    {
+        2:  150:      printf (format_int, number_width, umaxtostr (lines, buf));
+        2:  151:      format_int = format_sp_int;
+        -:  152:    }
+        2:  153:  if (print_words)
+        -:  154:    {
+    #####:  155:      printf (format_int, number_width, umaxtostr (words, buf));
+    #####:  156:      format_int = format_sp_int;
+        -:  157:    }
+        2:  158:  if (print_chars)
+        -:  159:    {
+    #####:  160:      printf (format_int, number_width, umaxtostr (chars, buf));
+    #####:  161:      format_int = format_sp_int;
+        -:  162:    }
+        2:  163:  if (print_bytes)
+        -:  164:    {
+    #####:  165:      printf (format_int, number_width, umaxtostr (bytes, buf));
+    #####:  166:      format_int = format_sp_int;
+        -:  167:    }
+        2:  168:  if (print_linelength)
+        -:  169:    {
+    #####:  170:      printf (format_int, number_width, umaxtostr (linelength, buf));
+        -:  171:    }
+        2:  172:  if (file)
+    #####:  173:    printf (" %s", file);
+        2:  174:  putchar ('\n');
+        2:  175:}
+        -:  176:
+        -:  177:/* Count words.  FILE_X is the name of the file (or NULL for standard
+        -:  178:   input) that is open on descriptor FD.  *FSTATUS is its status.
+        -:  179:   Return true if successful.  */
+        -:  180:static bool
+        2:  181:wc (int fd, char const *file_x, struct fstatus *fstatus)
+        -:  182:{
+        2:  183:  bool ok = true;
+        -:  184:  char buf[BUFFER_SIZE + 1];
+        -:  185:  size_t bytes_read;
+        -:  186:  uintmax_t lines, words, chars, bytes, linelength;
+        -:  187:  bool count_bytes, count_chars, count_complicated;
+        2:  188:  char const *file = file_x ? file_x : _("standard input");
+        -:  189:
+        2:  190:  lines = words = chars = bytes = linelength = 0;
+        -:  191:
+        -:  192:  /* If in the current locale, chars are equivalent to bytes, we prefer
+        -:  193:     counting bytes, because that's easier.  */
+        -:  194:#if HAVE_MBRTOWC && (MB_LEN_MAX > 1)
+        2:  195:  if (MB_CUR_MAX > 1)
+        -:  196:    {
+    #####:  197:      count_bytes = print_bytes;
+    #####:  198:      count_chars = print_chars;
+        -:  199:    }
+        -:  200:  else
+        -:  201:#endif
+        -:  202:    {
+        2:  203:      count_bytes = print_bytes | print_chars;
+        2:  204:      count_chars = false;
+        -:  205:    }
+        2:  206:  count_complicated = print_words | print_linelength;
+        -:  207:
+        -:  208:  /* When counting only bytes, save some line- and word-counting
+        -:  209:     overhead.  If FD is a `regular' Unix file, using lseek is enough
+        -:  210:     to get its `size' in bytes.  Otherwise, read blocks of BUFFER_SIZE
+        -:  211:     bytes at a time until EOF.  Note that the `size' (number of bytes)
+        -:  212:     that wc reports is smaller than stats.st_size when the file is not
+        -:  213:     positioned at its beginning.  That's why the lseek calls below are
+        -:  214:     necessary.  For example the command
+        -:  215:     `(dd ibs=99k skip=1 count=0; ./wc -c) < /etc/group'
+        -:  216:     should make wc report `0' bytes.  */
+        -:  217:
+        2:  218:  if (count_bytes & !count_chars & !print_lines & !count_complicated)
+        -:  219:    {
+        -:  220:      off_t current_pos, end_pos;
+        -:  221:
+    #####:  222:      if (0 < fstatus->failed)
+    #####:  223:	fstatus->failed = fstat (fd, &fstatus->st);
+        -:  224:
+    #####:  225:      if (! fstatus->failed && S_ISREG (fstatus->st.st_mode)
+    #####:  226:	  && (current_pos = lseek (fd, (off_t) 0, SEEK_CUR)) != -1
+    #####:  227:	  && (end_pos = lseek (fd, (off_t) 0, SEEK_END)) != -1)
+        -:  228:	{
+        -:  229:	  /* Be careful here.  The current position may actually be
+        -:  230:	     beyond the end of the file.  As in the example above.  */
+    #####:  231:	  bytes = end_pos < current_pos ? 0 : end_pos - current_pos;
+        -:  232:	}
+        -:  233:      else
+        -:  234:	{
+    #####:  235:	  while ((bytes_read = safe_read (fd, buf, BUFFER_SIZE)) > 0)
+        -:  236:	    {
+    #####:  237:	      if (bytes_read == SAFE_READ_ERROR)
+        -:  238:		{
+    #####:  239:		  error (0, errno, "%s", file);
+    #####:  240:		  ok = false;
+    #####:  241:		  break;
+        -:  242:		}
+    #####:  243:	      bytes += bytes_read;
+        -:  244:	    }
+        -:  245:	}
+        -:  246:    }
+        2:  247:  else if (!count_chars & !count_complicated)
+        -:  248:    {
+        -:  249:      /* Use a separate loop when counting only lines or lines and bytes --
+        -:  250:	 but not chars or words.  */
+        6:  251:      while ((bytes_read = safe_read (fd, buf, BUFFER_SIZE)) > 0)
+        -:  252:	{
+        2:  253:	  char *p = buf;
+        -:  254:
+        2:  255:	  if (bytes_read == SAFE_READ_ERROR)
+        -:  256:	    {
+    #####:  257:	      error (0, errno, "%s", file);
+    #####:  258:	      ok = false;
+    #####:  259:	      break;
+        -:  260:	    }
+        -:  261:
+        6:  262:	  while ((p = memchr (p, '\n', (buf + bytes_read) - p)))
+        -:  263:	    {
+        2:  264:	      ++p;
+        2:  265:	      ++lines;
+        -:  266:	    }
+        2:  267:	  bytes += bytes_read;
+        -:  268:	}
+        -:  269:    }
+        -:  270:#if HAVE_MBRTOWC && (MB_LEN_MAX > 1)
+        -:  271:# define SUPPORT_OLD_MBRTOWC 1
+    #####:  272:  else if (MB_CUR_MAX > 1)
+        -:  273:    {
+    #####:  274:      bool in_word = false;
+    #####:  275:      uintmax_t linepos = 0;
+    #####:  276:      mbstate_t state = { 0, };
+        -:  277:# if SUPPORT_OLD_MBRTOWC
+        -:  278:      /* Back-up the state before each multibyte character conversion and
+        -:  279:	 move the last incomplete character of the buffer to the front
+        -:  280:	 of the buffer.  This is needed because we don't know whether
+        -:  281:	 the `mbrtowc' function updates the state when it returns -2, -
+        -:  282:	 this is the ISO C 99 and glibc-2.2 behaviour - or not - amended
+        -:  283:	 ANSI C, glibc-2.1 and Solaris 5.7 behaviour.  We don't have an
+        -:  284:	 autoconf test for this, yet.  */
+    #####:  285:      size_t prev = 0; /* number of bytes carried over from previous round */
+        -:  286:# else
+        -:  287:      const size_t prev = 0;
+        -:  288:# endif
+        -:  289:
+    #####:  290:      while ((bytes_read = safe_read (fd, buf + prev, BUFFER_SIZE - prev)) > 0)
+        -:  291:	{
+        -:  292:	  const char *p;
+        -:  293:# if SUPPORT_OLD_MBRTOWC
+        -:  294:	  mbstate_t backup_state;
+        -:  295:# endif
+    #####:  296:	  if (bytes_read == SAFE_READ_ERROR)
+        -:  297:	    {
+    #####:  298:	      error (0, errno, "%s", file);
+    #####:  299:	      ok = false;
+    #####:  300:	      break;
+        -:  301:	    }
+        -:  302:
+    #####:  303:	  bytes += bytes_read;
+    #####:  304:	  p = buf;
+    #####:  305:	  bytes_read += prev;
+        -:  306:	  do
+        -:  307:	    {
+        -:  308:	      wchar_t wide_char;
+        -:  309:	      size_t n;
+        -:  310:
+        -:  311:# if SUPPORT_OLD_MBRTOWC
+    #####:  312:	      backup_state = state;
+        -:  313:# endif
+    #####:  314:	      n = mbrtowc (&wide_char, p, bytes_read, &state);
+    #####:  315:	      if (n == (size_t) -2)
+        -:  316:		{
+        -:  317:# if SUPPORT_OLD_MBRTOWC
+    #####:  318:		  state = backup_state;
+        -:  319:# endif
+    #####:  320:		  break;
+        -:  321:		}
+    #####:  322:	      if (n == (size_t) -1)
+        -:  323:		{
+        -:  324:		  /* Remember that we read a byte, but don't complain
+        -:  325:		     about the error.  Because of the decoding error,
+        -:  326:		     this is a considered to be byte but not a
+        -:  327:		     character (that is, chars is not incremented).  */
+    #####:  328:		  p++;
+    #####:  329:		  bytes_read--;
+        -:  330:		}
+        -:  331:	      else
+        -:  332:		{
+    #####:  333:		  if (n == 0)
+        -:  334:		    {
+    #####:  335:		      wide_char = 0;
+    #####:  336:		      n = 1;
+        -:  337:		    }
+    #####:  338:		  p += n;
+    #####:  339:		  bytes_read -= n;
+    #####:  340:		  chars++;
+    #####:  341:		  switch (wide_char)
+        -:  342:		    {
+        -:  343:		    case '\n':
+    #####:  344:		      lines++;
+        -:  345:		      /* Fall through. */
+        -:  346:		    case '\r':
+        -:  347:		    case '\f':
+    #####:  348:		      if (linepos > linelength)
+    #####:  349:			linelength = linepos;
+    #####:  350:		      linepos = 0;
+    #####:  351:		      goto mb_word_separator;
+        -:  352:		    case '\t':
+    #####:  353:		      linepos += 8 - (linepos % 8);
+    #####:  354:		      goto mb_word_separator;
+        -:  355:		    case ' ':
+    #####:  356:		      linepos++;
+        -:  357:		      /* Fall through. */
+        -:  358:		    case '\v':
+        -:  359:		    mb_word_separator:
+    #####:  360:		      words += in_word;
+    #####:  361:		      in_word = false;
+    #####:  362:		      break;
+        -:  363:		    default:
+    #####:  364:		      if (iswprint (wide_char))
+        -:  365:			{
+    #####:  366:			  int width = wcwidth (wide_char);
+    #####:  367:			  if (width > 0)
+    #####:  368:			    linepos += width;
+    #####:  369:			  if (iswspace (wide_char))
+    #####:  370:			    goto mb_word_separator;
+    #####:  371:			  in_word = true;
+        -:  372:			}
+    #####:  373:		      break;
+        -:  374:		    }
+        -:  375:		}
+        -:  376:	    }
+    #####:  377:	  while (bytes_read > 0);
+        -:  378:
+        -:  379:# if SUPPORT_OLD_MBRTOWC
+    #####:  380:	  if (bytes_read > 0)
+        -:  381:	    {
+    #####:  382:	      if (bytes_read == BUFFER_SIZE)
+        -:  383:		{
+        -:  384:		  /* Encountered a very long redundant shift sequence.  */
+    #####:  385:		  p++;
+    #####:  386:		  bytes_read--;
+        -:  387:		}
+    #####:  388:	      memmove (buf, p, bytes_read);
+        -:  389:	    }
+    #####:  390:	  prev = bytes_read;
+        -:  391:# endif
+        -:  392:	}
+    #####:  393:      if (linepos > linelength)
+    #####:  394:	linelength = linepos;
+    #####:  395:      words += in_word;
+        -:  396:    }
+        -:  397:#endif
+        -:  398:  else
+        -:  399:    {
+    #####:  400:      bool in_word = false;
+    #####:  401:      uintmax_t linepos = 0;
+        -:  402:
+    #####:  403:      while ((bytes_read = safe_read (fd, buf, BUFFER_SIZE)) > 0)
+        -:  404:	{
+    #####:  405:	  const char *p = buf;
+    #####:  406:	  if (bytes_read == SAFE_READ_ERROR)
+        -:  407:	    {
+    #####:  408:	      error (0, errno, "%s", file);
+    #####:  409:	      ok = false;
+    #####:  410:	      break;
+        -:  411:	    }
+        -:  412:
+    #####:  413:	  bytes += bytes_read;
+        -:  414:	  do
+        -:  415:	    {
+    #####:  416:	      switch (*p++)
+        -:  417:		{
+        -:  418:		case '\n':
+    #####:  419:		  lines++;
+        -:  420:		  /* Fall through. */
+        -:  421:		case '\r':
+        -:  422:		case '\f':
+    #####:  423:		  if (linepos > linelength)
+    #####:  424:		    linelength = linepos;
+    #####:  425:		  linepos = 0;
+    #####:  426:		  goto word_separator;
+        -:  427:		case '\t':
+    #####:  428:		  linepos += 8 - (linepos % 8);
+    #####:  429:		  goto word_separator;
+        -:  430:		case ' ':
+    #####:  431:		  linepos++;
+        -:  432:		  /* Fall through. */
+        -:  433:		case '\v':
+        -:  434:		word_separator:
+    #####:  435:		  words += in_word;
+    #####:  436:		  in_word = false;
+    #####:  437:		  break;
+        -:  438:		default:
+    #####:  439:		  if (isprint (to_uchar (p[-1])))
+        -:  440:		    {
+    #####:  441:		      linepos++;
+    #####:  442:		      if (isspace (to_uchar (p[-1])))
+    #####:  443:			goto word_separator;
+    #####:  444:		      in_word = true;
+        -:  445:		    }
+    #####:  446:		  break;
+        -:  447:		}
+        -:  448:	    }
+    #####:  449:	  while (--bytes_read);
+        -:  450:	}
+    #####:  451:      if (linepos > linelength)
+    #####:  452:	linelength = linepos;
+    #####:  453:      words += in_word;
+        -:  454:    }
+        -:  455:
+        2:  456:  if (count_chars < print_chars)
+    #####:  457:    chars = bytes;
+        -:  458:
+        2:  459:  write_counts (lines, words, chars, bytes, linelength, file_x);
+        2:  460:  total_lines += lines;
+        2:  461:  total_words += words;
+        2:  462:  total_chars += chars;
+        2:  463:  total_bytes += bytes;
+        2:  464:  if (linelength > max_line_length)
+    #####:  465:    max_line_length = linelength;
+        -:  466:
+        2:  467:  return ok;
+        -:  468:}
+        -:  469:
+        -:  470:static bool
+        2:  471:wc_file (char const *file, struct fstatus *fstatus)
+        -:  472:{
+        2:  473:  if (! file || STREQ (file, "-"))
+        -:  474:    {
+        2:  475:      have_read_stdin = true;
+        -:  476:      if (O_BINARY && ! isatty (STDIN_FILENO))
+        -:  477:	freopen (NULL, "rb", stdin);
+        2:  478:      return wc (STDIN_FILENO, file, fstatus);
+        -:  479:    }
+        -:  480:  else
+        -:  481:    {
+    #####:  482:      int fd = open (file, O_RDONLY | O_BINARY);
+    #####:  483:      if (fd == -1)
+        -:  484:	{
+    #####:  485:	  error (0, errno, "%s", file);
+    #####:  486:	  return false;
+        -:  487:	}
+        -:  488:      else
+        -:  489:	{
+    #####:  490:	  bool ok = wc (fd, file, fstatus);
+    #####:  491:	  if (close (fd) != 0)
+        -:  492:	    {
+    #####:  493:	      error (0, errno, "%s", file);
+    #####:  494:	      return false;
+        -:  495:	    }
+    #####:  496:	  return ok;
+        -:  497:	}
+        -:  498:    }
+        -:  499:}
+        -:  500:
+        -:  501:/* Return the file status for the NFILES files addressed by FILE.
+        -:  502:   Optimize the case where only one number is printed, for just one
+        -:  503:   file; in that case we can use a print width of 1, so we don't need
+        -:  504:   to stat the file.  */
+        -:  505:
+        -:  506:static struct fstatus *
+        2:  507:get_input_fstatus (int nfiles, char * const *file)
+        -:  508:{
+        2:  509:  struct fstatus *fstatus = xnmalloc (nfiles, sizeof *fstatus);
+        -:  510:
+        2:  511:  if (nfiles == 1
+        4:  512:      && ((print_lines + print_words + print_chars
+        2:  513:	   + print_bytes + print_linelength)
+        -:  514:	  == 1))
+        2:  515:    fstatus[0].failed = 1;
+        -:  516:  else
+        -:  517:    {
+        -:  518:      int i;
+        -:  519:
+    #####:  520:      for (i = 0; i < nfiles; i++)
+    #####:  521:	fstatus[i].failed = (! file[i] || STREQ (file[i], "-")
+    #####:  522:			     ? fstat (STDIN_FILENO, &fstatus[i].st)
+    #####:  523:			     : stat (file[i], &fstatus[i].st));
+        -:  524:    }
+        -:  525:
+        2:  526:  return fstatus;
+        -:  527:}
+        -:  528:
+        -:  529:/* Return a print width suitable for the NFILES files whose status is
+        -:  530:   recorded in FSTATUS.  Optimize the same special case that
+        -:  531:   get_input_fstatus optimizes.  */
+        -:  532:
+        -:  533:static int
+        2:  534:compute_number_width (int nfiles, struct fstatus const *fstatus)
+        -:  535:{
+        2:  536:  int width = 1;
+        -:  537:
+        2:  538:  if (0 < nfiles && fstatus[0].failed <= 0)
+        -:  539:    {
+    #####:  540:      int minimum_width = 1;
+    #####:  541:      uintmax_t regular_total = 0;
+        -:  542:      int i;
+        -:  543:
+    #####:  544:      for (i = 0; i < nfiles; i++)
+    #####:  545:	if (! fstatus[i].failed)
+        -:  546:	  {
+    #####:  547:	    if (S_ISREG (fstatus[i].st.st_mode))
+    #####:  548:	      regular_total += fstatus[i].st.st_size;
+        -:  549:	    else
+    #####:  550:	      minimum_width = 7;
+        -:  551:	  }
+        -:  552:
+    #####:  553:      for (; 10 <= regular_total; regular_total /= 10)
+    #####:  554:	width++;
+    #####:  555:      if (width < minimum_width)
+    #####:  556:	width = minimum_width;
+        -:  557:    }
+        -:  558:
+        2:  559:  return width;
+        -:  560:}
+        -:  561:
+        -:  562:
+        -:  563:int
+        2:  564:main (int argc, char **argv)
+        -:  565:{
+        -:  566:  int i;
+        -:  567:  bool ok;
+        -:  568:  int optc;
+        -:  569:  int nfiles;
+        -:  570:  char **files;
+        2:  571:  char *files_from = NULL;
+        -:  572:  struct fstatus *fstatus;
+        -:  573:  struct Tokens tok;
+        -:  574:
+        -:  575:  initialize_main (&argc, &argv);
+        2:  576:  program_name = argv[0];
+        2:  577:  setlocale (LC_ALL, "");
+        -:  578:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  579:  textdomain (PACKAGE);
+        -:  580:
+        2:  581:  atexit (close_stdout);
+        -:  582:
+        2:  583:  print_lines = print_words = print_chars = print_bytes = false;
+        2:  584:  print_linelength = false;
+        2:  585:  total_lines = total_words = total_chars = total_bytes = max_line_length = 0;
+        -:  586:
+        6:  587:  while ((optc = getopt_long (argc, argv, "clLmw", longopts, NULL)) != -1)
+        2:  588:    switch (optc)
+        -:  589:      {
+        -:  590:      case 'c':
+    #####:  591:	print_bytes = true;
+    #####:  592:	break;
+        -:  593:
+        -:  594:      case 'm':
+    #####:  595:	print_chars = true;
+    #####:  596:	break;
+        -:  597:
+        -:  598:      case 'l':
+        2:  599:	print_lines = true;
+        2:  600:	break;
+        -:  601:
+        -:  602:      case 'w':
+    #####:  603:	print_words = true;
+    #####:  604:	break;
+        -:  605:
+        -:  606:      case 'L':
+    #####:  607:	print_linelength = true;
+    #####:  608:	break;
+        -:  609:
+        -:  610:      case FILES0_FROM_OPTION:
+    #####:  611:	files_from = optarg;
+    #####:  612:	break;
+        -:  613:
+    #####:  614:      case_GETOPT_HELP_CHAR;
+        -:  615:
+    #####:  616:      case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  617:
+        -:  618:      default:
+    #####:  619:	usage (EXIT_FAILURE);
+        -:  620:      }
+        -:  621:
+        4:  622:  if (! (print_lines | print_words | print_chars | print_bytes
+        2:  623:	 | print_linelength))
+    #####:  624:    print_lines = print_words = print_bytes = true;
+        -:  625:
+        2:  626:  if (files_from)
+        -:  627:    {
+        -:  628:      FILE *stream;
+        -:  629:
+        -:  630:      /* When using --files0-from=F, you may not specify any files
+        -:  631:	 on the command-line.  */
+    #####:  632:      if (optind < argc)
+        -:  633:	{
+    #####:  634:	  error (0, 0, _("extra operand %s"), quote (argv[optind]));
+    #####:  635:	  fprintf (stderr, "%s\n",
+        -:  636:		   _("File operands cannot be combined with --files0-from."));
+    #####:  637:	  usage (EXIT_FAILURE);
+        -:  638:	}
+        -:  639:
+    #####:  640:      if (STREQ (files_from, "-"))
+    #####:  641:	stream = stdin;
+        -:  642:      else
+        -:  643:	{
+    #####:  644:	  stream = fopen (files_from, "r");
+    #####:  645:	  if (stream == NULL)
+    #####:  646:	    error (EXIT_FAILURE, errno, _("cannot open %s for reading"),
+        -:  647:		   quote (files_from));
+        -:  648:	}
+        -:  649:
+    #####:  650:      readtokens0_init (&tok);
+        -:  651:
+    #####:  652:      if (! readtokens0 (stream, &tok) || fclose (stream) != 0)
+    #####:  653:	error (EXIT_FAILURE, 0, _("cannot read file names from %s"),
+        -:  654:	       quote (files_from));
+        -:  655:
+    #####:  656:      files = tok.tok;
+    #####:  657:      nfiles = tok.n_tok;
+        -:  658:    }
+        -:  659:  else
+        -:  660:    {
+        -:  661:      static char *stdin_only[2];
+        2:  662:      files = (optind < argc ? argv + optind : stdin_only);
+        2:  663:      nfiles = (optind < argc ? argc - optind : 1);
+        2:  664:      stdin_only[0] = NULL;
+        -:  665:    }
+        -:  666:
+        2:  667:  fstatus = get_input_fstatus (nfiles, files);
+        2:  668:  number_width = compute_number_width (nfiles, fstatus);
+        -:  669:
+        2:  670:  ok = true;
+        4:  671:  for (i = 0; i < nfiles; i++)
+        -:  672:    {
+        2:  673:      if (files_from && STREQ (files_from, "-") && STREQ (files[i], "-"))
+        -:  674:	{
+    #####:  675:	  ok = false;
+    #####:  676:	  error (0, 0,
+        -:  677:		 _("when reading file names from stdin, "
+        -:  678:		   "no file name of %s allowed"),
+        -:  679:		 quote ("-"));
+    #####:  680:	  continue;
+        -:  681:	}
+        2:  682:      ok &= wc_file (files[i], &fstatus[i]);
+        -:  683:    }
+        -:  684:
+        2:  685:  if (1 < nfiles)
+    #####:  686:    write_counts (total_lines, total_words, total_chars, total_bytes,
+        -:  687:		  max_line_length, _("total"));
+        -:  688:
+        2:  689:  free (fstatus);
+        -:  690:
+        2:  691:  if (have_read_stdin && close (STDIN_FILENO) != 0)
+    #####:  692:    error (EXIT_FAILURE, errno, "-");
+        -:  693:
+        2:  694:  exit (ok ? EXIT_SUCCESS : EXIT_FAILURE);
+        -:  695:}

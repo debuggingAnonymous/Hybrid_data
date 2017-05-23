@@ -1,0 +1,116 @@
+diff --git a/ChangeLog b/ChangeLog
+index 170e76d..e626020 100644
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,3 +1,12 @@
++2007-07-09  Pádraig Brady <P@draigBrady.com>
++
++	Fix the automatic number width formatting in seq.
++	* src/seq.c: Fix the -w logic. Ignore spaces and '+'
++	characters of input numbers when determining width.
++	Set format correctly for input numbers in scientific notation.
++	* tests/seq/basic: Add various number width tests.
++	Details: <http://thread.gmane.org/gmane.comp.gnu.coreutils.bugs/10903>
++
+ 2007-07-08  Jim Meyering  <jim@meyering.net>
+ 
+ 	Run the coreutils-specific code only if tests/Makefile.am.in exists.
+diff --git a/src/seq.c b/src/seq.c
+index d5d5c53..329f3a4 100644
+--- a/src/seq.c
++++ b/src/seq.c
+@@ -135,23 +135,35 @@ scan_arg (const char *arg)
+       usage (EXIT_FAILURE);
+     }
+ 
++  /* We don't output spaces or '+' so don't include in width */
++  while (isspace (*arg) || *arg == '+')
++    arg++;
++
+   ret.width = strlen (arg);
+   ret.precision = INT_MAX;
+ 
+-  if (! arg[strcspn (arg, "eExX")] && isfinite (ret.value))
++  if (! arg[strcspn (arg, "xX")] && isfinite (ret.value))
+     {
+       char const *decimal_point = strchr (arg, '.');
+       if (! decimal_point)
+ 	ret.precision = 0;
+       else
+ 	{
+-	  size_t fraction_len = strlen (decimal_point + 1);
++	  size_t fraction_len = strcspn (decimal_point + 1, "eE");
+ 	  if (fraction_len <= INT_MAX)
+ 	    ret.precision = fraction_len;
+-	  ret.width += (fraction_len == 0
++	  ret.width += (fraction_len == 0                      /* #.  -> #   */
+ 			? -1
+-			: (decimal_point == arg
+-			   || ! ISDIGIT (decimal_point[-1])));
++			: (decimal_point == arg                /* .#  -> 0.# */
++			   || ! ISDIGIT (decimal_point[-1]))); /* -.# -> 0.# */
++	}
++      char const *e = strchr (arg, 'e');
++      if (! e)
++	e = strchr (arg, 'E');
++      if (e)
++	{
++	  long exponent = strtol (e + 1, NULL, 10);
++	  ret.precision += exponent < 0 ? -exponent : 0;
+ 	}
+     }
+ 
+@@ -275,18 +287,18 @@ get_default_format (operand first, operand step, operand last)
+     {
+       if (equal_width)
+ 	{
++	  /* increase first_width by any increased precision in step */
+ 	  size_t first_width = first.width + (prec - first.precision);
++	  /* adjust last_width to use precision from first/step */
+ 	  size_t last_width = last.width + (prec - last.precision);
+-	  if (first.width <= first_width
+-	      && (last.width < last_width) == (prec < last.precision))
++	  if (last.precision && prec == 0)
++	    last_width--;  /* don't include space for '.' */
++	  size_t width = MAX (first_width, last_width);
++	  if (width <= INT_MAX)
+ 	    {
+-	      size_t width = MAX (first_width, last_width);
+-	      if (width <= INT_MAX)
+-		{
+-		  int w = width;
+-		  sprintf (format_buf, "%%0%d.%dLf", w, prec);
+-		  return format_buf;
+-		}
++	      int w = width;
++	      sprintf (format_buf, "%%0%d.%dLf", w, prec);
++	      return format_buf;
+ 	    }
+ 	}
+       else
+diff --git a/tests/seq/basic b/tests/seq/basic
+index a710e19..6a277ba 100755
+--- a/tests/seq/basic
++++ b/tests/seq/basic
+@@ -56,12 +56,18 @@ my @Tests =
+    ['float-5',	qw(0.8 1e-1 0.9),	{OUT => [qw(0.8 0.9)]}],
+    ['float-6',	qw(0.8 0.1 0.90000000000000000000),	{OUT => [qw(0.8 0.9)]}],
+ 
+-   ['eq-wid-1',	qw(-w 1 -1 -1),	{OUT => [qw(01 00 -1)]}],
++   ['wid-1',	qw(.8 1e-2 .81),  {OUT => [qw(0.80 0.81)]}],
++   ['wid-2',	qw(.89999 1e-7 .8999901),  {OUT => [qw(0.8999900 0.8999901)]}],
+ 
++   ['eq-wid-1',	qw(-w 1 -1 -1),	{OUT => [qw(01 00 -1)]}],
+    # Prior to 2.0g, this test would fail on e.g., HPUX systems
+    # because it'd end up using %3.1f as the format instead of %4.1f.
+-   # ['eq-wid-2',	qw(-w -.1 .1 .11),{OUT => [qw(-0.1 00.0 00.1)]}],
+-   # ['eq-wid-3',	qw(-w 1 3.0),  {OUT => [qw(1 2 3)]}],
++   ['eq-wid-2',	qw(-w -.1 .1 .11),{OUT => [qw(-0.1 00.0 00.1)]}],
++   ['eq-wid-3',	qw(-w 1 3.0),  {OUT => [qw(1 2 3)]}],
++   ['eq-wid-4',	qw(-w .8 1e-2 .81),  {OUT => [qw(0.80 0.81)]}],
++   ['eq-wid-5',	qw(-w 1 .5 2),  {OUT => [qw(1.0 1.5 2.0)]}],
++   ['eq-wid-6',	qw(-w +1 2),  {OUT => [qw(1 2)]}],
++   ['eq-wid-7',	qw(-w "    .1"  "    .1"),  {OUT => [qw(0.1)]}],
+ 
+    # Prior to coreutils-4.5.11, some of these were not accepted.
+    ['fmt-1',	qw(-f %2.1f 1.5 .5 2),{OUT => [qw(1.5 2.0)]}],

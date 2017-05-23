@@ -1,0 +1,169 @@
+        -:    0:Source:cp-hash.c
+        -:    0:Graph:cp-hash.gcno
+        -:    0:Data:cp-hash.gcda
+        -:    0:Runs:6
+        -:    0:Programs:1
+        -:    1:/* cp-hash.c  -- file copying (hash search routines)
+        -:    2:   Copyright (C) 1989-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   16:
+        -:   17:   Written by Torbjorn Granlund, Sweden (tege@sics.se).
+        -:   18:   Rewritten to use lib/hash.c by Jim Meyering.  */
+        -:   19:
+        -:   20:#include <config.h>
+        -:   21:
+        -:   22:#include <sys/types.h>
+        -:   23:#include "system.h"
+        -:   24:
+        -:   25:#include "hash.h"
+        -:   26:#include "cp-hash.h"
+        -:   27:
+        -:   28:/* Use ST_DEV and ST_INO as the key, FILENAME as the value.
+        -:   29:   These are used e.g., in copy.c to associate the destination name with
+        -:   30:   the source device/inode pair so that if we encounter a matching dev/ino
+        -:   31:   pair in the source tree we can arrange to create a hard link between
+        -:   32:   the corresponding names in the destination tree.  */
+        -:   33:struct Src_to_dest
+        -:   34:{
+        -:   35:  ino_t st_ino;
+        -:   36:  dev_t st_dev;
+        -:   37:  /* Destination file name (of non-directory or pre-existing directory)
+        -:   38:     corresponding to the dev/ino of a copied file, or the destination file
+        -:   39:     name corresponding to a dev/ino pair for a newly-created directory. */
+        -:   40:  char *name;
+        -:   41:};
+        -:   42:
+        -:   43:/* This table maps source dev/ino to destination file name.
+        -:   44:   We use it to preserve hard links when copying.  */
+        -:   45:static Hash_table *src_to_dest;
+        -:   46:
+        -:   47:/* Initial size of the above hash table.  */
+        -:   48:#define INITIAL_TABLE_SIZE 103
+        -:   49:
+        -:   50:static size_t
+        6:   51:src_to_dest_hash (void const *x, size_t table_size)
+        -:   52:{
+        6:   53:  struct Src_to_dest const *p = x;
+        -:   54:
+        -:   55:  /* Ignoring the device number here should be fine.  */
+        -:   56:  /* The cast to uintmax_t prevents negative remainders
+        -:   57:     if st_ino is negative.  */
+        6:   58:  return (uintmax_t) p->st_ino % table_size;
+        -:   59:}
+        -:   60:
+        -:   61:/* Compare two Src_to_dest entries.
+        -:   62:   Return true if their keys are judged 'equal'.  */
+        -:   63:static bool
+    #####:   64:src_to_dest_compare (void const *x, void const *y)
+        -:   65:{
+    #####:   66:  struct Src_to_dest const *a = x;
+    #####:   67:  struct Src_to_dest const *b = y;
+    #####:   68:  return SAME_INODE (*a, *b) ? true : false;
+        -:   69:}
+        -:   70:
+        -:   71:static void
+    #####:   72:src_to_dest_free (void *x)
+        -:   73:{
+    #####:   74:  struct Src_to_dest *a = x;
+    #####:   75:  free (a->name);
+    #####:   76:  free (x);
+    #####:   77:}
+        -:   78:
+        -:   79:/* Remove the entry matching INO/DEV from the table
+        -:   80:   that maps source ino/dev to destination file name.  */
+        -:   81:extern void
+    #####:   82:forget_created (ino_t ino, dev_t dev)
+        -:   83:{
+        -:   84:  struct Src_to_dest probe;
+        -:   85:  struct Src_to_dest *ent;
+        -:   86:
+    #####:   87:  probe.st_ino = ino;
+    #####:   88:  probe.st_dev = dev;
+    #####:   89:  probe.name = NULL;
+        -:   90:
+    #####:   91:  ent = hash_delete (src_to_dest, &probe);
+    #####:   92:  if (ent)
+    #####:   93:    src_to_dest_free (ent);
+    #####:   94:}
+        -:   95:
+        -:   96:/* If INO/DEV correspond to an already-copied source file, return the
+        -:   97:   name of the corresponding destination file.  Otherwise, return NULL.  */
+        -:   98:
+        -:   99:extern char *
+        6:  100:src_to_dest_lookup (ino_t ino, dev_t dev)
+        -:  101:{
+        -:  102:  struct Src_to_dest ent;
+        -:  103:  struct Src_to_dest const *e;
+        6:  104:  ent.st_ino = ino;
+        6:  105:  ent.st_dev = dev;
+        6:  106:  e = hash_lookup (src_to_dest, &ent);
+        6:  107:  return e ? e->name : NULL;
+        -:  108:}
+        -:  109:
+        -:  110:/* Add file NAME, copied from inode number INO and device number DEV,
+        -:  111:   to the list of files we have copied.
+        -:  112:   Return NULL if inserted, otherwise non-NULL. */
+        -:  113:
+        -:  114:extern char *
+    #####:  115:remember_copied (const char *name, ino_t ino, dev_t dev)
+        -:  116:{
+        -:  117:  struct Src_to_dest *ent;
+        -:  118:  struct Src_to_dest *ent_from_table;
+        -:  119:
+    #####:  120:  ent = xmalloc (sizeof *ent);
+    #####:  121:  ent->name = xstrdup (name);
+    #####:  122:  ent->st_ino = ino;
+    #####:  123:  ent->st_dev = dev;
+        -:  124:
+    #####:  125:  ent_from_table = hash_insert (src_to_dest, ent);
+    #####:  126:  if (ent_from_table == NULL)
+        -:  127:    {
+        -:  128:      /* Insertion failed due to lack of memory.  */
+    #####:  129:      xalloc_die ();
+        -:  130:    }
+        -:  131:
+        -:  132:  /* Determine whether there was already an entry in the table
+        -:  133:     with a matching key.  If so, free ENT (it wasn't inserted) and
+        -:  134:     return the 'name' from the table entry.  */
+    #####:  135:  if (ent_from_table != ent)
+        -:  136:    {
+    #####:  137:      src_to_dest_free (ent);
+    #####:  138:      return (char *) ent_from_table->name;
+        -:  139:    }
+        -:  140:
+        -:  141:  /* New key;  insertion succeeded.  */
+    #####:  142:  return NULL;
+        -:  143:}
+        -:  144:
+        -:  145:/* Initialize the hash table.  */
+        -:  146:extern void
+        6:  147:hash_init (void)
+        -:  148:{
+        6:  149:  src_to_dest = hash_initialize (INITIAL_TABLE_SIZE, NULL,
+        -:  150:                                 src_to_dest_hash,
+        -:  151:                                 src_to_dest_compare,
+        -:  152:                                 src_to_dest_free);
+        6:  153:  if (src_to_dest == NULL)
+    #####:  154:    xalloc_die ();
+        6:  155:}
+        -:  156:
+        -:  157:/* Reset the hash structure in the global variable 'htab' to
+        -:  158:   contain no entries.  */
+        -:  159:
+        -:  160:extern void
+    #####:  161:forget_all (void)
+        -:  162:{
+    #####:  163:  hash_free (src_to_dest);
+    #####:  164:}

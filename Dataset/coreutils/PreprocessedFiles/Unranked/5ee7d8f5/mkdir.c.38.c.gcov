@@ -1,0 +1,240 @@
+        -:    0:Source:src/mkdir.c
+        -:    0:Graph:src/mkdir.gcno
+        -:    0:Data:src/mkdir.gcda
+        -:    0:Runs:1
+        -:    0:Programs:1
+        -:    1:/* mkdir -- make directories
+        -:    2:   Copyright (C) 1990-2013 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* David MacKenzie <djm@ai.mit.edu>  */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <stdio.h>
+        -:   21:#include <getopt.h>
+        -:   22:#include <sys/types.h>
+        -:   23:#include <selinux/selinux.h>
+        -:   24:
+        -:   25:#include "system.h"
+        -:   26:#include "error.h"
+        -:   27:#include "mkdir-p.h"
+        -:   28:#include "modechange.h"
+        -:   29:#include "prog-fprintf.h"
+        -:   30:#include "quote.h"
+        -:   31:#include "savewd.h"
+        -:   32:#include "smack.h"
+        -:   33:
+        -:   34:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   35:#define PROGRAM_NAME "mkdir"
+        -:   36:
+        -:   37:#define AUTHORS proper_name ("David MacKenzie")
+        -:   38:
+        -:   39:static struct option const longopts[] =
+        -:   40:{
+        -:   41:  {GETOPT_SELINUX_CONTEXT_OPTION_DECL},
+        -:   42:  {"mode", required_argument, NULL, 'm'},
+        -:   43:  {"parents", no_argument, NULL, 'p'},
+        -:   44:  {"verbose", no_argument, NULL, 'v'},
+        -:   45:  {GETOPT_HELP_OPTION_DECL},
+        -:   46:  {GETOPT_VERSION_OPTION_DECL},
+        -:   47:  {NULL, 0, NULL, 0}
+        -:   48:};
+        -:   49:
+        -:   50:void
+    #####:   51:usage (int status)
+        -:   52:{
+    #####:   53:  if (status != EXIT_SUCCESS)
+    #####:   54:    emit_try_help ();
+        -:   55:  else
+        -:   56:    {
+    #####:   57:      printf (_("Usage: %s [OPTION]... DIRECTORY...\n"), program_name);
+    #####:   58:      fputs (_("\
+        -:   59:Create the DIRECTORY(ies), if they do not already exist.\n\
+        -:   60:"), stdout);
+        -:   61:
+    #####:   62:      emit_mandatory_arg_note ();
+        -:   63:
+    #####:   64:      fputs (_("\
+        -:   65:  -m, --mode=MODE   set file mode (as in chmod), not a=rwx - umask\n\
+        -:   66:  -p, --parents     no error if existing, make parent directories as needed\n\
+        -:   67:  -v, --verbose     print a message for each created directory\n\
+        -:   68:  -Z, --context=CTX  set the SELinux security context of each created\n\
+        -:   69:                      directory to CTX\n\
+        -:   70:"), stdout);
+    #####:   71:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:   72:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:   73:      emit_ancillary_info ();
+        -:   74:    }
+    #####:   75:  exit (status);
+        -:   76:}
+        -:   77:
+        -:   78:/* Options passed to subsidiary functions.  */
+        -:   79:struct mkdir_options
+        -:   80:{
+        -:   81:  /* Function to make an ancestor, or NULL if ancestors should not be
+        -:   82:     made.  */
+        -:   83:  int (*make_ancestor_function) (char const *, char const *, void *);
+        -:   84:
+        -:   85:  /* Umask value in effect.  */
+        -:   86:  mode_t umask_value;
+        -:   87:
+        -:   88:  /* Mode for directory itself.  */
+        -:   89:  mode_t mode;
+        -:   90:
+        -:   91:  /* File mode bits affected by MODE.  */
+        -:   92:  mode_t mode_bits;
+        -:   93:
+        -:   94:  /* If not null, format to use when reporting newly made directories.  */
+        -:   95:  char const *created_directory_format;
+        -:   96:};
+        -:   97:
+        -:   98:/* Report that directory DIR was made, if OPTIONS requests this.  */
+        -:   99:static void
+        1:  100:announce_mkdir (char const *dir, void *options)
+        -:  101:{
+        1:  102:  struct mkdir_options const *o = options;
+        1:  103:  if (o->created_directory_format)
+    #####:  104:    prog_fprintf (stdout, o->created_directory_format, quote (dir));
+        1:  105:}
+        -:  106:
+        -:  107:/* Make ancestor directory DIR, whose last component is COMPONENT,
+        -:  108:   with options OPTIONS.  Assume the working directory is COMPONENT's
+        -:  109:   parent.  Return 0 if successful and the resulting directory is
+        -:  110:   readable, 1 if successful but the resulting directory is not
+        -:  111:   readable, -1 (setting errno) otherwise.  */
+        -:  112:static int
+    #####:  113:make_ancestor (char const *dir, char const *component, void *options)
+        -:  114:{
+    #####:  115:  struct mkdir_options const *o = options;
+        -:  116:  int r;
+    #####:  117:  mode_t user_wx = S_IWUSR | S_IXUSR;
+    #####:  118:  bool self_denying_umask = (o->umask_value & user_wx) != 0;
+    #####:  119:  if (self_denying_umask)
+    #####:  120:    umask (o->umask_value & ~user_wx);
+    #####:  121:  r = mkdir (component, S_IRWXUGO);
+    #####:  122:  if (self_denying_umask)
+        -:  123:    {
+    #####:  124:      int mkdir_errno = errno;
+    #####:  125:      umask (o->umask_value);
+    #####:  126:      errno = mkdir_errno;
+        -:  127:    }
+    #####:  128:  if (r == 0)
+        -:  129:    {
+    #####:  130:      r = (o->umask_value & S_IRUSR) != 0;
+    #####:  131:      announce_mkdir (dir, options);
+        -:  132:    }
+    #####:  133:  return r;
+        -:  134:}
+        -:  135:
+        -:  136:/* Process a command-line file name.  */
+        -:  137:static int
+        1:  138:process_dir (char *dir, struct savewd *wd, void *options)
+        -:  139:{
+        1:  140:  struct mkdir_options const *o = options;
+        2:  141:  return (make_dir_parents (dir, wd, o->make_ancestor_function, options,
+        -:  142:                            o->mode, announce_mkdir,
+        -:  143:                            o->mode_bits, (uid_t) -1, (gid_t) -1, true)
+        -:  144:          ? EXIT_SUCCESS
+        1:  145:          : EXIT_FAILURE);
+        -:  146:}
+        -:  147:
+        -:  148:int
+        1:  149:main (int argc, char **argv)
+        -:  150:{
+        1:  151:  const char *specified_mode = NULL;
+        -:  152:  int optc;
+        1:  153:  security_context_t scontext = NULL;
+        -:  154:  struct mkdir_options options;
+        -:  155:
+        1:  156:  options.make_ancestor_function = NULL;
+        1:  157:  options.mode = S_IRWXUGO;
+        1:  158:  options.mode_bits = 0;
+        1:  159:  options.created_directory_format = NULL;
+        -:  160:
+        -:  161:  initialize_main (&argc, &argv);
+        1:  162:  set_program_name (argv[0]);
+        1:  163:  setlocale (LC_ALL, "");
+        -:  164:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  165:  textdomain (PACKAGE);
+        -:  166:
+        1:  167:  atexit (close_stdout);
+        -:  168:
+        1:  169:  while ((optc = getopt_long (argc, argv, "pm:vZ:", longopts, NULL)) != -1)
+        -:  170:    {
+    #####:  171:      switch (optc)
+        -:  172:        {
+        -:  173:        case 'p':
+    #####:  174:          options.make_ancestor_function = make_ancestor;
+    #####:  175:          break;
+        -:  176:        case 'm':
+    #####:  177:          specified_mode = optarg;
+    #####:  178:          break;
+        -:  179:        case 'v': /* --verbose  */
+    #####:  180:          options.created_directory_format = _("created directory %s");
+    #####:  181:          break;
+        -:  182:        case 'Z':
+    #####:  183:          scontext = optarg;
+    #####:  184:          break;
+    #####:  185:        case_GETOPT_HELP_CHAR;
+    #####:  186:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  187:        default:
+    #####:  188:          usage (EXIT_FAILURE);
+        -:  189:        }
+        -:  190:    }
+        -:  191:
+        1:  192:  if (optind == argc)
+        -:  193:    {
+    #####:  194:      error (0, 0, _("missing operand"));
+    #####:  195:      usage (EXIT_FAILURE);
+        -:  196:    }
+        -:  197:
+        1:  198:  if (scontext)
+        -:  199:    {
+    #####:  200:      int ret = 0;
+    #####:  201:      if (is_smack_enabled ())
+    #####:  202:        ret = smack_set_label_for_self (scontext);
+        -:  203:      else
+    #####:  204:        ret = setfscreatecon (scontext);
+        -:  205:
+    #####:  206:      if (ret < 0)
+    #####:  207:        error (EXIT_FAILURE, errno,
+        -:  208:               _("failed to set default file creation context to %s"),
+        -:  209:               quote (scontext));
+        -:  210:    }
+        -:  211:
+        -:  212:
+        1:  213:  if (options.make_ancestor_function || specified_mode)
+        -:  214:    {
+    #####:  215:      mode_t umask_value = umask (0);
+    #####:  216:      umask (umask_value);
+    #####:  217:      options.umask_value = umask_value;
+        -:  218:
+    #####:  219:      if (specified_mode)
+        -:  220:        {
+    #####:  221:          struct mode_change *change = mode_compile (specified_mode);
+    #####:  222:          if (!change)
+    #####:  223:            error (EXIT_FAILURE, 0, _("invalid mode %s"),
+        -:  224:                   quote (specified_mode));
+    #####:  225:          options.mode = mode_adjust (S_IRWXUGO, true, umask_value, change,
+        -:  226:                                      &options.mode_bits);
+    #####:  227:          free (change);
+        -:  228:        }
+        -:  229:      else
+    #####:  230:        options.mode = S_IRWXUGO;
+        -:  231:    }
+        -:  232:
+        1:  233:  exit (savewd_process_files (argc - optind, argv + optind,
+        -:  234:                              process_dir, &options));
+        -:  235:}

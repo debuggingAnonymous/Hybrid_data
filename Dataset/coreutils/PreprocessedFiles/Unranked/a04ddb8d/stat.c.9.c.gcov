@@ -1,0 +1,1514 @@
+        -:    0:Source:src/stat.c
+        -:    0:Graph:src/stat.gcno
+        -:    0:Data:src/stat.gcda
+        -:    0:Runs:9
+        -:    0:Programs:1
+        -:    1:/* stat.c -- display file or file system status
+        -:    2:   Copyright (C) 2001-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   16:
+        -:   17:   Written by Michael Meskes.  */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:
+        -:   21:/* Keep this conditional in sync with the similar conditional in
+        -:   22:   ../m4/stat-prog.m4.  */
+        -:   23:#if ((STAT_STATVFS || STAT_STATVFS64)                                       \
+        -:   24:     && (HAVE_STRUCT_STATVFS_F_BASETYPE || HAVE_STRUCT_STATVFS_F_FSTYPENAME \
+        -:   25:         || (! HAVE_STRUCT_STATFS_F_FSTYPENAME && HAVE_STRUCT_STATVFS_F_TYPE)))
+        -:   26:# define USE_STATVFS 1
+        -:   27:#else
+        -:   28:# define USE_STATVFS 0
+        -:   29:#endif
+        -:   30:
+        -:   31:#include <stddef.h>
+        -:   32:#include <stdio.h>
+        -:   33:#include <stdalign.h>
+        -:   34:#include <sys/types.h>
+        -:   35:#include <pwd.h>
+        -:   36:#include <grp.h>
+        -:   37:#if USE_STATVFS
+        -:   38:# include <sys/statvfs.h>
+        -:   39:#elif HAVE_SYS_VFS_H
+        -:   40:# include <sys/vfs.h>
+        -:   41:#elif HAVE_SYS_MOUNT_H && HAVE_SYS_PARAM_H
+        -:   42:/* NOTE: freebsd5.0 needs sys/param.h and sys/mount.h for statfs.
+        -:   43:   It does have statvfs.h, but shouldn't use it, since it doesn't
+        -:   44:   HAVE_STRUCT_STATVFS_F_BASETYPE.  So find a clean way to fix it.  */
+        -:   45:/* NetBSD 1.5.2 needs these, for the declaration of struct statfs. */
+        -:   46:# include <sys/param.h>
+        -:   47:# include <sys/mount.h>
+        -:   48:# if HAVE_NFS_NFS_CLNT_H && HAVE_NFS_VFS_H
+        -:   49:/* Ultrix 4.4 needs these for the declaration of struct statfs.  */
+        -:   50:#  include <netinet/in.h>
+        -:   51:#  include <nfs/nfs_clnt.h>
+        -:   52:#  include <nfs/vfs.h>
+        -:   53:# endif
+        -:   54:#elif HAVE_OS_H /* BeOS */
+        -:   55:# include <fs_info.h>
+        -:   56:#endif
+        -:   57:#include <selinux/selinux.h>
+        -:   58:
+        -:   59:#include "system.h"
+        -:   60:
+        -:   61:#include "areadlink.h"
+        -:   62:#include "error.h"
+        -:   63:#include "file-type.h"
+        -:   64:#include "filemode.h"
+        -:   65:#include "fs.h"
+        -:   66:#include "getopt.h"
+        -:   67:#include "mountlist.h"
+        -:   68:#include "quote.h"
+        -:   69:#include "quotearg.h"
+        -:   70:#include "stat-size.h"
+        -:   71:#include "stat-time.h"
+        -:   72:#include "strftime.h"
+        -:   73:#include "find-mount-point.h"
+        -:   74:#include "xvasprintf.h"
+        -:   75:
+        -:   76:#if USE_STATVFS
+        -:   77:# define STRUCT_STATVFS struct statvfs
+        -:   78:# define STRUCT_STATXFS_F_FSID_IS_INTEGER STRUCT_STATVFS_F_FSID_IS_INTEGER
+        -:   79:# define HAVE_STRUCT_STATXFS_F_TYPE HAVE_STRUCT_STATVFS_F_TYPE
+        -:   80:# if HAVE_STRUCT_STATVFS_F_NAMEMAX
+        -:   81:#  define SB_F_NAMEMAX(S) ((S)->f_namemax)
+        -:   82:# endif
+        -:   83:# if ! STAT_STATVFS && STAT_STATVFS64
+        -:   84:#  define STATFS statvfs64
+        -:   85:# else
+        -:   86:#  define STATFS statvfs
+        -:   87:# endif
+        -:   88:# define STATFS_FRSIZE(S) ((S)->f_frsize)
+        -:   89:#else
+        -:   90:# define HAVE_STRUCT_STATXFS_F_TYPE HAVE_STRUCT_STATFS_F_TYPE
+        -:   91:# if HAVE_STRUCT_STATFS_F_NAMELEN
+        -:   92:#  define SB_F_NAMEMAX(S) ((S)->f_namelen)
+        -:   93:# endif
+        -:   94:# define STATFS statfs
+        -:   95:# if HAVE_OS_H /* BeOS */
+        -:   96:/* BeOS has a statvfs function, but it does not return sensible values
+        -:   97:   for f_files, f_ffree and f_favail, and lacks f_type, f_basetype and
+        -:   98:   f_fstypename.  Use 'struct fs_info' instead.  */
+        -:   99:static int ATTRIBUTE_WARN_UNUSED_RESULT
+        -:  100:statfs (char const *filename, struct fs_info *buf)
+        -:  101:{
+        -:  102:  dev_t device = dev_for_path (filename);
+        -:  103:  if (device < 0)
+        -:  104:    {
+        -:  105:      errno = (device == B_ENTRY_NOT_FOUND ? ENOENT
+        -:  106:               : device == B_BAD_VALUE ? EINVAL
+        -:  107:               : device == B_NAME_TOO_LONG ? ENAMETOOLONG
+        -:  108:               : device == B_NO_MEMORY ? ENOMEM
+        -:  109:               : device == B_FILE_ERROR ? EIO
+        -:  110:               : 0);
+        -:  111:      return -1;
+        -:  112:    }
+        -:  113:  /* If successful, buf->dev will be == device.  */
+        -:  114:  return fs_stat_dev (device, buf);
+        -:  115:}
+        -:  116:#  define f_fsid dev
+        -:  117:#  define f_blocks total_blocks
+        -:  118:#  define f_bfree free_blocks
+        -:  119:#  define f_bavail free_blocks
+        -:  120:#  define f_bsize io_size
+        -:  121:#  define f_files total_nodes
+        -:  122:#  define f_ffree free_nodes
+        -:  123:#  define STRUCT_STATVFS struct fs_info
+        -:  124:#  define STRUCT_STATXFS_F_FSID_IS_INTEGER true
+        -:  125:#  define STATFS_FRSIZE(S) ((S)->block_size)
+        -:  126:# else
+        -:  127:#  define STRUCT_STATVFS struct statfs
+        -:  128:#  define STRUCT_STATXFS_F_FSID_IS_INTEGER STRUCT_STATFS_F_FSID_IS_INTEGER
+        -:  129:#  if HAVE_STRUCT_STATFS_F_FRSIZE
+        -:  130:#   define STATFS_FRSIZE(S) ((S)->f_frsize)
+        -:  131:#  else
+        -:  132:#   define STATFS_FRSIZE(S) 0
+        -:  133:#  endif
+        -:  134:# endif
+        -:  135:#endif
+        -:  136:
+        -:  137:#ifdef SB_F_NAMEMAX
+        -:  138:# define OUT_NAMEMAX out_uint
+        -:  139:#else
+        -:  140:/* NetBSD 1.5.2 has neither f_namemax nor f_namelen.  */
+        -:  141:# define SB_F_NAMEMAX(S) "*"
+        -:  142:# define OUT_NAMEMAX out_string
+        -:  143:#endif
+        -:  144:
+        -:  145:#if HAVE_STRUCT_STATVFS_F_BASETYPE
+        -:  146:# define STATXFS_FILE_SYSTEM_TYPE_MEMBER_NAME f_basetype
+        -:  147:#else
+        -:  148:# if HAVE_STRUCT_STATVFS_F_FSTYPENAME || HAVE_STRUCT_STATFS_F_FSTYPENAME
+        -:  149:#  define STATXFS_FILE_SYSTEM_TYPE_MEMBER_NAME f_fstypename
+        -:  150:# elif HAVE_OS_H /* BeOS */
+        -:  151:#  define STATXFS_FILE_SYSTEM_TYPE_MEMBER_NAME fsh_name
+        -:  152:# endif
+        -:  153:#endif
+        -:  154:
+        -:  155:/* FIXME: these are used by printf.c, too */
+        -:  156:#define isodigit(c) ('0' <= (c) && (c) <= '7')
+        -:  157:#define octtobin(c) ((c) - '0')
+        -:  158:#define hextobin(c) ((c) >= 'a' && (c) <= 'f' ? (c) - 'a' + 10 : \
+        -:  159:                     (c) >= 'A' && (c) <= 'F' ? (c) - 'A' + 10 : (c) - '0')
+        -:  160:
+        -:  161:static char const digits[] = "0123456789";
+        -:  162:
+        -:  163:/* Flags that are portable for use in printf, for at least one
+        -:  164:   conversion specifier; make_format removes unportable flags as
+        -:  165:   needed for particular specifiers.  The glibc 2.2 extension "I" is
+        -:  166:   listed here; it is removed by make_format because it has undefined
+        -:  167:   behavior elsewhere and because it is incompatible with
+        -:  168:   out_epoch_sec.  */
+        -:  169:static char const printf_flags[] = "'-+ #0I";
+        -:  170:
+        -:  171:#define PROGRAM_NAME "stat"
+        -:  172:
+        -:  173:#define AUTHORS proper_name ("Michael Meskes")
+        -:  174:
+        -:  175:enum
+        -:  176:{
+        -:  177:  PRINTF_OPTION = CHAR_MAX + 1
+        -:  178:};
+        -:  179:
+        -:  180:static struct option const long_options[] =
+        -:  181:{
+        -:  182:  {"context", no_argument, 0, 'Z'},
+        -:  183:  {"dereference", no_argument, NULL, 'L'},
+        -:  184:  {"file-system", no_argument, NULL, 'f'},
+        -:  185:  {"format", required_argument, NULL, 'c'},
+        -:  186:  {"printf", required_argument, NULL, PRINTF_OPTION},
+        -:  187:  {"terse", no_argument, NULL, 't'},
+        -:  188:  {GETOPT_HELP_OPTION_DECL},
+        -:  189:  {GETOPT_VERSION_OPTION_DECL},
+        -:  190:  {NULL, 0, NULL, 0}
+        -:  191:};
+        -:  192:
+        -:  193:/* Whether to follow symbolic links;  True for --dereference (-L).  */
+        -:  194:static bool follow_links;
+        -:  195:
+        -:  196:/* Whether to interpret backslash-escape sequences.
+        -:  197:   True for --printf=FMT, not for --format=FMT (-c).  */
+        -:  198:static bool interpret_backslash_escapes;
+        -:  199:
+        -:  200:/* The trailing delimiter string:
+        -:  201:   "" for --printf=FMT, "\n" for --format=FMT (-c).  */
+        -:  202:static char const *trailing_delim = "";
+        -:  203:
+        -:  204:/* The representation of the decimal point in the current locale.  */
+        -:  205:static char const *decimal_point;
+        -:  206:static size_t decimal_point_len;
+        -:  207:
+        -:  208:/* Return the type of the specified file system.
+        -:  209:   Some systems have statfvs.f_basetype[FSTYPSZ] (AIX, HP-UX, and Solaris).
+        -:  210:   Others have statvfs.f_fstypename[_VFS_NAMELEN] (NetBSD 3.0).
+        -:  211:   Others have statfs.f_fstypename[MFSNAMELEN] (NetBSD 1.5.2).
+        -:  212:   Still others have neither and have to get by with f_type (GNU/Linux).
+        -:  213:   But f_type may only exist in statfs (Cygwin).  */
+        -:  214:static char const * ATTRIBUTE_WARN_UNUSED_RESULT
+    #####:  215:human_fstype (STRUCT_STATVFS const *statfsbuf)
+        -:  216:{
+        -:  217:#ifdef STATXFS_FILE_SYSTEM_TYPE_MEMBER_NAME
+        -:  218:  return statfsbuf->STATXFS_FILE_SYSTEM_TYPE_MEMBER_NAME;
+        -:  219:#else
+    #####:  220:  switch (statfsbuf->f_type)
+        -:  221:    {
+        -:  222:# if defined __linux__
+        -:  223:
+        -:  224:      /* Compare with what's in libc:
+        -:  225:         f=/a/libc/sysdeps/unix/sysv/linux/linux_fsinfo.h
+        -:  226:         sed -n '/ADFS_SUPER_MAGIC/,/SYSFS_MAGIC/p' $f \
+        -:  227:           | perl -n -e '/#define (.*?)_(?:SUPER_)MAGIC\s+0x(\S+)/' \
+        -:  228:             -e 'and print "case S_MAGIC_$1: /\* 0x" . uc($2) . " *\/\n"' \
+        -:  229:           | sort > sym_libc
+        -:  230:         perl -ne '/^\s+(case S_MAGIC_.*?): \/\* 0x(\S+) \*\//' \
+        -:  231:             -e 'and do { $v=uc$2; print "$1: /\* 0x$v *\/\n"}' stat.c \
+        -:  232:           | sort > sym_stat
+        -:  233:         diff -u sym_stat sym_libc
+        -:  234:      */
+        -:  235:
+        -:  236:      /* Also compare with the list in "man 2 statfs" using the
+        -:  237:         fs-magic-compare make target.  */
+        -:  238:
+        -:  239:      /* IMPORTANT NOTE: Each of the following 'case S_MAGIC_...:'
+        -:  240:         statements must be followed by a hexadecimal constant in
+        -:  241:         a comment.  The S_MAGIC_... name and constant are automatically
+        -:  242:         combined to produce the #define directives in fs.h.  */
+        -:  243:
+        -:  244:    case S_MAGIC_ADFS: /* 0xADF5 local */
+    #####:  245:      return "adfs";
+        -:  246:    case S_MAGIC_AFFS: /* 0xADFF local */
+    #####:  247:      return "affs";
+        -:  248:    case S_MAGIC_AFS: /* 0x5346414F remote */
+    #####:  249:      return "afs";
+        -:  250:    case S_MAGIC_ANON_INODE_FS: /* 0x09041934 local */
+    #####:  251:      return "anon-inode FS";
+        -:  252:    case S_MAGIC_AUFS: /* 0x61756673 remote */
+        -:  253:      /* FIXME: change syntax or add an optional attribute like "inotify:no".
+        -:  254:         The above is labeled as "remote" so that tail always uses polling,
+        -:  255:         but this isn't really a remote file system type.  */
+    #####:  256:      return "aufs";
+        -:  257:    case S_MAGIC_AUTOFS: /* 0x0187 local */
+    #####:  258:      return "autofs";
+        -:  259:    case S_MAGIC_BEFS: /* 0x42465331 local */
+    #####:  260:      return "befs";
+        -:  261:    case S_MAGIC_BDEVFS: /* 0x62646576 local */
+    #####:  262:      return "bdevfs";
+        -:  263:    case S_MAGIC_BFS: /* 0x1BADFACE local */
+    #####:  264:      return "bfs";
+        -:  265:    case S_MAGIC_BINFMTFS: /* 0x42494E4D local */
+    #####:  266:      return "binfmt_misc";
+        -:  267:    case S_MAGIC_BTRFS: /* 0x9123683E local */
+    #####:  268:      return "btrfs";
+        -:  269:    case S_MAGIC_CGROUP: /* 0x0027E0EB local */
+    #####:  270:      return "cgroupfs";
+        -:  271:    case S_MAGIC_CIFS: /* 0xFF534D42 remote */
+    #####:  272:      return "cifs";
+        -:  273:    case S_MAGIC_CODA: /* 0x73757245 remote */
+    #####:  274:      return "coda";
+        -:  275:    case S_MAGIC_COH: /* 0x012FF7B7 local */
+    #####:  276:      return "coh";
+        -:  277:    case S_MAGIC_CRAMFS: /* 0x28CD3D45 local */
+    #####:  278:      return "cramfs";
+        -:  279:    case S_MAGIC_CRAMFS_WEND: /* 0x453DCD28 local */
+    #####:  280:      return "cramfs-wend";
+        -:  281:    case S_MAGIC_DEBUGFS: /* 0x64626720 local */
+    #####:  282:      return "debugfs";
+        -:  283:    case S_MAGIC_DEVFS: /* 0x1373 local */
+    #####:  284:      return "devfs";
+        -:  285:    case S_MAGIC_DEVPTS: /* 0x1CD1 local */
+    #####:  286:      return "devpts";
+        -:  287:    case S_MAGIC_ECRYPTFS: /* 0xF15F local */
+    #####:  288:      return "ecryptfs";
+        -:  289:    case S_MAGIC_EFS: /* 0x00414A53 local */
+    #####:  290:      return "efs";
+        -:  291:    case S_MAGIC_EXT: /* 0x137D local */
+    #####:  292:      return "ext";
+        -:  293:    case S_MAGIC_EXT2: /* 0xEF53 local */
+    #####:  294:      return "ext2/ext3";
+        -:  295:    case S_MAGIC_EXT2_OLD: /* 0xEF51 local */
+    #####:  296:      return "ext2";
+        -:  297:    case S_MAGIC_FAT: /* 0x4006 local */
+    #####:  298:      return "fat";
+        -:  299:    case S_MAGIC_FHGFS: /* 0x19830326 remote */
+    #####:  300:      return "fhgfs";
+        -:  301:    case S_MAGIC_FUSEBLK: /* 0x65735546 remote */
+    #####:  302:      return "fuseblk";
+        -:  303:    case S_MAGIC_FUSECTL: /* 0x65735543 remote */
+    #####:  304:      return "fusectl";
+        -:  305:    case S_MAGIC_FUTEXFS: /* 0x0BAD1DEA local */
+    #####:  306:      return "futexfs";
+        -:  307:    case S_MAGIC_GFS: /* 0x1161970 remote */
+    #####:  308:      return "gfs/gfs2";
+        -:  309:    case S_MAGIC_GPFS: /* 0x47504653 remote */
+    #####:  310:      return "gpfs";
+        -:  311:    case S_MAGIC_HFS: /* 0x4244 local */
+    #####:  312:      return "hfs";
+        -:  313:    case S_MAGIC_HPFS: /* 0xF995E849 local */
+    #####:  314:      return "hpfs";
+        -:  315:    case S_MAGIC_HUGETLBFS: /* 0x958458F6 local */
+    #####:  316:      return "hugetlbfs";
+        -:  317:    case S_MAGIC_MTD_INODE_FS: /* 0x11307854 local */
+    #####:  318:      return "inodefs";
+        -:  319:    case S_MAGIC_INOTIFYFS: /* 0x2BAD1DEA local */
+    #####:  320:      return "inotifyfs";
+        -:  321:    case S_MAGIC_ISOFS: /* 0x9660 local */
+    #####:  322:      return "isofs";
+        -:  323:    case S_MAGIC_ISOFS_R_WIN: /* 0x4004 local */
+    #####:  324:      return "isofs";
+        -:  325:    case S_MAGIC_ISOFS_WIN: /* 0x4000 local */
+    #####:  326:      return "isofs";
+        -:  327:    case S_MAGIC_JFFS: /* 0x07C0 local */
+    #####:  328:      return "jffs";
+        -:  329:    case S_MAGIC_JFFS2: /* 0x72B6 local */
+    #####:  330:      return "jffs2";
+        -:  331:    case S_MAGIC_JFS: /* 0x3153464A local */
+    #####:  332:      return "jfs";
+        -:  333:    case S_MAGIC_KAFS: /* 0x6B414653 remote */
+    #####:  334:      return "k-afs";
+        -:  335:    case S_MAGIC_LUSTRE: /* 0x0BD00BD0 remote */
+    #####:  336:      return "lustre";
+        -:  337:    case S_MAGIC_MINIX: /* 0x137F local */
+    #####:  338:      return "minix";
+        -:  339:    case S_MAGIC_MINIX_30: /* 0x138F local */
+    #####:  340:      return "minix (30 char.)";
+        -:  341:    case S_MAGIC_MINIX_V2: /* 0x2468 local */
+    #####:  342:      return "minix v2";
+        -:  343:    case S_MAGIC_MINIX_V2_30: /* 0x2478 local */
+    #####:  344:      return "minix v2 (30 char.)";
+        -:  345:    case S_MAGIC_MINIX_V3: /* 0x4D5A local */
+    #####:  346:      return "minix3";
+        -:  347:    case S_MAGIC_MQUEUE: /* 0x19800202 local */
+    #####:  348:      return "mqueue";
+        -:  349:    case S_MAGIC_MSDOS: /* 0x4D44 local */
+    #####:  350:      return "msdos";
+        -:  351:    case S_MAGIC_NCP: /* 0x564C remote */
+    #####:  352:      return "novell";
+        -:  353:    case S_MAGIC_NFS: /* 0x6969 remote */
+    #####:  354:      return "nfs";
+        -:  355:    case S_MAGIC_NFSD: /* 0x6E667364 remote */
+    #####:  356:      return "nfsd";
+        -:  357:    case S_MAGIC_NILFS: /* 0x3434 local */
+    #####:  358:      return "nilfs";
+        -:  359:    case S_MAGIC_NTFS: /* 0x5346544E local */
+    #####:  360:      return "ntfs";
+        -:  361:    case S_MAGIC_OPENPROM: /* 0x9FA1 local */
+    #####:  362:      return "openprom";
+        -:  363:    case S_MAGIC_OCFS2: /* 0x7461636f remote */
+    #####:  364:      return "ocfs2";
+        -:  365:    case S_MAGIC_PANFS: /* 0xAAD7AAEA remote */
+    #####:  366:      return "panfs";
+        -:  367:    case S_MAGIC_PIPEFS: /* 0x50495045 remote */
+        -:  368:      /* FIXME: change syntax or add an optional attribute like "inotify:no".
+        -:  369:         The above is labeled as "remote" so that tail always uses polling,
+        -:  370:         but this isn't really a remote file system type.  */
+    #####:  371:      return "pipefs";
+        -:  372:    case S_MAGIC_PROC: /* 0x9FA0 local */
+    #####:  373:      return "proc";
+        -:  374:    case S_MAGIC_PSTOREFS: /* 0x6165676C local */
+    #####:  375:      return "pstorefs";
+        -:  376:    case S_MAGIC_QNX4: /* 0x002F local */
+    #####:  377:      return "qnx4";
+        -:  378:    case S_MAGIC_QNX6: /* 0x68191122 local */
+    #####:  379:      return "qnx6";
+        -:  380:    case S_MAGIC_RAMFS: /* 0x858458F6 local */
+    #####:  381:      return "ramfs";
+        -:  382:    case S_MAGIC_REISERFS: /* 0x52654973 local */
+    #####:  383:      return "reiserfs";
+        -:  384:    case S_MAGIC_ROMFS: /* 0x7275 local */
+    #####:  385:      return "romfs";
+        -:  386:    case S_MAGIC_RPC_PIPEFS: /* 0x67596969 local */
+    #####:  387:      return "rpc_pipefs";
+        -:  388:    case S_MAGIC_SECURITYFS: /* 0x73636673 local */
+    #####:  389:      return "securityfs";
+        -:  390:    case S_MAGIC_SELINUX: /* 0xF97CFF8C local */
+    #####:  391:      return "selinux";
+        -:  392:    case S_MAGIC_SMB: /* 0x517B remote */
+    #####:  393:      return "smb";
+        -:  394:    case S_MAGIC_SOCKFS: /* 0x534F434B local */
+    #####:  395:      return "sockfs";
+        -:  396:    case S_MAGIC_SQUASHFS: /* 0x73717368 local */
+    #####:  397:      return "squashfs";
+        -:  398:    case S_MAGIC_SYSFS: /* 0x62656572 local */
+    #####:  399:      return "sysfs";
+        -:  400:    case S_MAGIC_SYSV2: /* 0x012FF7B6 local */
+    #####:  401:      return "sysv2";
+        -:  402:    case S_MAGIC_SYSV4: /* 0x012FF7B5 local */
+    #####:  403:      return "sysv4";
+        -:  404:    case S_MAGIC_TMPFS: /* 0x01021994 local */
+    #####:  405:      return "tmpfs";
+        -:  406:    case S_MAGIC_UDF: /* 0x15013346 local */
+    #####:  407:      return "udf";
+        -:  408:    case S_MAGIC_UFS: /* 0x00011954 local */
+    #####:  409:      return "ufs";
+        -:  410:    case S_MAGIC_UFS_BYTESWAPPED: /* 0x54190100 local */
+    #####:  411:      return "ufs";
+        -:  412:    case S_MAGIC_USBDEVFS: /* 0x9FA2 local */
+    #####:  413:      return "usbdevfs";
+        -:  414:    case S_MAGIC_V9FS: /* 0x01021997 local */
+    #####:  415:      return "v9fs";
+        -:  416:    case S_MAGIC_VXFS: /* 0xA501FCF5 local */
+    #####:  417:      return "vxfs";
+        -:  418:    case S_MAGIC_VZFS: /* 0x565A4653 local */
+    #####:  419:      return "vzfs";
+        -:  420:    case S_MAGIC_XENFS: /* 0xABBA1974 local */
+    #####:  421:      return "xenfs";
+        -:  422:    case S_MAGIC_XENIX: /* 0x012FF7B4 local */
+    #####:  423:      return "xenix";
+        -:  424:    case S_MAGIC_XFS: /* 0x58465342 local */
+    #####:  425:      return "xfs";
+        -:  426:    case S_MAGIC_XIAFS: /* 0x012FD16D local */
+    #####:  427:      return "xia";
+        -:  428:    case S_MAGIC_ZFS: /* 0x2FC12FC1 local */
+    #####:  429:      return "zfs";
+        -:  430:
+        -:  431:# elif __GNU__
+        -:  432:    case FSTYPE_UFS:
+        -:  433:      return "ufs";
+        -:  434:    case FSTYPE_NFS:
+        -:  435:      return "nfs";
+        -:  436:    case FSTYPE_GFS:
+        -:  437:      return "gfs";
+        -:  438:    case FSTYPE_LFS:
+        -:  439:      return "lfs";
+        -:  440:    case FSTYPE_SYSV:
+        -:  441:      return "sysv";
+        -:  442:    case FSTYPE_FTP:
+        -:  443:      return "ftp";
+        -:  444:    case FSTYPE_TAR:
+        -:  445:      return "tar";
+        -:  446:    case FSTYPE_AR:
+        -:  447:      return "ar";
+        -:  448:    case FSTYPE_CPIO:
+        -:  449:      return "cpio";
+        -:  450:    case FSTYPE_MSLOSS:
+        -:  451:      return "msloss";
+        -:  452:    case FSTYPE_CPM:
+        -:  453:      return "cpm";
+        -:  454:    case FSTYPE_HFS:
+        -:  455:      return "hfs";
+        -:  456:    case FSTYPE_DTFS:
+        -:  457:      return "dtfs";
+        -:  458:    case FSTYPE_GRFS:
+        -:  459:      return "grfs";
+        -:  460:    case FSTYPE_TERM:
+        -:  461:      return "term";
+        -:  462:    case FSTYPE_DEV:
+        -:  463:      return "dev";
+        -:  464:    case FSTYPE_PROC:
+        -:  465:      return "proc";
+        -:  466:    case FSTYPE_IFSOCK:
+        -:  467:      return "ifsock";
+        -:  468:    case FSTYPE_AFS:
+        -:  469:      return "afs";
+        -:  470:    case FSTYPE_DFS:
+        -:  471:      return "dfs";
+        -:  472:    case FSTYPE_PROC9:
+        -:  473:      return "proc9";
+        -:  474:    case FSTYPE_SOCKET:
+        -:  475:      return "socket";
+        -:  476:    case FSTYPE_MISC:
+        -:  477:      return "misc";
+        -:  478:    case FSTYPE_EXT2FS:
+        -:  479:      return "ext2/ext3";
+        -:  480:    case FSTYPE_HTTP:
+        -:  481:      return "http";
+        -:  482:    case FSTYPE_MEMFS:
+        -:  483:      return "memfs";
+        -:  484:    case FSTYPE_ISO9660:
+        -:  485:      return "iso9660";
+        -:  486:# endif
+        -:  487:    default:
+        -:  488:      {
+    #####:  489:        unsigned long int type = statfsbuf->f_type;
+        -:  490:        static char buf[sizeof "UNKNOWN (0x%lx)" - 3
+        -:  491:                        + (sizeof type * CHAR_BIT + 3) / 4];
+    #####:  492:        sprintf (buf, "UNKNOWN (0x%lx)", type);
+    #####:  493:        return buf;
+        -:  494:      }
+        -:  495:    }
+        -:  496:#endif
+        -:  497:}
+        -:  498:
+        -:  499:static char * ATTRIBUTE_WARN_UNUSED_RESULT
+    #####:  500:human_access (struct stat const *statbuf)
+        -:  501:{
+        -:  502:  static char modebuf[12];
+    #####:  503:  filemodestring (statbuf, modebuf);
+    #####:  504:  modebuf[10] = 0;
+    #####:  505:  return modebuf;
+        -:  506:}
+        -:  507:
+        -:  508:static char * ATTRIBUTE_WARN_UNUSED_RESULT
+    #####:  509:human_time (struct timespec t)
+        -:  510:{
+        -:  511:  static char str[MAX (INT_BUFSIZE_BOUND (intmax_t),
+        -:  512:                       (INT_STRLEN_BOUND (int) /* YYYY */
+        -:  513:                        + 1 /* because YYYY might equal INT_MAX + 1900 */
+        -:  514:                        + sizeof "-MM-DD HH:MM:SS.NNNNNNNNN +ZZZZ"))];
+    #####:  515:  struct tm const *tm = localtime (&t.tv_sec);
+    #####:  516:  if (tm == NULL)
+    #####:  517:    return timetostr (t.tv_sec, str);
+    #####:  518:  nstrftime (str, sizeof str, "%Y-%m-%d %H:%M:%S.%N %z", tm, 0, t.tv_nsec);
+    #####:  519:  return str;
+        -:  520:}
+        -:  521:
+        -:  522:/* PFORMAT points to a '%' followed by a prefix of a format, all of
+        -:  523:   size PREFIX_LEN.  The flags allowed for this format are
+        -:  524:   ALLOWED_FLAGS; remove other printf flags from the prefix, then
+        -:  525:   append SUFFIX.  */
+        -:  526:static void
+        9:  527:make_format (char *pformat, size_t prefix_len, char const *allowed_flags,
+        -:  528:             char const *suffix)
+        -:  529:{
+        9:  530:  char *dst = pformat + 1;
+        -:  531:  char const *src;
+        9:  532:  char const *srclim = pformat + prefix_len;
+        9:  533:  for (src = dst; src < srclim && strchr (printf_flags, *src); src++)
+    #####:  534:    if (strchr (allowed_flags, *src))
+    #####:  535:      *dst++ = *src;
+       18:  536:  while (src < srclim)
+    #####:  537:    *dst++ = *src++;
+        9:  538:  strcpy (dst, suffix);
+        9:  539:}
+        -:  540:
+        -:  541:static void
+    #####:  542:out_string (char *pformat, size_t prefix_len, char const *arg)
+        -:  543:{
+    #####:  544:  make_format (pformat, prefix_len, "-", "s");
+    #####:  545:  printf (pformat, arg);
+    #####:  546:}
+        -:  547:static int
+    #####:  548:out_int (char *pformat, size_t prefix_len, intmax_t arg)
+        -:  549:{
+    #####:  550:  make_format (pformat, prefix_len, "'-+ 0", PRIdMAX);
+    #####:  551:  return printf (pformat, arg);
+        -:  552:}
+        -:  553:static int
+        9:  554:out_uint (char *pformat, size_t prefix_len, uintmax_t arg)
+        -:  555:{
+        9:  556:  make_format (pformat, prefix_len, "'-0", PRIuMAX);
+        9:  557:  return printf (pformat, arg);
+        -:  558:}
+        -:  559:static void
+    #####:  560:out_uint_o (char *pformat, size_t prefix_len, uintmax_t arg)
+        -:  561:{
+    #####:  562:  make_format (pformat, prefix_len, "-#0", PRIoMAX);
+    #####:  563:  printf (pformat, arg);
+    #####:  564:}
+        -:  565:static void
+    #####:  566:out_uint_x (char *pformat, size_t prefix_len, uintmax_t arg)
+        -:  567:{
+    #####:  568:  make_format (pformat, prefix_len, "-#0", PRIxMAX);
+    #####:  569:  printf (pformat, arg);
+    #####:  570:}
+        -:  571:static int
+    #####:  572:out_minus_zero (char *pformat, size_t prefix_len)
+        -:  573:{
+    #####:  574:  make_format (pformat, prefix_len, "'-+ 0", ".0f");
+    #####:  575:  return printf (pformat, -0.25);
+        -:  576:}
+        -:  577:
+        -:  578:/* Output the number of seconds since the Epoch, using a format that
+        -:  579:   acts like printf's %f format.  */
+        -:  580:static void
+    #####:  581:out_epoch_sec (char *pformat, size_t prefix_len,
+        -:  582:               struct stat const *statbuf ATTRIBUTE_UNUSED,
+        -:  583:               struct timespec arg)
+        -:  584:{
+    #####:  585:  char *dot = memchr (pformat, '.', prefix_len);
+    #####:  586:  size_t sec_prefix_len = prefix_len;
+    #####:  587:  int width = 0;
+    #####:  588:  int precision = 0;
+    #####:  589:  bool frac_left_adjust = false;
+        -:  590:
+    #####:  591:  if (dot)
+        -:  592:    {
+    #####:  593:      sec_prefix_len = dot - pformat;
+    #####:  594:      pformat[prefix_len] = '\0';
+        -:  595:
+    #####:  596:      if (ISDIGIT (dot[1]))
+        -:  597:        {
+    #####:  598:          long int lprec = strtol (dot + 1, NULL, 10);
+    #####:  599:          precision = (lprec <= INT_MAX ? lprec : INT_MAX);
+        -:  600:        }
+        -:  601:      else
+        -:  602:        {
+    #####:  603:          precision = 9;
+        -:  604:        }
+        -:  605:
+    #####:  606:      if (precision && ISDIGIT (dot[-1]))
+        -:  607:        {
+        -:  608:          /* If a nontrivial width is given, subtract the width of the
+        -:  609:             decimal point and PRECISION digits that will be output
+        -:  610:             later.  */
+    #####:  611:          char *p = dot;
+    #####:  612:          *dot = '\0';
+        -:  613:
+        -:  614:          do
+    #####:  615:            --p;
+    #####:  616:          while (ISDIGIT (p[-1]));
+        -:  617:
+    #####:  618:          long int lwidth = strtol (p, NULL, 10);
+    #####:  619:          width = (lwidth <= INT_MAX ? lwidth : INT_MAX);
+    #####:  620:          if (1 < width)
+        -:  621:            {
+    #####:  622:              p += (*p == '0');
+    #####:  623:              sec_prefix_len = p - pformat;
+    #####:  624:              int w_d = (decimal_point_len < width
+        -:  625:                         ? width - decimal_point_len
+        -:  626:                         : 0);
+    #####:  627:              if (1 < w_d)
+        -:  628:                {
+    #####:  629:                  int w = w_d - precision;
+    #####:  630:                  if (1 < w)
+        -:  631:                    {
+    #####:  632:                      char *dst = pformat;
+    #####:  633:                      for (char const *src = dst; src < p; src++)
+        -:  634:                        {
+    #####:  635:                          if (*src == '-')
+    #####:  636:                            frac_left_adjust = true;
+        -:  637:                          else
+    #####:  638:                            *dst++ = *src;
+        -:  639:                        }
+    #####:  640:                      sec_prefix_len =
+    #####:  641:                        (dst - pformat
+    #####:  642:                         + (frac_left_adjust ? 0 : sprintf (dst, "%d", w)));
+        -:  643:                    }
+        -:  644:                }
+        -:  645:            }
+        -:  646:        }
+        -:  647:    }
+        -:  648:
+    #####:  649:  int divisor = 1;
+    #####:  650:  for (int i = precision; i < 9; i++)
+    #####:  651:    divisor *= 10;
+    #####:  652:  int frac_sec = arg.tv_nsec / divisor;
+        -:  653:  int int_len;
+        -:  654:
+        -:  655:  if (TYPE_SIGNED (time_t))
+        -:  656:    {
+    #####:  657:      bool minus_zero = false;
+    #####:  658:      if (arg.tv_sec < 0 && arg.tv_nsec != 0)
+        -:  659:        {
+    #####:  660:          int frac_sec_modulus = 1000000000 / divisor;
+    #####:  661:          frac_sec = (frac_sec_modulus - frac_sec
+    #####:  662:                      - (arg.tv_nsec % divisor != 0));
+    #####:  663:          arg.tv_sec += (frac_sec != 0);
+    #####:  664:          minus_zero = (arg.tv_sec == 0);
+        -:  665:        }
+    #####:  666:      int_len = (minus_zero
+        -:  667:                 ? out_minus_zero (pformat, sec_prefix_len)
+    #####:  668:                 : out_int (pformat, sec_prefix_len, arg.tv_sec));
+        -:  669:    }
+        -:  670:  else
+        -:  671:    int_len = out_uint (pformat, sec_prefix_len, arg.tv_sec);
+        -:  672:
+    #####:  673:  if (precision)
+        -:  674:    {
+    #####:  675:      int prec = (precision < 9 ? precision : 9);
+    #####:  676:      int trailing_prec = precision - prec;
+    #####:  677:      int ilen = (int_len < 0 ? 0 : int_len);
+    #####:  678:      int trailing_width = (ilen < width && decimal_point_len < width - ilen
+    #####:  679:                            ? width - ilen - decimal_point_len - prec
+        -:  680:                            : 0);
+    #####:  681:      printf ("%s%.*d%-*.*d", decimal_point, prec, frac_sec,
+        -:  682:              trailing_width, trailing_prec, 0);
+        -:  683:    }
+    #####:  684:}
+        -:  685:
+        -:  686:/* Print the context information of FILENAME, and return true iff the
+        -:  687:   context could not be obtained.  */
+        -:  688:static bool ATTRIBUTE_WARN_UNUSED_RESULT
+    #####:  689:out_file_context (char *pformat, size_t prefix_len, char const *filename)
+        -:  690:{
+        -:  691:  char *scontext;
+    #####:  692:  bool fail = false;
+        -:  693:
+    #####:  694:  if ((follow_links
+    #####:  695:       ? getfilecon (filename, &scontext)
+    #####:  696:       : lgetfilecon (filename, &scontext)) < 0)
+        -:  697:    {
+    #####:  698:      error (0, errno, _("failed to get security context of %s"),
+        -:  699:             quote (filename));
+    #####:  700:      scontext = NULL;
+    #####:  701:      fail = true;
+        -:  702:    }
+    #####:  703:  strcpy (pformat + prefix_len, "s");
+    #####:  704:  printf (pformat, (scontext ? scontext : "?"));
+    #####:  705:  if (scontext)
+    #####:  706:    freecon (scontext);
+    #####:  707:  return fail;
+        -:  708:}
+        -:  709:
+        -:  710:/* Print statfs info.  Return zero upon success, nonzero upon failure.  */
+        -:  711:static bool ATTRIBUTE_WARN_UNUSED_RESULT
+    #####:  712:print_statfs (char *pformat, size_t prefix_len, unsigned int m,
+        -:  713:              char const *filename,
+        -:  714:              void const *data)
+        -:  715:{
+    #####:  716:  STRUCT_STATVFS const *statfsbuf = data;
+    #####:  717:  bool fail = false;
+        -:  718:
+    #####:  719:  switch (m)
+        -:  720:    {
+        -:  721:    case 'n':
+    #####:  722:      out_string (pformat, prefix_len, filename);
+    #####:  723:      break;
+        -:  724:
+        -:  725:    case 'i':
+        -:  726:      {
+        -:  727:#if STRUCT_STATXFS_F_FSID_IS_INTEGER
+        -:  728:        uintmax_t fsid = statfsbuf->f_fsid;
+        -:  729:#else
+        -:  730:        typedef unsigned int fsid_word;
+        -:  731:        verify (alignof (STRUCT_STATVFS) % alignof (fsid_word) == 0);
+        -:  732:        verify (offsetof (STRUCT_STATVFS, f_fsid) % alignof (fsid_word) == 0);
+        -:  733:        verify (sizeof statfsbuf->f_fsid % alignof (fsid_word) == 0);
+    #####:  734:        fsid_word const *p = (fsid_word *) &statfsbuf->f_fsid;
+        -:  735:
+        -:  736:        /* Assume a little-endian word order, as that is compatible
+        -:  737:           with glibc's statvfs implementation.  */
+    #####:  738:        uintmax_t fsid = 0;
+    #####:  739:        int words = sizeof statfsbuf->f_fsid / sizeof *p;
+        -:  740:        int i;
+    #####:  741:        for (i = 0; i < words && i * sizeof *p < sizeof fsid; i++)
+        -:  742:          {
+    #####:  743:            uintmax_t u = p[words - 1 - i];
+    #####:  744:            fsid |= u << (i * CHAR_BIT * sizeof *p);
+        -:  745:          }
+        -:  746:#endif
+    #####:  747:        out_uint_x (pformat, prefix_len, fsid);
+        -:  748:      }
+    #####:  749:      break;
+        -:  750:
+        -:  751:    case 'l':
+    #####:  752:      OUT_NAMEMAX (pformat, prefix_len, SB_F_NAMEMAX (statfsbuf));
+    #####:  753:      break;
+        -:  754:    case 't':
+        -:  755:#if HAVE_STRUCT_STATXFS_F_TYPE
+    #####:  756:      out_uint_x (pformat, prefix_len, statfsbuf->f_type);
+        -:  757:#else
+        -:  758:      fputc ('?', stdout);
+        -:  759:#endif
+    #####:  760:      break;
+        -:  761:    case 'T':
+    #####:  762:      out_string (pformat, prefix_len, human_fstype (statfsbuf));
+    #####:  763:      break;
+        -:  764:    case 'b':
+    #####:  765:      out_int (pformat, prefix_len, statfsbuf->f_blocks);
+    #####:  766:      break;
+        -:  767:    case 'f':
+    #####:  768:      out_int (pformat, prefix_len, statfsbuf->f_bfree);
+    #####:  769:      break;
+        -:  770:    case 'a':
+    #####:  771:      out_int (pformat, prefix_len, statfsbuf->f_bavail);
+    #####:  772:      break;
+        -:  773:    case 's':
+    #####:  774:      out_uint (pformat, prefix_len, statfsbuf->f_bsize);
+    #####:  775:      break;
+        -:  776:    case 'S':
+        -:  777:      {
+    #####:  778:        uintmax_t frsize = STATFS_FRSIZE (statfsbuf);
+    #####:  779:        if (! frsize)
+    #####:  780:          frsize = statfsbuf->f_bsize;
+    #####:  781:        out_uint (pformat, prefix_len, frsize);
+        -:  782:      }
+    #####:  783:      break;
+        -:  784:    case 'c':
+    #####:  785:      out_uint (pformat, prefix_len, statfsbuf->f_files);
+    #####:  786:      break;
+        -:  787:    case 'd':
+    #####:  788:      out_int (pformat, prefix_len, statfsbuf->f_ffree);
+    #####:  789:      break;
+        -:  790:    default:
+    #####:  791:      fputc ('?', stdout);
+    #####:  792:      break;
+        -:  793:    }
+    #####:  794:  return fail;
+        -:  795:}
+        -:  796:
+        -:  797:/* Return any bind mounted source for a path.
+        -:  798:   The caller should not free the returned buffer.
+        -:  799:   Return NULL if no bind mount found.  */
+        -:  800:static char const * ATTRIBUTE_WARN_UNUSED_RESULT
+    #####:  801:find_bind_mount (char const * name)
+        -:  802:{
+    #####:  803:  char const * bind_mount = NULL;
+        -:  804:
+        -:  805:  static struct mount_entry *mount_list;
+        -:  806:  static bool tried_mount_list = false;
+    #####:  807:  if (!tried_mount_list) /* attempt/warn once per process.  */
+        -:  808:    {
+    #####:  809:      if (!(mount_list = read_file_system_list (false)))
+    #####:  810:        error (0, errno, "%s", _("cannot read table of mounted file systems"));
+    #####:  811:      tried_mount_list = true;
+        -:  812:    }
+        -:  813:
+        -:  814:  struct mount_entry *me;
+    #####:  815:  for (me = mount_list; me; me = me->me_next)
+        -:  816:    {
+    #####:  817:      if (me->me_dummy && me->me_devname[0] == '/'
+    #####:  818:          && STREQ (me->me_mountdir, name))
+        -:  819:        {
+        -:  820:          struct stat name_stats;
+        -:  821:          struct stat dev_stats;
+        -:  822:
+    #####:  823:          if (stat (name, &name_stats) == 0
+    #####:  824:              && stat (me->me_devname, &dev_stats) == 0
+    #####:  825:              && SAME_INODE (name_stats, dev_stats))
+        -:  826:            {
+    #####:  827:              bind_mount = me->me_devname;
+    #####:  828:              break;
+        -:  829:            }
+        -:  830:        }
+        -:  831:    }
+        -:  832:
+    #####:  833:  return bind_mount;
+        -:  834:}
+        -:  835:
+        -:  836:/* Print mount point.  Return zero upon success, nonzero upon failure.  */
+        -:  837:static bool ATTRIBUTE_WARN_UNUSED_RESULT
+    #####:  838:out_mount_point (char const *filename, char *pformat, size_t prefix_len,
+        -:  839:                 const struct stat *statp)
+        -:  840:{
+        -:  841:
+    #####:  842:  char const *np = "?", *bp = NULL;
+    #####:  843:  char *mp = NULL;
+    #####:  844:  bool fail = true;
+        -:  845:
+        -:  846:  /* Look for bind mounts first.  Note we output the immediate alias,
+        -:  847:     rather than further resolving to a base device mount point.  */
+    #####:  848:  if (follow_links || !S_ISLNK (statp->st_mode))
+        -:  849:    {
+    #####:  850:      char *resolved = canonicalize_file_name (filename);
+    #####:  851:      if (!resolved)
+        -:  852:        {
+    #####:  853:          error (0, errno, _("failed to canonicalize %s"), quote (filename));
+    #####:  854:          goto print_mount_point;
+        -:  855:        }
+    #####:  856:      bp = find_bind_mount (resolved);
+    #####:  857:      free (resolved);
+    #####:  858:      if (bp)
+        -:  859:        {
+    #####:  860:          fail = false;
+    #####:  861:          goto print_mount_point;
+        -:  862:        }
+        -:  863:    }
+        -:  864:
+        -:  865:  /* If there is no direct bind mount, then navigate
+        -:  866:     back up the tree looking for a device change.
+        -:  867:     Note we don't detect if any of the directory components
+        -:  868:     are bind mounted to the same device, but that's OK
+        -:  869:     since we've not directly queried them.  */
+    #####:  870:  if ((mp = find_mount_point (filename, statp)))
+        -:  871:    {
+        -:  872:      /* This dir might be bind mounted to another device,
+        -:  873:         so we resolve the bound source in that case also.  */
+    #####:  874:      bp = find_bind_mount (mp);
+    #####:  875:      fail = false;
+        -:  876:    }
+        -:  877:
+        -:  878:print_mount_point:
+        -:  879:
+    #####:  880:  out_string (pformat, prefix_len, bp ? bp : mp ? mp : np);
+    #####:  881:  free (mp);
+    #####:  882:  return fail;
+        -:  883:}
+        -:  884:
+        -:  885:/* Map a TS with negative TS.tv_nsec to {0,0}.  */
+        -:  886:static inline struct timespec
+    #####:  887:neg_to_zero (struct timespec ts)
+        -:  888:{
+    #####:  889:  if (0 <= ts.tv_nsec)
+    #####:  890:    return ts;
+    #####:  891:  struct timespec z = {0, 0};
+    #####:  892:  return z;
+        -:  893:}
+        -:  894:
+        -:  895:/* Print stat info.  Return zero upon success, nonzero upon failure.  */
+        -:  896:static bool
+        9:  897:print_stat (char *pformat, size_t prefix_len, unsigned int m,
+        -:  898:            char const *filename, void const *data)
+        -:  899:{
+        9:  900:  struct stat *statbuf = (struct stat *) data;
+        -:  901:  struct passwd *pw_ent;
+        -:  902:  struct group *gw_ent;
+        9:  903:  bool fail = false;
+        -:  904:
+        9:  905:  switch (m)
+        -:  906:    {
+        -:  907:    case 'n':
+    #####:  908:      out_string (pformat, prefix_len, filename);
+    #####:  909:      break;
+        -:  910:    case 'N':
+    #####:  911:      out_string (pformat, prefix_len, quote (filename));
+    #####:  912:      if (S_ISLNK (statbuf->st_mode))
+        -:  913:        {
+    #####:  914:          char *linkname = areadlink_with_size (filename, statbuf->st_size);
+    #####:  915:          if (linkname == NULL)
+        -:  916:            {
+    #####:  917:              error (0, errno, _("cannot read symbolic link %s"),
+        -:  918:                     quote (filename));
+    #####:  919:              return true;
+        -:  920:            }
+    #####:  921:          printf (" -> ");
+    #####:  922:          out_string (pformat, prefix_len, quote (linkname));
+    #####:  923:          free (linkname);
+        -:  924:        }
+    #####:  925:      break;
+        -:  926:    case 'd':
+    #####:  927:      out_uint (pformat, prefix_len, statbuf->st_dev);
+    #####:  928:      break;
+        -:  929:    case 'D':
+    #####:  930:      out_uint_x (pformat, prefix_len, statbuf->st_dev);
+    #####:  931:      break;
+        -:  932:    case 'i':
+        9:  933:      out_uint (pformat, prefix_len, statbuf->st_ino);
+        9:  934:      break;
+        -:  935:    case 'a':
+    #####:  936:      out_uint_o (pformat, prefix_len, statbuf->st_mode & CHMOD_MODE_BITS);
+    #####:  937:      break;
+        -:  938:    case 'A':
+    #####:  939:      out_string (pformat, prefix_len, human_access (statbuf));
+    #####:  940:      break;
+        -:  941:    case 'f':
+    #####:  942:      out_uint_x (pformat, prefix_len, statbuf->st_mode);
+    #####:  943:      break;
+        -:  944:    case 'F':
+    #####:  945:      out_string (pformat, prefix_len, file_type (statbuf));
+    #####:  946:      break;
+        -:  947:    case 'h':
+    #####:  948:      out_uint (pformat, prefix_len, statbuf->st_nlink);
+    #####:  949:      break;
+        -:  950:    case 'u':
+    #####:  951:      out_uint (pformat, prefix_len, statbuf->st_uid);
+    #####:  952:      break;
+        -:  953:    case 'U':
+    #####:  954:      setpwent ();
+    #####:  955:      pw_ent = getpwuid (statbuf->st_uid);
+    #####:  956:      out_string (pformat, prefix_len,
+        -:  957:                  pw_ent ? pw_ent->pw_name : "UNKNOWN");
+    #####:  958:      break;
+        -:  959:    case 'g':
+    #####:  960:      out_uint (pformat, prefix_len, statbuf->st_gid);
+    #####:  961:      break;
+        -:  962:    case 'G':
+    #####:  963:      setgrent ();
+    #####:  964:      gw_ent = getgrgid (statbuf->st_gid);
+    #####:  965:      out_string (pformat, prefix_len,
+        -:  966:                  gw_ent ? gw_ent->gr_name : "UNKNOWN");
+    #####:  967:      break;
+        -:  968:    case 't':
+    #####:  969:      out_uint_x (pformat, prefix_len, major (statbuf->st_rdev));
+    #####:  970:      break;
+        -:  971:    case 'm':
+    #####:  972:      fail |= out_mount_point (filename, pformat, prefix_len, statbuf);
+    #####:  973:      break;
+        -:  974:    case 'T':
+    #####:  975:      out_uint_x (pformat, prefix_len, minor (statbuf->st_rdev));
+    #####:  976:      break;
+        -:  977:    case 's':
+    #####:  978:      out_int (pformat, prefix_len, statbuf->st_size);
+    #####:  979:      break;
+        -:  980:    case 'B':
+    #####:  981:      out_uint (pformat, prefix_len, ST_NBLOCKSIZE);
+    #####:  982:      break;
+        -:  983:    case 'b':
+    #####:  984:      out_uint (pformat, prefix_len, ST_NBLOCKS (*statbuf));
+    #####:  985:      break;
+        -:  986:    case 'o':
+    #####:  987:      out_uint (pformat, prefix_len, ST_BLKSIZE (*statbuf));
+    #####:  988:      break;
+        -:  989:    case 'w':
+        -:  990:      {
+    #####:  991:        struct timespec t = get_stat_birthtime (statbuf);
+    #####:  992:        if (t.tv_nsec < 0)
+    #####:  993:          out_string (pformat, prefix_len, "-");
+        -:  994:        else
+    #####:  995:          out_string (pformat, prefix_len, human_time (t));
+        -:  996:      }
+    #####:  997:      break;
+        -:  998:    case 'W':
+    #####:  999:      out_epoch_sec (pformat, prefix_len, statbuf,
+        -: 1000:                     neg_to_zero (get_stat_birthtime (statbuf)));
+    #####: 1001:      break;
+        -: 1002:    case 'x':
+    #####: 1003:      out_string (pformat, prefix_len, human_time (get_stat_atime (statbuf)));
+    #####: 1004:      break;
+        -: 1005:    case 'X':
+    #####: 1006:      out_epoch_sec (pformat, prefix_len, statbuf, get_stat_atime (statbuf));
+    #####: 1007:      break;
+        -: 1008:    case 'y':
+    #####: 1009:      out_string (pformat, prefix_len, human_time (get_stat_mtime (statbuf)));
+    #####: 1010:      break;
+        -: 1011:    case 'Y':
+    #####: 1012:      out_epoch_sec (pformat, prefix_len, statbuf, get_stat_mtime (statbuf));
+    #####: 1013:      break;
+        -: 1014:    case 'z':
+    #####: 1015:      out_string (pformat, prefix_len, human_time (get_stat_ctime (statbuf)));
+    #####: 1016:      break;
+        -: 1017:    case 'Z':
+    #####: 1018:      out_epoch_sec (pformat, prefix_len, statbuf, get_stat_ctime (statbuf));
+    #####: 1019:      break;
+        -: 1020:    case 'C':
+    #####: 1021:      fail |= out_file_context (pformat, prefix_len, filename);
+    #####: 1022:      break;
+        -: 1023:    default:
+    #####: 1024:      fputc ('?', stdout);
+    #####: 1025:      break;
+        -: 1026:    }
+        9: 1027:  return fail;
+        -: 1028:}
+        -: 1029:
+        -: 1030:/* Output a single-character \ escape.  */
+        -: 1031:
+        -: 1032:static void
+    #####: 1033:print_esc_char (char c)
+        -: 1034:{
+    #####: 1035:  switch (c)
+        -: 1036:    {
+        -: 1037:    case 'a':			/* Alert. */
+    #####: 1038:      c ='\a';
+    #####: 1039:      break;
+        -: 1040:    case 'b':			/* Backspace. */
+    #####: 1041:      c ='\b';
+    #####: 1042:      break;
+        -: 1043:    case 'e':			/* Escape. */
+    #####: 1044:      c ='\x1B';
+    #####: 1045:      break;
+        -: 1046:    case 'f':			/* Form feed. */
+    #####: 1047:      c ='\f';
+    #####: 1048:      break;
+        -: 1049:    case 'n':			/* New line. */
+    #####: 1050:      c ='\n';
+    #####: 1051:      break;
+        -: 1052:    case 'r':			/* Carriage return. */
+    #####: 1053:      c ='\r';
+    #####: 1054:      break;
+        -: 1055:    case 't':			/* Horizontal tab. */
+    #####: 1056:      c ='\t';
+    #####: 1057:      break;
+        -: 1058:    case 'v':			/* Vertical tab. */
+    #####: 1059:      c ='\v';
+    #####: 1060:      break;
+        -: 1061:    case '"':
+        -: 1062:    case '\\':
+    #####: 1063:      break;
+        -: 1064:    default:
+    #####: 1065:      error (0, 0, _("warning: unrecognized escape '\\%c'"), c);
+    #####: 1066:      break;
+        -: 1067:    }
+    #####: 1068:  putchar (c);
+    #####: 1069:}
+        -: 1070:
+        -: 1071:/* Print the information specified by the format string, FORMAT,
+        -: 1072:   calling PRINT_FUNC for each %-directive encountered.
+        -: 1073:   Return zero upon success, nonzero upon failure.  */
+        -: 1074:static bool ATTRIBUTE_WARN_UNUSED_RESULT
+        9: 1075:print_it (char const *format, char const *filename,
+        -: 1076:          bool (*print_func) (char *, size_t, unsigned int,
+        -: 1077:                              char const *, void const *),
+        -: 1078:          void const *data)
+        -: 1079:{
+        9: 1080:  bool fail = false;
+        -: 1081:
+        -: 1082:  /* Add 2 to accommodate our conversion of the stat '%s' format string
+        -: 1083:     to the longer printf '%llu' one.  */
+        -: 1084:  enum
+        -: 1085:    {
+        -: 1086:      MAX_ADDITIONAL_BYTES =
+        -: 1087:        (MAX (sizeof PRIdMAX,
+        -: 1088:              MAX (sizeof PRIoMAX, MAX (sizeof PRIuMAX, sizeof PRIxMAX)))
+        -: 1089:         - 1)
+        -: 1090:    };
+        9: 1091:  size_t n_alloc = strlen (format) + MAX_ADDITIONAL_BYTES + 1;
+        9: 1092:  char *dest = xmalloc (n_alloc);
+        -: 1093:  char const *b;
+       18: 1094:  for (b = format; *b; b++)
+        -: 1095:    {
+        9: 1096:      switch (*b)
+        -: 1097:        {
+        -: 1098:        case '%':
+        -: 1099:          {
+        9: 1100:            size_t len = strspn (b + 1, printf_flags);
+        9: 1101:            char const *fmt_char = b + len + 1;
+        9: 1102:            fmt_char += strspn (fmt_char, digits);
+        9: 1103:            if (*fmt_char == '.')
+    #####: 1104:              fmt_char += 1 + strspn (fmt_char + 1, digits);
+        9: 1105:            len = fmt_char - (b + 1);
+        9: 1106:            unsigned int fmt_code = *fmt_char;
+        9: 1107:            memcpy (dest, b, len + 1);
+        -: 1108:
+        9: 1109:            b = fmt_char;
+        9: 1110:            switch (fmt_code)
+        -: 1111:              {
+        -: 1112:              case '\0':
+    #####: 1113:                --b;
+        -: 1114:                /* fall through */
+        -: 1115:              case '%':
+    #####: 1116:                if (0 < len)
+        -: 1117:                  {
+    #####: 1118:                    dest[len + 1] = *fmt_char;
+    #####: 1119:                    dest[len + 2] = '\0';
+    #####: 1120:                    error (EXIT_FAILURE, 0, _("%s: invalid directive"),
+        -: 1121:                           quotearg_colon (dest));
+        -: 1122:                  }
+    #####: 1123:                putchar ('%');
+    #####: 1124:                break;
+        -: 1125:              default:
+        9: 1126:                fail |= print_func (dest, len + 1, fmt_code, filename, data);
+        9: 1127:                break;
+        -: 1128:              }
+        9: 1129:            break;
+        -: 1130:          }
+        -: 1131:
+        -: 1132:        case '\\':
+    #####: 1133:          if ( ! interpret_backslash_escapes)
+        -: 1134:            {
+    #####: 1135:              putchar ('\\');
+    #####: 1136:              break;
+        -: 1137:            }
+    #####: 1138:          ++b;
+    #####: 1139:          if (isodigit (*b))
+    #####: 1140:            {
+    #####: 1141:              int esc_value = octtobin (*b);
+    #####: 1142:              int esc_length = 1;	/* number of octal digits */
+    #####: 1143:              for (++b; esc_length < 3 && isodigit (*b);
+    #####: 1144:                   ++esc_length, ++b)
+        -: 1145:                {
+    #####: 1146:                  esc_value = esc_value * 8 + octtobin (*b);
+        -: 1147:                }
+    #####: 1148:              putchar (esc_value);
+    #####: 1149:              --b;
+        -: 1150:            }
+    #####: 1151:          else if (*b == 'x' && isxdigit (to_uchar (b[1])))
+    #####: 1152:            {
+    #####: 1153:              int esc_value = hextobin (b[1]);	/* Value of \xhh escape. */
+        -: 1154:              /* A hexadecimal \xhh escape sequence must have
+        -: 1155:                 1 or 2 hex. digits.  */
+    #####: 1156:              ++b;
+    #####: 1157:              if (isxdigit (to_uchar (b[1])))
+        -: 1158:                {
+    #####: 1159:                  ++b;
+    #####: 1160:                  esc_value = esc_value * 16 + hextobin (*b);
+        -: 1161:                }
+    #####: 1162:              putchar (esc_value);
+        -: 1163:            }
+    #####: 1164:          else if (*b == '\0')
+        -: 1165:            {
+    #####: 1166:              error (0, 0, _("warning: backslash at end of format"));
+    #####: 1167:              putchar ('\\');
+        -: 1168:              /* Arrange to exit the loop.  */
+    #####: 1169:              --b;
+        -: 1170:            }
+        -: 1171:          else
+        -: 1172:            {
+    #####: 1173:              print_esc_char (*b);
+        -: 1174:            }
+    #####: 1175:          break;
+        -: 1176:
+        -: 1177:        default:
+    #####: 1178:          putchar (*b);
+    #####: 1179:          break;
+        -: 1180:        }
+        -: 1181:    }
+        9: 1182:  free (dest);
+        -: 1183:
+        9: 1184:  fputs (trailing_delim, stdout);
+        -: 1185:
+        9: 1186:  return fail;
+        -: 1187:}
+        -: 1188:
+        -: 1189:/* Stat the file system and print what we find.  */
+        -: 1190:static bool ATTRIBUTE_WARN_UNUSED_RESULT
+    #####: 1191:do_statfs (char const *filename, char const *format)
+        -: 1192:{
+        -: 1193:  STRUCT_STATVFS statfsbuf;
+        -: 1194:
+    #####: 1195:  if (STREQ (filename, "-"))
+        -: 1196:    {
+    #####: 1197:      error (0, 0, _("using %s to denote standard input does not work"
+        -: 1198:                     " in file system mode"), quote (filename));
+    #####: 1199:      return false;
+        -: 1200:    }
+        -: 1201:
+    #####: 1202:  if (STATFS (filename, &statfsbuf) != 0)
+        -: 1203:    {
+    #####: 1204:      error (0, errno, _("cannot read file system information for %s"),
+        -: 1205:             quote (filename));
+    #####: 1206:      return false;
+        -: 1207:    }
+        -: 1208:
+    #####: 1209:  bool fail = print_it (format, filename, print_statfs, &statfsbuf);
+    #####: 1210:  return ! fail;
+        -: 1211:}
+        -: 1212:
+        -: 1213:/* stat the file and print what we find */
+        -: 1214:static bool ATTRIBUTE_WARN_UNUSED_RESULT
+        9: 1215:do_stat (char const *filename, char const *format,
+        -: 1216:         char const *format2)
+        -: 1217:{
+        -: 1218:  struct stat statbuf;
+        -: 1219:
+        9: 1220:  if (STREQ (filename, "-"))
+        -: 1221:    {
+    #####: 1222:      if (fstat (STDIN_FILENO, &statbuf) != 0)
+        -: 1223:        {
+    #####: 1224:          error (0, errno, _("cannot stat standard input"));
+    #####: 1225:          return false;
+        -: 1226:        }
+        -: 1227:    }
+        -: 1228:  /* We can't use the shorter
+        -: 1229:     (follow_links?stat:lstat) (filename, &statbug)
+        -: 1230:     since stat might be a function-like macro.  */
+        9: 1231:  else if ((follow_links
+    #####: 1232:            ? stat (filename, &statbuf)
+        9: 1233:            : lstat (filename, &statbuf)) != 0)
+        -: 1234:    {
+    #####: 1235:      error (0, errno, _("cannot stat %s"), quote (filename));
+    #####: 1236:      return false;
+        -: 1237:    }
+        -: 1238:
+        9: 1239:  if (S_ISBLK (statbuf.st_mode) || S_ISCHR (statbuf.st_mode))
+        2: 1240:    format = format2;
+        -: 1241:
+        9: 1242:  bool fail = print_it (format, filename, print_stat, &statbuf);
+        9: 1243:  return ! fail;
+        -: 1244:}
+        -: 1245:
+        -: 1246:/* Return an allocated format string in static storage that
+        -: 1247:   corresponds to whether FS and TERSE options were declared.  */
+        -: 1248:static char *
+    #####: 1249:default_format (bool fs, bool terse, bool device)
+        -: 1250:{
+        -: 1251:  char *format;
+    #####: 1252:  if (fs)
+        -: 1253:    {
+    #####: 1254:      if (terse)
+    #####: 1255:        format = xstrdup ("%n %i %l %t %s %S %b %f %a %c %d\n");
+        -: 1256:      else
+        -: 1257:        {
+        -: 1258:          /* TRANSLATORS: This string uses format specifiers from
+        -: 1259:             'stat --help' with --file-system, and NOT from printf.  */
+    #####: 1260:          format = xstrdup (_("  File: \"%n\"\n"
+        -: 1261:                              "    ID: %-8i Namelen: %-7l Type: %T\n"
+        -: 1262:                              "Block size: %-10s Fundamental block size: %S\n"
+        -: 1263:                              "Blocks: Total: %-10b Free: %-10f Available: %a\n"
+        -: 1264:                              "Inodes: Total: %-10c Free: %d\n"));
+        -: 1265:        }
+        -: 1266:    }
+        -: 1267:  else /* ! fs */
+        -: 1268:    {
+    #####: 1269:      if (terse)
+        -: 1270:        {
+        -: 1271:          if (0 < is_selinux_enabled ())
+        -: 1272:            format = xstrdup ("%n %s %b %f %u %g %D %i %h %t %T"
+        -: 1273:                              " %X %Y %Z %W %o %C\n");
+        -: 1274:          else
+    #####: 1275:            format = xstrdup ("%n %s %b %f %u %g %D %i %h %t %T"
+        -: 1276:                              " %X %Y %Z %W %o\n");
+        -: 1277:        }
+        -: 1278:      else
+        -: 1279:        {
+        -: 1280:          char *temp;
+        -: 1281:          /* TRANSLATORS: This string uses format specifiers from
+        -: 1282:             'stat --help' without --file-system, and NOT from printf.  */
+    #####: 1283:          format = xstrdup (_("\
+        -: 1284:  File: %N\n\
+        -: 1285:  Size: %-10s\tBlocks: %-10b IO Block: %-6o %F\n\
+        -: 1286:"));
+        -: 1287:
+    #####: 1288:          temp = format;
+    #####: 1289:          if (device)
+        -: 1290:            {
+        -: 1291:              /* TRANSLATORS: This string uses format specifiers from
+        -: 1292:                 'stat --help' without --file-system, and NOT from printf.  */
+    #####: 1293:              format = xasprintf ("%s%s", format, _("\
+        -: 1294:" "Device: %Dh/%dd\tInode: %-10i  Links: %-5h Device type: %t,%T\n\
+        -: 1295:"));
+        -: 1296:            }
+        -: 1297:          else
+        -: 1298:            {
+        -: 1299:              /* TRANSLATORS: This string uses format specifiers from
+        -: 1300:                 'stat --help' without --file-system, and NOT from printf.  */
+    #####: 1301:              format = xasprintf ("%s%s", format, _("\
+        -: 1302:" "Device: %Dh/%dd\tInode: %-10i  Links: %h\n\
+        -: 1303:"));
+        -: 1304:            }
+    #####: 1305:          free (temp);
+        -: 1306:
+    #####: 1307:          temp = format;
+        -: 1308:          /* TRANSLATORS: This string uses format specifiers from
+        -: 1309:             'stat --help' without --file-system, and NOT from printf.  */
+    #####: 1310:          format = xasprintf ("%s%s", format, _("\
+        -: 1311:" "Access: (%04a/%10.10A)  Uid: (%5u/%8U)   Gid: (%5g/%8G)\n\
+        -: 1312:"));
+    #####: 1313:          free (temp);
+        -: 1314:
+        -: 1315:          if (0 < is_selinux_enabled ())
+        -: 1316:            {
+        -: 1317:              temp = format;
+        -: 1318:              /* TRANSLATORS: This string uses format specifiers from
+        -: 1319:                 'stat --help' without --file-system, and NOT from printf.  */
+        -: 1320:              format = xasprintf ("%s%s", format, _("Context: %C\n"));
+        -: 1321:              free (temp);
+        -: 1322:            }
+        -: 1323:
+    #####: 1324:          temp = format;
+        -: 1325:          /* TRANSLATORS: This string uses format specifiers from
+        -: 1326:             'stat --help' without --file-system, and NOT from printf.  */
+    #####: 1327:          format = xasprintf ("%s%s", format,
+        -: 1328:                              _("Access: %x\n"
+        -: 1329:                                "Modify: %y\n"
+        -: 1330:                                "Change: %z\n"
+        -: 1331:                                " Birth: %w\n"));
+    #####: 1332:          free (temp);
+        -: 1333:        }
+        -: 1334:    }
+    #####: 1335:  return format;
+        -: 1336:}
+        -: 1337:
+        -: 1338:void
+    #####: 1339:usage (int status)
+        -: 1340:{
+    #####: 1341:  if (status != EXIT_SUCCESS)
+    #####: 1342:    emit_try_help ();
+        -: 1343:  else
+        -: 1344:    {
+    #####: 1345:      printf (_("Usage: %s [OPTION]... FILE...\n"), program_name);
+    #####: 1346:      fputs (_("\
+        -: 1347:Display file or file system status.\n\
+        -: 1348:\n\
+        -: 1349:  -L, --dereference     follow links\n\
+        -: 1350:  -f, --file-system     display file system status instead of file status\n\
+        -: 1351:"), stdout);
+    #####: 1352:      fputs (_("\
+        -: 1353:  -c  --format=FORMAT   use the specified FORMAT instead of the default;\n\
+        -: 1354:                          output a newline after each use of FORMAT\n\
+        -: 1355:      --printf=FORMAT   like --format, but interpret backslash escapes,\n\
+        -: 1356:                          and do not output a mandatory trailing newline.\n\
+        -: 1357:                          If you want a newline, include \\n in FORMAT\n\
+        -: 1358:  -t, --terse           print the information in terse form\n\
+        -: 1359:"), stdout);
+    #####: 1360:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####: 1361:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+        -: 1362:
+    #####: 1363:      fputs (_("\n\
+        -: 1364:The valid format sequences for files (without --file-system):\n\
+        -: 1365:\n\
+        -: 1366:  %a   access rights in octal\n\
+        -: 1367:  %A   access rights in human readable form\n\
+        -: 1368:  %b   number of blocks allocated (see %B)\n\
+        -: 1369:  %B   the size in bytes of each block reported by %b\n\
+        -: 1370:  %C   SELinux security context string\n\
+        -: 1371:"), stdout);
+    #####: 1372:      fputs (_("\
+        -: 1373:  %d   device number in decimal\n\
+        -: 1374:  %D   device number in hex\n\
+        -: 1375:  %f   raw mode in hex\n\
+        -: 1376:  %F   file type\n\
+        -: 1377:  %g   group ID of owner\n\
+        -: 1378:  %G   group name of owner\n\
+        -: 1379:"), stdout);
+    #####: 1380:      fputs (_("\
+        -: 1381:  %h   number of hard links\n\
+        -: 1382:  %i   inode number\n\
+        -: 1383:  %m   mount point\n\
+        -: 1384:  %n   file name\n\
+        -: 1385:  %N   quoted file name with dereference if symbolic link\n\
+        -: 1386:  %o   optimal I/O transfer size hint\n\
+        -: 1387:  %s   total size, in bytes\n\
+        -: 1388:  %t   major device type in hex\n\
+        -: 1389:  %T   minor device type in hex\n\
+        -: 1390:"), stdout);
+    #####: 1391:      fputs (_("\
+        -: 1392:  %u   user ID of owner\n\
+        -: 1393:  %U   user name of owner\n\
+        -: 1394:  %w   time of file birth, human-readable; - if unknown\n\
+        -: 1395:  %W   time of file birth, seconds since Epoch; 0 if unknown\n\
+        -: 1396:  %x   time of last access, human-readable\n\
+        -: 1397:  %X   time of last access, seconds since Epoch\n\
+        -: 1398:  %y   time of last modification, human-readable\n\
+        -: 1399:  %Y   time of last modification, seconds since Epoch\n\
+        -: 1400:  %z   time of last change, human-readable\n\
+        -: 1401:  %Z   time of last change, seconds since Epoch\n\
+        -: 1402:\n\
+        -: 1403:"), stdout);
+        -: 1404:
+    #####: 1405:      fputs (_("\
+        -: 1406:Valid format sequences for file systems:\n\
+        -: 1407:\n\
+        -: 1408:  %a   free blocks available to non-superuser\n\
+        -: 1409:  %b   total data blocks in file system\n\
+        -: 1410:  %c   total file nodes in file system\n\
+        -: 1411:  %d   free file nodes in file system\n\
+        -: 1412:  %f   free blocks in file system\n\
+        -: 1413:"), stdout);
+    #####: 1414:      fputs (_("\
+        -: 1415:  %i   file system ID in hex\n\
+        -: 1416:  %l   maximum length of filenames\n\
+        -: 1417:  %n   file name\n\
+        -: 1418:  %s   block size (for faster transfers)\n\
+        -: 1419:  %S   fundamental block size (for block counts)\n\
+        -: 1420:  %t   file system type in hex\n\
+        -: 1421:  %T   file system type in human readable form\n\
+        -: 1422:"), stdout);
+    #####: 1423:      printf (USAGE_BUILTIN_WARNING, PROGRAM_NAME);
+    #####: 1424:      emit_ancillary_info ();
+        -: 1425:    }
+    #####: 1426:  exit (status);
+        -: 1427:}
+        -: 1428:
+        -: 1429:int
+        9: 1430:main (int argc, char *argv[])
+        -: 1431:{
+        -: 1432:  int c;
+        -: 1433:  int i;
+        9: 1434:  bool fs = false;
+        9: 1435:  bool terse = false;
+        9: 1436:  char *format = NULL;
+        -: 1437:  char *format2;
+        9: 1438:  bool ok = true;
+        -: 1439:
+        -: 1440:  initialize_main (&argc, &argv);
+        9: 1441:  set_program_name (argv[0]);
+        9: 1442:  setlocale (LC_ALL, "");
+        -: 1443:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -: 1444:  textdomain (PACKAGE);
+        -: 1445:
+        9: 1446:  struct lconv const *locale = localeconv ();
+        9: 1447:  decimal_point = (locale->decimal_point[0] ? locale->decimal_point : ".");
+        9: 1448:  decimal_point_len = strlen (decimal_point);
+        -: 1449:
+        9: 1450:  atexit (close_stdout);
+        -: 1451:
+        9: 1452:  while ((c = getopt_long (argc, argv, "c:fLt", long_options, NULL)) != -1)
+        -: 1453:    {
+        9: 1454:      switch (c)
+        -: 1455:        {
+        -: 1456:        case PRINTF_OPTION:
+    #####: 1457:          format = optarg;
+    #####: 1458:          interpret_backslash_escapes = true;
+    #####: 1459:          trailing_delim = "";
+    #####: 1460:          break;
+        -: 1461:
+        -: 1462:        case 'c':
+        9: 1463:          format = optarg;
+        9: 1464:          interpret_backslash_escapes = false;
+        9: 1465:          trailing_delim = "\n";
+        9: 1466:          break;
+        -: 1467:
+        -: 1468:        case 'L':
+    #####: 1469:          follow_links = true;
+    #####: 1470:          break;
+        -: 1471:
+        -: 1472:        case 'f':
+    #####: 1473:          fs = true;
+    #####: 1474:          break;
+        -: 1475:
+        -: 1476:        case 't':
+    #####: 1477:          terse = true;
+    #####: 1478:          break;
+        -: 1479:
+    #####: 1480:        case_GETOPT_HELP_CHAR;
+        -: 1481:
+    #####: 1482:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -: 1483:
+        -: 1484:        default:
+    #####: 1485:          usage (EXIT_FAILURE);
+        -: 1486:        }
+        -: 1487:    }
+        -: 1488:
+        9: 1489:  if (argc == optind)
+        -: 1490:    {
+    #####: 1491:      error (0, 0, _("missing operand"));
+    #####: 1492:      usage (EXIT_FAILURE);
+        -: 1493:    }
+        -: 1494:
+        9: 1495:  if (format)
+        9: 1496:    format2 = format;
+        -: 1497:  else
+        -: 1498:    {
+    #####: 1499:      format = default_format (fs, terse, false);
+    #####: 1500:      format2 = default_format (fs, terse, true);
+        -: 1501:    }
+        -: 1502:
+       18: 1503:  for (i = optind; i < argc; i++)
+       18: 1504:    ok &= (fs
+    #####: 1505:           ? do_statfs (argv[i], format)
+        9: 1506:           : do_stat (argv[i], format, format2));
+        -: 1507:
+        9: 1508:  exit (ok ? EXIT_SUCCESS : EXIT_FAILURE);
+        -: 1509:}

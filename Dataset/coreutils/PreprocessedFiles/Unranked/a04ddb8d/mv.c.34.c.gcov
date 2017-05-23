@@ -1,0 +1,502 @@
+        -:    0:Source:src/mv.c
+        -:    0:Graph:src/mv.gcno
+        -:    0:Data:src/mv.gcda
+        -:    0:Runs:8
+        -:    0:Programs:1
+        -:    1:/* mv -- move or rename files
+        -:    2:   Copyright (C) 1986-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by Mike Parker, David MacKenzie, and Jim Meyering */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <stdio.h>
+        -:   21:#include <getopt.h>
+        -:   22:#include <sys/types.h>
+        -:   23:#include <assert.h>
+        -:   24:#include <selinux/selinux.h>
+        -:   25:
+        -:   26:#include "system.h"
+        -:   27:#include "backupfile.h"
+        -:   28:#include "copy.h"
+        -:   29:#include "cp-hash.h"
+        -:   30:#include "error.h"
+        -:   31:#include "filenamecat.h"
+        -:   32:#include "quote.h"
+        -:   33:#include "remove.h"
+        -:   34:#include "root-dev-ino.h"
+        -:   35:#include "priv-set.h"
+        -:   36:
+        -:   37:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   38:#define PROGRAM_NAME "mv"
+        -:   39:
+        -:   40:#define AUTHORS \
+        -:   41:  proper_name ("Mike Parker"), \
+        -:   42:  proper_name ("David MacKenzie"), \
+        -:   43:  proper_name ("Jim Meyering")
+        -:   44:
+        -:   45:/* For long options that have no equivalent short option, use a
+        -:   46:   non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
+        -:   47:enum
+        -:   48:{
+        -:   49:  STRIP_TRAILING_SLASHES_OPTION = CHAR_MAX + 1
+        -:   50:};
+        -:   51:
+        -:   52:/* Remove any trailing slashes from each SOURCE argument.  */
+        -:   53:static bool remove_trailing_slashes;
+        -:   54:
+        -:   55:static struct option const long_options[] =
+        -:   56:{
+        -:   57:  {"backup", optional_argument, NULL, 'b'},
+        -:   58:  {"force", no_argument, NULL, 'f'},
+        -:   59:  {"interactive", no_argument, NULL, 'i'},
+        -:   60:  {"no-clobber", no_argument, NULL, 'n'},
+        -:   61:  {"no-target-directory", no_argument, NULL, 'T'},
+        -:   62:  {"strip-trailing-slashes", no_argument, NULL, STRIP_TRAILING_SLASHES_OPTION},
+        -:   63:  {"suffix", required_argument, NULL, 'S'},
+        -:   64:  {"target-directory", required_argument, NULL, 't'},
+        -:   65:  {"update", no_argument, NULL, 'u'},
+        -:   66:  {"verbose", no_argument, NULL, 'v'},
+        -:   67:  {GETOPT_HELP_OPTION_DECL},
+        -:   68:  {GETOPT_VERSION_OPTION_DECL},
+        -:   69:  {NULL, 0, NULL, 0}
+        -:   70:};
+        -:   71:
+        -:   72:static void
+        7:   73:rm_option_init (struct rm_options *x)
+        -:   74:{
+        7:   75:  x->ignore_missing_files = false;
+        7:   76:  x->remove_empty_directories = true;
+        7:   77:  x->recursive = true;
+        7:   78:  x->one_file_system = false;
+        -:   79:
+        -:   80:  /* Should we prompt for removal, too?  No.  Prompting for the 'move'
+        -:   81:     part is enough.  It implies removal.  */
+        7:   82:  x->interactive = RMI_NEVER;
+        7:   83:  x->stdin_tty = false;
+        -:   84:
+        7:   85:  x->verbose = false;
+        -:   86:
+        -:   87:  /* Since this program may well have to process additional command
+        -:   88:     line arguments after any call to 'rm', that function must preserve
+        -:   89:     the initial working directory, in case one of those is a
+        -:   90:     '.'-relative name.  */
+        7:   91:  x->require_restore_cwd = true;
+        -:   92:
+        -:   93:  {
+        -:   94:    static struct dev_ino dev_ino_buf;
+        7:   95:    x->root_dev_ino = get_root_dev_ino (&dev_ino_buf);
+        7:   96:    if (x->root_dev_ino == NULL)
+    #####:   97:      error (EXIT_FAILURE, errno, _("failed to get attributes of %s"),
+        -:   98:             quote ("/"));
+        -:   99:  }
+        7:  100:}
+        -:  101:
+        -:  102:static void
+        8:  103:cp_option_init (struct cp_options *x)
+        -:  104:{
+        8:  105:  bool selinux_enabled = (0 < is_selinux_enabled ());
+        -:  106:
+        8:  107:  cp_options_default (x);
+        8:  108:  x->copy_as_regular = false;  /* FIXME: maybe make this an option */
+        8:  109:  x->reflink_mode = REFLINK_NEVER;
+        8:  110:  x->dereference = DEREF_NEVER;
+        8:  111:  x->unlink_dest_before_opening = false;
+        8:  112:  x->unlink_dest_after_failed_open = false;
+        8:  113:  x->hard_link = false;
+        8:  114:  x->interactive = I_UNSPECIFIED;
+        8:  115:  x->move_mode = true;
+        8:  116:  x->one_file_system = false;
+        8:  117:  x->preserve_ownership = true;
+        8:  118:  x->preserve_links = true;
+        8:  119:  x->preserve_mode = true;
+        8:  120:  x->preserve_timestamps = true;
+        8:  121:  x->preserve_security_context = selinux_enabled;
+        8:  122:  x->reduce_diagnostics = false;
+        8:  123:  x->data_copy_required = true;
+        8:  124:  x->require_preserve = false;  /* FIXME: maybe make this an option */
+        8:  125:  x->require_preserve_context = false;
+        8:  126:  x->preserve_xattr = true;
+        8:  127:  x->require_preserve_xattr = false;
+        8:  128:  x->recursive = true;
+        8:  129:  x->sparse_mode = SPARSE_AUTO;  /* FIXME: maybe make this an option */
+        8:  130:  x->symbolic_link = false;
+        8:  131:  x->set_mode = false;
+        8:  132:  x->mode = 0;
+        8:  133:  x->stdin_tty = isatty (STDIN_FILENO);
+        -:  134:
+        8:  135:  x->open_dangling_dest_symlink = false;
+        8:  136:  x->update = false;
+        8:  137:  x->verbose = false;
+        8:  138:  x->dest_info = NULL;
+        8:  139:  x->src_info = NULL;
+        8:  140:}
+        -:  141:
+        -:  142:/* FILE is the last operand of this command.  Return true if FILE is a
+        -:  143:   directory.  But report an error if there is a problem accessing FILE, other
+        -:  144:   than nonexistence (errno == ENOENT).  */
+        -:  145:
+        -:  146:static bool
+        8:  147:target_directory_operand (char const *file)
+        -:  148:{
+        -:  149:  struct stat st;
+        8:  150:  int err = (stat (file, &st) == 0 ? 0 : errno);
+        8:  151:  bool is_a_dir = !err && S_ISDIR (st.st_mode);
+        8:  152:  if (err && err != ENOENT)
+    #####:  153:    error (EXIT_FAILURE, err, _("accessing %s"), quote (file));
+        8:  154:  return is_a_dir;
+        -:  155:}
+        -:  156:
+        -:  157:/* Move SOURCE onto DEST.  Handles cross-file-system moves.
+        -:  158:   If SOURCE is a directory, DEST must not exist.
+        -:  159:   Return true if successful.  */
+        -:  160:
+        -:  161:static bool
+        8:  162:do_move (const char *source, const char *dest, const struct cp_options *x)
+        -:  163:{
+        -:  164:  bool copy_into_self;
+        -:  165:  bool rename_succeeded;
+        8:  166:  bool ok = copy (source, dest, false, x, &copy_into_self, &rename_succeeded);
+        -:  167:
+        8:  168:  if (ok)
+        -:  169:    {
+        -:  170:      char const *dir_to_remove;
+        8:  171:      if (copy_into_self)
+        -:  172:        {
+        -:  173:          /* In general, when copy returns with copy_into_self set, SOURCE is
+        -:  174:             the same as, or a parent of DEST.  In this case we know it's a
+        -:  175:             parent.  It doesn't make sense to move a directory into itself, and
+        -:  176:             besides in some situations doing so would give highly nonintuitive
+        -:  177:             results.  Run this 'mkdir b; touch a c; mv * b' in an empty
+        -:  178:             directory.  Here's the result of running echo $(find b -print):
+        -:  179:             b b/a b/b b/b/a b/c.  Notice that only file 'a' was copied
+        -:  180:             into b/b.  Handle this by giving a diagnostic, removing the
+        -:  181:             copied-into-self directory, DEST ('b/b' in the example),
+        -:  182:             and failing.  */
+        -:  183:
+    #####:  184:          dir_to_remove = NULL;
+    #####:  185:          ok = false;
+        -:  186:        }
+        8:  187:      else if (rename_succeeded)
+        -:  188:        {
+        -:  189:          /* No need to remove anything.  SOURCE was successfully
+        -:  190:             renamed to DEST.  Or the user declined to rename a file.  */
+        1:  191:          dir_to_remove = NULL;
+        -:  192:        }
+        -:  193:      else
+        -:  194:        {
+        -:  195:          /* This may mean SOURCE and DEST referred to different devices.
+        -:  196:             It may also conceivably mean that even though they referred
+        -:  197:             to the same device, rename wasn't implemented for that device.
+        -:  198:
+        -:  199:             E.g., (from Joel N. Weber),
+        -:  200:             [...] there might someday be cases where you can't rename
+        -:  201:             but you can copy where the device name is the same, especially
+        -:  202:             on Hurd.  Consider an ftpfs with a primitive ftp server that
+        -:  203:             supports uploading, downloading and deleting, but not renaming.
+        -:  204:
+        -:  205:             Also, note that comparing device numbers is not a reliable
+        -:  206:             check for 'can-rename'.  Some systems can be set up so that
+        -:  207:             files from many different physical devices all have the same
+        -:  208:             st_dev field.  This is a feature of some NFS mounting
+        -:  209:             configurations.
+        -:  210:
+        -:  211:             We reach this point if SOURCE has been successfully copied
+        -:  212:             to DEST.  Now we have to remove SOURCE.
+        -:  213:
+        -:  214:             This function used to resort to copying only when rename
+        -:  215:             failed and set errno to EXDEV.  */
+        -:  216:
+        7:  217:          dir_to_remove = source;
+        -:  218:        }
+        -:  219:
+        8:  220:      if (dir_to_remove != NULL)
+        -:  221:        {
+        -:  222:          struct rm_options rm_options;
+        -:  223:          enum RM_status status;
+        -:  224:          char const *dir[2];
+        -:  225:
+        7:  226:          rm_option_init (&rm_options);
+        7:  227:          rm_options.verbose = x->verbose;
+        7:  228:          dir[0] = dir_to_remove;
+        7:  229:          dir[1] = NULL;
+        -:  230:
+        7:  231:          status = rm ((void*) dir, &rm_options);
+        7:  232:          assert (VALID_STATUS (status));
+        7:  233:          if (status == RM_ERROR)
+    #####:  234:            ok = false;
+        -:  235:        }
+        -:  236:    }
+        -:  237:
+        8:  238:  return ok;
+        -:  239:}
+        -:  240:
+        -:  241:/* Move file SOURCE onto DEST.  Handles the case when DEST is a directory.
+        -:  242:   Treat DEST as a directory if DEST_IS_DIR.
+        -:  243:   Return true if successful.  */
+        -:  244:
+        -:  245:static bool
+        8:  246:movefile (char *source, char *dest, bool dest_is_dir,
+        -:  247:          const struct cp_options *x)
+        -:  248:{
+        -:  249:  bool ok;
+        -:  250:
+        -:  251:  /* This code was introduced to handle the ambiguity in the semantics
+        -:  252:     of mv that is induced by the varying semantics of the rename function.
+        -:  253:     Some systems (e.g., GNU/Linux) have a rename function that honors a
+        -:  254:     trailing slash, while others (like Solaris 5,6,7) have a rename
+        -:  255:     function that ignores a trailing slash.  I believe the GNU/Linux
+        -:  256:     rename semantics are POSIX and susv2 compliant.  */
+        -:  257:
+        8:  258:  if (remove_trailing_slashes)
+    #####:  259:    strip_trailing_slashes (source);
+        -:  260:
+        8:  261:  if (dest_is_dir)
+        -:  262:    {
+        -:  263:      /* Treat DEST as a directory; build the full filename.  */
+    #####:  264:      char const *src_basename = last_component (source);
+    #####:  265:      char *new_dest = file_name_concat (dest, src_basename, NULL);
+    #####:  266:      strip_trailing_slashes (new_dest);
+    #####:  267:      ok = do_move (source, new_dest, x);
+    #####:  268:      free (new_dest);
+        -:  269:    }
+        -:  270:  else
+        -:  271:    {
+        8:  272:      ok = do_move (source, dest, x);
+        -:  273:    }
+        -:  274:
+        8:  275:  return ok;
+        -:  276:}
+        -:  277:
+        -:  278:void
+    #####:  279:usage (int status)
+        -:  280:{
+    #####:  281:  if (status != EXIT_SUCCESS)
+    #####:  282:    emit_try_help ();
+        -:  283:  else
+        -:  284:    {
+    #####:  285:      printf (_("\
+        -:  286:Usage: %s [OPTION]... [-T] SOURCE DEST\n\
+        -:  287:  or:  %s [OPTION]... SOURCE... DIRECTORY\n\
+        -:  288:  or:  %s [OPTION]... -t DIRECTORY SOURCE...\n\
+        -:  289:"),
+        -:  290:              program_name, program_name, program_name);
+    #####:  291:      fputs (_("\
+        -:  292:Rename SOURCE to DEST, or move SOURCE(s) to DIRECTORY.\n\
+        -:  293:\n\
+        -:  294:"), stdout);
+    #####:  295:      fputs (_("\
+        -:  296:Mandatory arguments to long options are mandatory for short options too.\n\
+        -:  297:"), stdout);
+    #####:  298:      fputs (_("\
+        -:  299:      --backup[=CONTROL]       make a backup of each existing destination file\
+        -:  300:\n\
+        -:  301:  -b                           like --backup but does not accept an argument\n\
+        -:  302:  -f, --force                  do not prompt before overwriting\n\
+        -:  303:  -i, --interactive            prompt before overwrite\n\
+        -:  304:  -n, --no-clobber             do not overwrite an existing file\n\
+        -:  305:If you specify more than one of -i, -f, -n, only the final one takes effect.\n\
+        -:  306:"), stdout);
+    #####:  307:      fputs (_("\
+        -:  308:      --strip-trailing-slashes  remove any trailing slashes from each SOURCE\n\
+        -:  309:                                 argument\n\
+        -:  310:  -S, --suffix=SUFFIX          override the usual backup suffix\n\
+        -:  311:"), stdout);
+    #####:  312:      fputs (_("\
+        -:  313:  -t, --target-directory=DIRECTORY  move all SOURCE arguments into DIRECTORY\n\
+        -:  314:  -T, --no-target-directory    treat DEST as a normal file\n\
+        -:  315:  -u, --update                 move only when the SOURCE file is newer\n\
+        -:  316:                                 than the destination file or when the\n\
+        -:  317:                                 destination file is missing\n\
+        -:  318:  -v, --verbose                explain what is being done\n\
+        -:  319:"), stdout);
+    #####:  320:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  321:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  322:      fputs (_("\
+        -:  323:\n\
+        -:  324:The backup suffix is '~', unless set with --suffix or SIMPLE_BACKUP_SUFFIX.\n\
+        -:  325:The version control method may be selected via the --backup option or through\n\
+        -:  326:the VERSION_CONTROL environment variable.  Here are the values:\n\
+        -:  327:\n\
+        -:  328:"), stdout);
+    #####:  329:      fputs (_("\
+        -:  330:  none, off       never make backups (even if --backup is given)\n\
+        -:  331:  numbered, t     make numbered backups\n\
+        -:  332:  existing, nil   numbered if numbered backups exist, simple otherwise\n\
+        -:  333:  simple, never   always make simple backups\n\
+        -:  334:"), stdout);
+    #####:  335:      emit_ancillary_info ();
+        -:  336:    }
+    #####:  337:  exit (status);
+        -:  338:}
+        -:  339:
+        -:  340:int
+        8:  341:main (int argc, char **argv)
+        -:  342:{
+        -:  343:  int c;
+        -:  344:  bool ok;
+        8:  345:  bool make_backups = false;
+        -:  346:  char *backup_suffix_string;
+        8:  347:  char *version_control_string = NULL;
+        -:  348:  struct cp_options x;
+        8:  349:  char *target_directory = NULL;
+        8:  350:  bool no_target_directory = false;
+        -:  351:  int n_files;
+        -:  352:  char **file;
+        -:  353:
+        -:  354:  initialize_main (&argc, &argv);
+        8:  355:  set_program_name (argv[0]);
+        8:  356:  setlocale (LC_ALL, "");
+        -:  357:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  358:  textdomain (PACKAGE);
+        -:  359:
+        8:  360:  atexit (close_stdin);
+        -:  361:
+        8:  362:  cp_option_init (&x);
+        -:  363:
+        -:  364:  /* Try to disable the ability to unlink a directory.  */
+        8:  365:  priv_set_remove_linkdir ();
+        -:  366:
+        -:  367:  /* FIXME: consider not calling getenv for SIMPLE_BACKUP_SUFFIX unless
+        -:  368:     we'll actually use backup_suffix_string.  */
+        8:  369:  backup_suffix_string = getenv ("SIMPLE_BACKUP_SUFFIX");
+        -:  370:
+        8:  371:  while ((c = getopt_long (argc, argv, "bfint:uvS:T", long_options, NULL))
+        -:  372:         != -1)
+        -:  373:    {
+    #####:  374:      switch (c)
+        -:  375:        {
+        -:  376:        case 'b':
+    #####:  377:          make_backups = true;
+    #####:  378:          if (optarg)
+    #####:  379:            version_control_string = optarg;
+    #####:  380:          break;
+        -:  381:        case 'f':
+    #####:  382:          x.interactive = I_ALWAYS_YES;
+    #####:  383:          break;
+        -:  384:        case 'i':
+    #####:  385:          x.interactive = I_ASK_USER;
+    #####:  386:          break;
+        -:  387:        case 'n':
+    #####:  388:          x.interactive = I_ALWAYS_NO;
+    #####:  389:          break;
+        -:  390:        case STRIP_TRAILING_SLASHES_OPTION:
+    #####:  391:          remove_trailing_slashes = true;
+    #####:  392:          break;
+        -:  393:        case 't':
+    #####:  394:          if (target_directory)
+    #####:  395:            error (EXIT_FAILURE, 0, _("multiple target directories specified"));
+        -:  396:          else
+        -:  397:            {
+        -:  398:              struct stat st;
+    #####:  399:              if (stat (optarg, &st) != 0)
+    #####:  400:                error (EXIT_FAILURE, errno, _("accessing %s"), quote (optarg));
+    #####:  401:              if (! S_ISDIR (st.st_mode))
+    #####:  402:                error (EXIT_FAILURE, 0, _("target %s is not a directory"),
+        -:  403:                       quote (optarg));
+        -:  404:            }
+    #####:  405:          target_directory = optarg;
+    #####:  406:          break;
+        -:  407:        case 'T':
+    #####:  408:          no_target_directory = true;
+    #####:  409:          break;
+        -:  410:        case 'u':
+    #####:  411:          x.update = true;
+    #####:  412:          break;
+        -:  413:        case 'v':
+    #####:  414:          x.verbose = true;
+    #####:  415:          break;
+        -:  416:        case 'S':
+    #####:  417:          make_backups = true;
+    #####:  418:          backup_suffix_string = optarg;
+    #####:  419:          break;
+    #####:  420:        case_GETOPT_HELP_CHAR;
+    #####:  421:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  422:        default:
+    #####:  423:          usage (EXIT_FAILURE);
+        -:  424:        }
+        -:  425:    }
+        -:  426:
+        8:  427:  n_files = argc - optind;
+        8:  428:  file = argv + optind;
+        -:  429:
+        8:  430:  if (n_files <= !target_directory)
+        -:  431:    {
+    #####:  432:      if (n_files <= 0)
+    #####:  433:        error (0, 0, _("missing file operand"));
+        -:  434:      else
+    #####:  435:        error (0, 0, _("missing destination file operand after %s"),
+        -:  436:               quote (file[0]));
+    #####:  437:      usage (EXIT_FAILURE);
+        -:  438:    }
+        -:  439:
+        8:  440:  if (no_target_directory)
+        -:  441:    {
+    #####:  442:      if (target_directory)
+    #####:  443:        error (EXIT_FAILURE, 0,
+        -:  444:               _("cannot combine --target-directory (-t) "
+        -:  445:                 "and --no-target-directory (-T)"));
+    #####:  446:      if (2 < n_files)
+        -:  447:        {
+    #####:  448:          error (0, 0, _("extra operand %s"), quote (file[2]));
+    #####:  449:          usage (EXIT_FAILURE);
+        -:  450:        }
+        -:  451:    }
+        8:  452:  else if (!target_directory)
+        -:  453:    {
+        8:  454:      assert (2 <= n_files);
+        8:  455:      if (target_directory_operand (file[n_files - 1]))
+    #####:  456:        target_directory = file[--n_files];
+        8:  457:      else if (2 < n_files)
+    #####:  458:        error (EXIT_FAILURE, 0, _("target %s is not a directory"),
+    #####:  459:               quote (file[n_files - 1]));
+        -:  460:    }
+        -:  461:
+        8:  462:  if (make_backups && x.interactive == I_ALWAYS_NO)
+        -:  463:    {
+    #####:  464:      error (0, 0,
+        -:  465:             _("options --backup and --no-clobber are mutually exclusive"));
+    #####:  466:      usage (EXIT_FAILURE);
+        -:  467:    }
+        -:  468:
+        8:  469:  if (backup_suffix_string)
+    #####:  470:    simple_backup_suffix = xstrdup (backup_suffix_string);
+        -:  471:
+        8:  472:  x.backup_type = (make_backups
+        -:  473:                   ? xget_version (_("backup type"),
+        -:  474:                                   version_control_string)
+        -:  475:                   : no_backups);
+        -:  476:
+        8:  477:  hash_init ();
+        -:  478:
+        8:  479:  if (target_directory)
+        -:  480:    {
+        -:  481:      int i;
+        -:  482:
+        -:  483:      /* Initialize the hash table only if we'll need it.
+        -:  484:         The problem it is used to detect can arise only if there are
+        -:  485:         two or more files to move.  */
+    #####:  486:      if (2 <= n_files)
+    #####:  487:        dest_info_init (&x);
+        -:  488:
+    #####:  489:      ok = true;
+    #####:  490:      for (i = 0; i < n_files; ++i)
+    #####:  491:        ok &= movefile (file[i], target_directory, true, &x);
+        -:  492:    }
+        -:  493:  else
+        8:  494:    ok = movefile (file[0], file[1], false, &x);
+        -:  495:
+        8:  496:  exit (ok ? EXIT_SUCCESS : EXIT_FAILURE);
+        -:  497:}

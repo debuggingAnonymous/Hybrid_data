@@ -1,0 +1,1181 @@
+        -:    0:Source:src/cp.c
+        -:    0:Graph:src/cp.gcno
+        -:    0:Data:src/cp.gcda
+        -:    0:Runs:2
+        -:    0:Programs:1
+        -:    1:/* cp.c  -- file copying (main routines)
+        -:    2:   Copyright (C) 1989-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   16:
+        -:   17:   Written by Torbjorn Granlund, David MacKenzie, and Jim Meyering. */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <stdio.h>
+        -:   21:#include <sys/types.h>
+        -:   22:#include <getopt.h>
+        -:   23:#include <selinux/selinux.h>
+        -:   24:
+        -:   25:#include "system.h"
+        -:   26:#include "argmatch.h"
+        -:   27:#include "backupfile.h"
+        -:   28:#include "copy.h"
+        -:   29:#include "cp-hash.h"
+        -:   30:#include "error.h"
+        -:   31:#include "filenamecat.h"
+        -:   32:#include "ignore-value.h"
+        -:   33:#include "quote.h"
+        -:   34:#include "stat-time.h"
+        -:   35:#include "utimens.h"
+        -:   36:#include "acl.h"
+        -:   37:
+        -:   38:#if ! HAVE_LCHOWN
+        -:   39:# define lchown(name, uid, gid) chown (name, uid, gid)
+        -:   40:#endif
+        -:   41:
+        -:   42:#define ASSIGN_BASENAME_STRDUPA(Dest, File_name)	\
+        -:   43:  do							\
+        -:   44:    {							\
+        -:   45:      char *tmp_abns_;					\
+        -:   46:      ASSIGN_STRDUPA (tmp_abns_, (File_name));		\
+        -:   47:      Dest = last_component (tmp_abns_);		\
+        -:   48:      strip_trailing_slashes (Dest);			\
+        -:   49:    }							\
+        -:   50:  while (0)
+        -:   51:
+        -:   52:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   53:#define PROGRAM_NAME "cp"
+        -:   54:
+        -:   55:#define AUTHORS \
+        -:   56:  proper_name_utf8 ("Torbjorn Granlund", "Torbj\303\266rn Granlund"), \
+        -:   57:  proper_name ("David MacKenzie"), \
+        -:   58:  proper_name ("Jim Meyering")
+        -:   59:
+        -:   60:/* Used by do_copy, make_dir_parents_private, and re_protect
+        -:   61:   to keep a list of leading directories whose protections
+        -:   62:   need to be fixed after copying. */
+        -:   63:struct dir_attr
+        -:   64:{
+        -:   65:  struct stat st;
+        -:   66:  bool restore_mode;
+        -:   67:  size_t slash_offset;
+        -:   68:  struct dir_attr *next;
+        -:   69:};
+        -:   70:
+        -:   71:/* For long options that have no equivalent short option, use a
+        -:   72:   non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
+        -:   73:enum
+        -:   74:{
+        -:   75:  ATTRIBUTES_ONLY_OPTION = CHAR_MAX + 1,
+        -:   76:  COPY_CONTENTS_OPTION,
+        -:   77:  NO_PRESERVE_ATTRIBUTES_OPTION,
+        -:   78:  PARENTS_OPTION,
+        -:   79:  PRESERVE_ATTRIBUTES_OPTION,
+        -:   80:  REFLINK_OPTION,
+        -:   81:  SPARSE_OPTION,
+        -:   82:  STRIP_TRAILING_SLASHES_OPTION,
+        -:   83:  UNLINK_DEST_BEFORE_OPENING
+        -:   84:};
+        -:   85:
+        -:   86:/* True if the kernel is SELinux enabled.  */
+        -:   87:static bool selinux_enabled;
+        -:   88:
+        -:   89:/* If true, the command "cp x/e_file e_dir" uses "e_dir/x/e_file"
+        -:   90:   as its destination instead of the usual "e_dir/e_file." */
+        -:   91:static bool parents_option = false;
+        -:   92:
+        -:   93:/* Remove any trailing slashes from each SOURCE argument.  */
+        -:   94:static bool remove_trailing_slashes;
+        -:   95:
+        -:   96:static char const *const sparse_type_string[] =
+        -:   97:{
+        -:   98:  "never", "auto", "always", NULL
+        -:   99:};
+        -:  100:static enum Sparse_type const sparse_type[] =
+        -:  101:{
+        -:  102:  SPARSE_NEVER, SPARSE_AUTO, SPARSE_ALWAYS
+        -:  103:};
+        -:  104:ARGMATCH_VERIFY (sparse_type_string, sparse_type);
+        -:  105:
+        -:  106:static char const *const reflink_type_string[] =
+        -:  107:{
+        -:  108:  "auto", "always", NULL
+        -:  109:};
+        -:  110:static enum Reflink_type const reflink_type[] =
+        -:  111:{
+        -:  112:  REFLINK_AUTO, REFLINK_ALWAYS
+        -:  113:};
+        -:  114:ARGMATCH_VERIFY (reflink_type_string, reflink_type);
+        -:  115:
+        -:  116:static struct option const long_opts[] =
+        -:  117:{
+        -:  118:  {"archive", no_argument, NULL, 'a'},
+        -:  119:  {"attributes-only", no_argument, NULL, ATTRIBUTES_ONLY_OPTION},
+        -:  120:  {"backup", optional_argument, NULL, 'b'},
+        -:  121:  {"copy-contents", no_argument, NULL, COPY_CONTENTS_OPTION},
+        -:  122:  {"dereference", no_argument, NULL, 'L'},
+        -:  123:  {"force", no_argument, NULL, 'f'},
+        -:  124:  {"interactive", no_argument, NULL, 'i'},
+        -:  125:  {"link", no_argument, NULL, 'l'},
+        -:  126:  {"no-clobber", no_argument, NULL, 'n'},
+        -:  127:  {"no-dereference", no_argument, NULL, 'P'},
+        -:  128:  {"no-preserve", required_argument, NULL, NO_PRESERVE_ATTRIBUTES_OPTION},
+        -:  129:  {"no-target-directory", no_argument, NULL, 'T'},
+        -:  130:  {"one-file-system", no_argument, NULL, 'x'},
+        -:  131:  {"parents", no_argument, NULL, PARENTS_OPTION},
+        -:  132:  {"path", no_argument, NULL, PARENTS_OPTION},   /* Deprecated.  */
+        -:  133:  {"preserve", optional_argument, NULL, PRESERVE_ATTRIBUTES_OPTION},
+        -:  134:  {"recursive", no_argument, NULL, 'R'},
+        -:  135:  {"remove-destination", no_argument, NULL, UNLINK_DEST_BEFORE_OPENING},
+        -:  136:  {"sparse", required_argument, NULL, SPARSE_OPTION},
+        -:  137:  {"reflink", optional_argument, NULL, REFLINK_OPTION},
+        -:  138:  {"strip-trailing-slashes", no_argument, NULL, STRIP_TRAILING_SLASHES_OPTION},
+        -:  139:  {"suffix", required_argument, NULL, 'S'},
+        -:  140:  {"symbolic-link", no_argument, NULL, 's'},
+        -:  141:  {"target-directory", required_argument, NULL, 't'},
+        -:  142:  {"update", no_argument, NULL, 'u'},
+        -:  143:  {"verbose", no_argument, NULL, 'v'},
+        -:  144:  {GETOPT_HELP_OPTION_DECL},
+        -:  145:  {GETOPT_VERSION_OPTION_DECL},
+        -:  146:  {NULL, 0, NULL, 0}
+        -:  147:};
+        -:  148:
+        -:  149:void
+    #####:  150:usage (int status)
+        -:  151:{
+    #####:  152:  if (status != EXIT_SUCCESS)
+    #####:  153:    emit_try_help ();
+        -:  154:  else
+        -:  155:    {
+    #####:  156:      printf (_("\
+        -:  157:Usage: %s [OPTION]... [-T] SOURCE DEST\n\
+        -:  158:  or:  %s [OPTION]... SOURCE... DIRECTORY\n\
+        -:  159:  or:  %s [OPTION]... -t DIRECTORY SOURCE...\n\
+        -:  160:"),
+        -:  161:              program_name, program_name, program_name);
+    #####:  162:      fputs (_("\
+        -:  163:Copy SOURCE to DEST, or multiple SOURCE(s) to DIRECTORY.\n\
+        -:  164:\n\
+        -:  165:"), stdout);
+    #####:  166:      fputs (_("\
+        -:  167:Mandatory arguments to long options are mandatory for short options too.\n\
+        -:  168:"), stdout);
+    #####:  169:      fputs (_("\
+        -:  170:  -a, --archive                same as -dR --preserve=all\n\
+        -:  171:      --attributes-only        don't copy the file data, just the attributes\n\
+        -:  172:      --backup[=CONTROL]       make a backup of each existing destination file\
+        -:  173:\n\
+        -:  174:  -b                           like --backup but does not accept an argument\n\
+        -:  175:      --copy-contents          copy contents of special files when recursive\n\
+        -:  176:  -d                           same as --no-dereference --preserve=links\n\
+        -:  177:"), stdout);
+    #####:  178:      fputs (_("\
+        -:  179:  -f, --force                  if an existing destination file cannot be\n\
+        -:  180:                                 opened, remove it and try again (this option\n\
+        -:  181:                                 is ignored when the -n option is also used)\n\
+        -:  182:  -i, --interactive            prompt before overwrite (overrides a previous -n\
+        -:  183:\n\
+        -:  184:                                  option)\n\
+        -:  185:  -H                           follow command-line symbolic links in SOURCE\n\
+        -:  186:"), stdout);
+    #####:  187:      fputs (_("\
+        -:  188:  -l, --link                   hard link files instead of copying\n\
+        -:  189:  -L, --dereference            always follow symbolic links in SOURCE\n\
+        -:  190:"), stdout);
+    #####:  191:      fputs (_("\
+        -:  192:  -n, --no-clobber             do not overwrite an existing file (overrides\n\
+        -:  193:                                 a previous -i option)\n\
+        -:  194:  -P, --no-dereference         never follow symbolic links in SOURCE\n\
+        -:  195:"), stdout);
+    #####:  196:      fputs (_("\
+        -:  197:  -p                           same as --preserve=mode,ownership,timestamps\n\
+        -:  198:      --preserve[=ATTR_LIST]   preserve the specified attributes (default:\n\
+        -:  199:                                 mode,ownership,timestamps), if possible\n\
+        -:  200:                                 additional attributes: context, links, xattr,\
+        -:  201:\n\
+        -:  202:                                 all\n\
+        -:  203:"), stdout);
+    #####:  204:      fputs (_("\
+        -:  205:      --no-preserve=ATTR_LIST  don't preserve the specified attributes\n\
+        -:  206:      --parents                use full source file name under DIRECTORY\n\
+        -:  207:"), stdout);
+    #####:  208:      fputs (_("\
+        -:  209:  -R, -r, --recursive          copy directories recursively\n\
+        -:  210:      --reflink[=WHEN]         control clone/CoW copies. See below\n\
+        -:  211:      --remove-destination     remove each existing destination file before\n\
+        -:  212:                                 attempting to open it (contrast with --force)\
+        -:  213:\n"), stdout);
+    #####:  214:      fputs (_("\
+        -:  215:      --sparse=WHEN            control creation of sparse files. See below\n\
+        -:  216:      --strip-trailing-slashes  remove any trailing slashes from each SOURCE\n\
+        -:  217:                                 argument\n\
+        -:  218:"), stdout);
+    #####:  219:      fputs (_("\
+        -:  220:  -s, --symbolic-link          make symbolic links instead of copying\n\
+        -:  221:  -S, --suffix=SUFFIX          override the usual backup suffix\n\
+        -:  222:  -t, --target-directory=DIRECTORY  copy all SOURCE arguments into DIRECTORY\n\
+        -:  223:  -T, --no-target-directory    treat DEST as a normal file\n\
+        -:  224:"), stdout);
+    #####:  225:      fputs (_("\
+        -:  226:  -u, --update                 copy only when the SOURCE file is newer\n\
+        -:  227:                                 than the destination file or when the\n\
+        -:  228:                                 destination file is missing\n\
+        -:  229:  -v, --verbose                explain what is being done\n\
+        -:  230:  -x, --one-file-system        stay on this file system\n\
+        -:  231:"), stdout);
+    #####:  232:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  233:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  234:      fputs (_("\
+        -:  235:\n\
+        -:  236:By default, sparse SOURCE files are detected by a crude heuristic and the\n\
+        -:  237:corresponding DEST file is made sparse as well.  That is the behavior\n\
+        -:  238:selected by --sparse=auto.  Specify --sparse=always to create a sparse DEST\n\
+        -:  239:file whenever the SOURCE file contains a long enough sequence of zero bytes.\n\
+        -:  240:Use --sparse=never to inhibit creation of sparse files.\n\
+        -:  241:\n\
+        -:  242:When --reflink[=always] is specified, perform a lightweight copy, where the\n\
+        -:  243:data blocks are copied only when modified.  If this is not possible the copy\n\
+        -:  244:fails, or if --reflink=auto is specified, fall back to a standard copy.\n\
+        -:  245:"), stdout);
+    #####:  246:      fputs (_("\
+        -:  247:\n\
+        -:  248:The backup suffix is '~', unless set with --suffix or SIMPLE_BACKUP_SUFFIX.\n\
+        -:  249:The version control method may be selected via the --backup option or through\n\
+        -:  250:the VERSION_CONTROL environment variable.  Here are the values:\n\
+        -:  251:\n\
+        -:  252:"), stdout);
+    #####:  253:      fputs (_("\
+        -:  254:  none, off       never make backups (even if --backup is given)\n\
+        -:  255:  numbered, t     make numbered backups\n\
+        -:  256:  existing, nil   numbered if numbered backups exist, simple otherwise\n\
+        -:  257:  simple, never   always make simple backups\n\
+        -:  258:"), stdout);
+    #####:  259:      fputs (_("\
+        -:  260:\n\
+        -:  261:As a special case, cp makes a backup of SOURCE when the force and backup\n\
+        -:  262:options are given and SOURCE and DEST are the same name for an existing,\n\
+        -:  263:regular file.\n\
+        -:  264:"), stdout);
+    #####:  265:      emit_ancillary_info ();
+        -:  266:    }
+    #####:  267:  exit (status);
+        -:  268:}
+        -:  269:
+        -:  270:/* Ensure that the parent directories of CONST_DST_NAME have the
+        -:  271:   correct protections, for the --parents option.  This is done
+        -:  272:   after all copying has been completed, to allow permissions
+        -:  273:   that don't include user write/execute.
+        -:  274:
+        -:  275:   SRC_OFFSET is the index in CONST_DST_NAME of the beginning of the
+        -:  276:   source directory name.
+        -:  277:
+        -:  278:   ATTR_LIST is a null-terminated linked list of structures that
+        -:  279:   indicates the end of the filename of each intermediate directory
+        -:  280:   in CONST_DST_NAME that may need to have its attributes changed.
+        -:  281:   The command 'cp --parents --preserve a/b/c d/e_dir' changes the
+        -:  282:   attributes of the directories d/e_dir/a and d/e_dir/a/b to match
+        -:  283:   the corresponding source directories regardless of whether they
+        -:  284:   existed before the 'cp' command was given.
+        -:  285:
+        -:  286:   Return true if the parent of CONST_DST_NAME and any intermediate
+        -:  287:   directories specified by ATTR_LIST have the proper permissions
+        -:  288:   when done.  */
+        -:  289:
+        -:  290:static bool
+    #####:  291:re_protect (char const *const_dst_name, size_t src_offset,
+        -:  292:            struct dir_attr *attr_list, const struct cp_options *x)
+        -:  293:{
+        -:  294:  struct dir_attr *p;
+        -:  295:  char *dst_name;		/* A copy of CONST_DST_NAME we can change. */
+        -:  296:  char *src_name;		/* The source name in 'dst_name'. */
+        -:  297:
+    #####:  298:  ASSIGN_STRDUPA (dst_name, const_dst_name);
+    #####:  299:  src_name = dst_name + src_offset;
+        -:  300:
+    #####:  301:  for (p = attr_list; p; p = p->next)
+        -:  302:    {
+    #####:  303:      dst_name[p->slash_offset] = '\0';
+        -:  304:
+        -:  305:      /* Adjust the times (and if possible, ownership) for the copy.
+        -:  306:         chown turns off set[ug]id bits for non-root,
+        -:  307:         so do the chmod last.  */
+        -:  308:
+    #####:  309:      if (x->preserve_timestamps)
+        -:  310:        {
+        -:  311:          struct timespec timespec[2];
+        -:  312:
+    #####:  313:          timespec[0] = get_stat_atime (&p->st);
+    #####:  314:          timespec[1] = get_stat_mtime (&p->st);
+        -:  315:
+    #####:  316:          if (utimens (dst_name, timespec))
+        -:  317:            {
+    #####:  318:              error (0, errno, _("failed to preserve times for %s"),
+        -:  319:                     quote (dst_name));
+    #####:  320:              return false;
+        -:  321:            }
+        -:  322:        }
+        -:  323:
+    #####:  324:      if (x->preserve_ownership)
+        -:  325:        {
+    #####:  326:          if (lchown (dst_name, p->st.st_uid, p->st.st_gid) != 0)
+        -:  327:            {
+    #####:  328:              if (! chown_failure_ok (x))
+        -:  329:                {
+    #####:  330:                  error (0, errno, _("failed to preserve ownership for %s"),
+        -:  331:                         quote (dst_name));
+    #####:  332:                  return false;
+        -:  333:                }
+        -:  334:              /* Failing to preserve ownership is OK. Still, try to preserve
+        -:  335:                 the group, but ignore the possible error. */
+    #####:  336:              ignore_value (lchown (dst_name, -1, p->st.st_gid));
+        -:  337:            }
+        -:  338:        }
+        -:  339:
+    #####:  340:      if (x->preserve_mode)
+        -:  341:        {
+    #####:  342:          if (copy_acl (src_name, -1, dst_name, -1, p->st.st_mode) != 0)
+    #####:  343:            return false;
+        -:  344:        }
+    #####:  345:      else if (p->restore_mode)
+        -:  346:        {
+    #####:  347:          if (lchmod (dst_name, p->st.st_mode) != 0)
+        -:  348:            {
+    #####:  349:              error (0, errno, _("failed to preserve permissions for %s"),
+        -:  350:                     quote (dst_name));
+    #####:  351:              return false;
+        -:  352:            }
+        -:  353:        }
+        -:  354:
+    #####:  355:      dst_name[p->slash_offset] = '/';
+        -:  356:    }
+    #####:  357:  return true;
+        -:  358:}
+        -:  359:
+        -:  360:/* Ensure that the parent directory of CONST_DIR exists, for
+        -:  361:   the --parents option.
+        -:  362:
+        -:  363:   SRC_OFFSET is the index in CONST_DIR (which is a destination
+        -:  364:   directory) of the beginning of the source directory name.
+        -:  365:   Create any leading directories that don't already exist.
+        -:  366:   If VERBOSE_FMT_STRING is nonzero, use it as a printf format
+        -:  367:   string for printing a message after successfully making a directory.
+        -:  368:   The format should take two string arguments: the names of the
+        -:  369:   source and destination directories.
+        -:  370:   Creates a linked list of attributes of intermediate directories,
+        -:  371:   *ATTR_LIST, for re_protect to use after calling copy.
+        -:  372:   Sets *NEW_DST if this function creates parent of CONST_DIR.
+        -:  373:
+        -:  374:   Return true if parent of CONST_DIR exists as a directory with the proper
+        -:  375:   permissions when done.  */
+        -:  376:
+        -:  377:/* FIXME: Synch this function with the one in ../lib/mkdir-p.c.  */
+        -:  378:
+        -:  379:static bool
+    #####:  380:make_dir_parents_private (char const *const_dir, size_t src_offset,
+        -:  381:                          char const *verbose_fmt_string,
+        -:  382:                          struct dir_attr **attr_list, bool *new_dst,
+        -:  383:                          const struct cp_options *x)
+        -:  384:{
+        -:  385:  struct stat stats;
+        -:  386:  char *dir;		/* A copy of CONST_DIR we can change.  */
+        -:  387:  char *src;		/* Source name in DIR.  */
+        -:  388:  char *dst_dir;	/* Leading directory of DIR.  */
+        -:  389:  size_t dirlen;	/* Length of DIR.  */
+        -:  390:
+    #####:  391:  ASSIGN_STRDUPA (dir, const_dir);
+        -:  392:
+    #####:  393:  src = dir + src_offset;
+        -:  394:
+    #####:  395:  dirlen = dir_len (dir);
+    #####:  396:  dst_dir = alloca (dirlen + 1);
+    #####:  397:  memcpy (dst_dir, dir, dirlen);
+    #####:  398:  dst_dir[dirlen] = '\0';
+        -:  399:
+    #####:  400:  *attr_list = NULL;
+        -:  401:
+    #####:  402:  if (stat (dst_dir, &stats) != 0)
+        -:  403:    {
+        -:  404:      /* A parent of CONST_DIR does not exist.
+        -:  405:         Make all missing intermediate directories. */
+        -:  406:      char *slash;
+        -:  407:
+    #####:  408:      slash = src;
+    #####:  409:      while (*slash == '/')
+    #####:  410:        slash++;
+    #####:  411:      while ((slash = strchr (slash, '/')))
+        -:  412:        {
+    #####:  413:          struct dir_attr *new IF_LINT ( = NULL);
+        -:  414:          bool missing_dir;
+        -:  415:
+    #####:  416:          *slash = '\0';
+    #####:  417:          missing_dir = (stat (dir, &stats) != 0);
+        -:  418:
+    #####:  419:          if (missing_dir || x->preserve_ownership || x->preserve_mode
+    #####:  420:              || x->preserve_timestamps)
+        -:  421:            {
+        -:  422:              /* Add this directory to the list of directories whose
+        -:  423:                 modes might need fixing later. */
+        -:  424:              struct stat src_st;
+    #####:  425:              int src_errno = (stat (src, &src_st) != 0
+    #####:  426:                               ? errno
+    #####:  427:                               : S_ISDIR (src_st.st_mode)
+        -:  428:                               ? 0
+    #####:  429:                               : ENOTDIR);
+    #####:  430:              if (src_errno)
+        -:  431:                {
+    #####:  432:                  error (0, src_errno, _("failed to get attributes of %s"),
+        -:  433:                         quote (src));
+    #####:  434:                  return false;
+        -:  435:                }
+        -:  436:
+    #####:  437:              new = xmalloc (sizeof *new);
+    #####:  438:              new->st = src_st;
+    #####:  439:              new->slash_offset = slash - dir;
+    #####:  440:              new->restore_mode = false;
+    #####:  441:              new->next = *attr_list;
+    #####:  442:              *attr_list = new;
+        -:  443:            }
+        -:  444:
+    #####:  445:          if (missing_dir)
+        -:  446:            {
+        -:  447:              mode_t src_mode;
+        -:  448:              mode_t omitted_permissions;
+        -:  449:              mode_t mkdir_mode;
+        -:  450:
+        -:  451:              /* This component does not exist.  We must set
+        -:  452:                 *new_dst and new->st.st_mode inside this loop because,
+        -:  453:                 for example, in the command 'cp --parents ../a/../b/c e_dir',
+        -:  454:                 make_dir_parents_private creates only e_dir/../a if
+        -:  455:                 ./b already exists. */
+    #####:  456:              *new_dst = true;
+    #####:  457:              src_mode = new->st.st_mode;
+        -:  458:
+        -:  459:              /* If the ownership or special mode bits might change,
+        -:  460:                 omit some permissions at first, so unauthorized users
+        -:  461:                 cannot nip in before the file is ready.  */
+    #####:  462:              omitted_permissions = (src_mode
+    #####:  463:                                     & (x->preserve_ownership
+    #####:  464:                                        ? S_IRWXG | S_IRWXO
+    #####:  465:                                        : x->preserve_mode
+        -:  466:                                        ? S_IWGRP | S_IWOTH
+        -:  467:                                        : 0));
+        -:  468:
+        -:  469:              /* POSIX says mkdir's behavior is implementation-defined when
+        -:  470:                 (src_mode & ~S_IRWXUGO) != 0.  However, common practice is
+        -:  471:                 to ask mkdir to copy all the CHMOD_MODE_BITS, letting mkdir
+        -:  472:                 decide what to do with S_ISUID | S_ISGID | S_ISVTX.  */
+    #####:  473:              mkdir_mode = src_mode & CHMOD_MODE_BITS & ~omitted_permissions;
+    #####:  474:              if (mkdir (dir, mkdir_mode) != 0)
+        -:  475:                {
+    #####:  476:                  error (0, errno, _("cannot make directory %s"),
+        -:  477:                         quote (dir));
+    #####:  478:                  return false;
+        -:  479:                }
+        -:  480:              else
+        -:  481:                {
+    #####:  482:                  if (verbose_fmt_string != NULL)
+    #####:  483:                    printf (verbose_fmt_string, src, dir);
+        -:  484:                }
+        -:  485:
+        -:  486:              /* We need search and write permissions to the new directory
+        -:  487:                 for writing the directory's contents. Check if these
+        -:  488:                 permissions are there.  */
+        -:  489:
+    #####:  490:              if (lstat (dir, &stats))
+        -:  491:                {
+    #####:  492:                  error (0, errno, _("failed to get attributes of %s"),
+        -:  493:                         quote (dir));
+    #####:  494:                  return false;
+        -:  495:                }
+        -:  496:
+        -:  497:
+    #####:  498:              if (! x->preserve_mode)
+        -:  499:                {
+    #####:  500:                  if (omitted_permissions & ~stats.st_mode)
+    #####:  501:                    omitted_permissions &= ~ cached_umask ();
+    #####:  502:                  if (omitted_permissions & ~stats.st_mode
+    #####:  503:                      || (stats.st_mode & S_IRWXU) != S_IRWXU)
+        -:  504:                    {
+    #####:  505:                      new->st.st_mode = stats.st_mode | omitted_permissions;
+    #####:  506:                      new->restore_mode = true;
+        -:  507:                    }
+        -:  508:                }
+        -:  509:
+    #####:  510:              if ((stats.st_mode & S_IRWXU) != S_IRWXU)
+        -:  511:                {
+        -:  512:                  /* Make the new directory searchable and writable.
+        -:  513:                     The original permissions will be restored later.  */
+        -:  514:
+    #####:  515:                  if (lchmod (dir, stats.st_mode | S_IRWXU) != 0)
+        -:  516:                    {
+    #####:  517:                      error (0, errno, _("setting permissions for %s"),
+        -:  518:                             quote (dir));
+    #####:  519:                      return false;
+        -:  520:                    }
+        -:  521:                }
+        -:  522:            }
+    #####:  523:          else if (!S_ISDIR (stats.st_mode))
+        -:  524:            {
+    #####:  525:              error (0, 0, _("%s exists but is not a directory"),
+        -:  526:                     quote (dir));
+    #####:  527:              return false;
+        -:  528:            }
+        -:  529:          else
+    #####:  530:            *new_dst = false;
+    #####:  531:          *slash++ = '/';
+        -:  532:
+        -:  533:          /* Avoid unnecessary calls to 'stat' when given
+        -:  534:             file names containing multiple adjacent slashes.  */
+    #####:  535:          while (*slash == '/')
+    #####:  536:            slash++;
+        -:  537:        }
+        -:  538:    }
+        -:  539:
+        -:  540:  /* We get here if the parent of DIR already exists.  */
+        -:  541:
+    #####:  542:  else if (!S_ISDIR (stats.st_mode))
+        -:  543:    {
+    #####:  544:      error (0, 0, _("%s exists but is not a directory"), quote (dst_dir));
+    #####:  545:      return false;
+        -:  546:    }
+        -:  547:  else
+        -:  548:    {
+    #####:  549:      *new_dst = false;
+        -:  550:    }
+    #####:  551:  return true;
+        -:  552:}
+        -:  553:
+        -:  554:/* FILE is the last operand of this command.
+        -:  555:   Return true if FILE is a directory.
+        -:  556:   But report an error and exit if there is a problem accessing FILE,
+        -:  557:   or if FILE does not exist but would have to refer to an existing
+        -:  558:   directory if it referred to anything at all.
+        -:  559:
+        -:  560:   If the file exists, store the file's status into *ST.
+        -:  561:   Otherwise, set *NEW_DST.  */
+        -:  562:
+        -:  563:static bool
+        1:  564:target_directory_operand (char const *file, struct stat *st, bool *new_dst)
+        -:  565:{
+        1:  566:  int err = (stat (file, st) == 0 ? 0 : errno);
+        1:  567:  bool is_a_dir = !err && S_ISDIR (st->st_mode);
+        1:  568:  if (err)
+        -:  569:    {
+    #####:  570:      if (err != ENOENT)
+    #####:  571:        error (EXIT_FAILURE, err, _("accessing %s"), quote (file));
+    #####:  572:      *new_dst = true;
+        -:  573:    }
+        1:  574:  return is_a_dir;
+        -:  575:}
+        -:  576:
+        -:  577:/* Scan the arguments, and copy each by calling copy.
+        -:  578:   Return true if successful.  */
+        -:  579:
+        -:  580:static bool
+        1:  581:do_copy (int n_files, char **file, const char *target_directory,
+        -:  582:         bool no_target_directory, struct cp_options *x)
+        -:  583:{
+        -:  584:  struct stat sb;
+        1:  585:  bool new_dst = false;
+        1:  586:  bool ok = true;
+        -:  587:
+        1:  588:  if (n_files <= !target_directory)
+        -:  589:    {
+    #####:  590:      if (n_files <= 0)
+    #####:  591:        error (0, 0, _("missing file operand"));
+        -:  592:      else
+    #####:  593:        error (0, 0, _("missing destination file operand after %s"),
+        -:  594:               quote (file[0]));
+    #####:  595:      usage (EXIT_FAILURE);
+        -:  596:    }
+        -:  597:
+        1:  598:  if (no_target_directory)
+        -:  599:    {
+    #####:  600:      if (target_directory)
+    #####:  601:        error (EXIT_FAILURE, 0,
+        -:  602:               _("cannot combine --target-directory (-t) "
+        -:  603:                 "and --no-target-directory (-T)"));
+    #####:  604:      if (2 < n_files)
+        -:  605:        {
+    #####:  606:          error (0, 0, _("extra operand %s"), quote (file[2]));
+    #####:  607:          usage (EXIT_FAILURE);
+        -:  608:        }
+        -:  609:      /* Update NEW_DST and SB, which may be checked below.  */
+    #####:  610:      ignore_value (target_directory_operand (file[n_files -1], &sb, &new_dst));
+        -:  611:    }
+        1:  612:  else if (!target_directory)
+        -:  613:    {
+        1:  614:      if (2 <= n_files
+        1:  615:          && target_directory_operand (file[n_files - 1], &sb, &new_dst))
+        1:  616:        target_directory = file[--n_files];
+    #####:  617:      else if (2 < n_files)
+    #####:  618:        error (EXIT_FAILURE, 0, _("target %s is not a directory"),
+    #####:  619:               quote (file[n_files - 1]));
+        -:  620:    }
+        -:  621:
+        1:  622:  if (target_directory)
+        -:  623:    {
+        -:  624:      /* cp file1...filen edir
+        -:  625:         Copy the files 'file1' through 'filen'
+        -:  626:         to the existing directory 'edir'. */
+        -:  627:      int i;
+        -:  628:
+        -:  629:      /* Initialize these hash tables only if we'll need them.
+        -:  630:         The problems they're used to detect can arise only if
+        -:  631:         there are two or more files to copy.  */
+        1:  632:      if (2 <= n_files)
+        -:  633:        {
+        1:  634:          dest_info_init (x);
+        1:  635:          src_info_init (x);
+        -:  636:        }
+        -:  637:
+        3:  638:      for (i = 0; i < n_files; i++)
+        -:  639:        {
+        -:  640:          char *dst_name;
+        2:  641:          bool parent_exists = true;  /* True if dir_name (dst_name) exists. */
+        -:  642:          struct dir_attr *attr_list;
+        2:  643:          char *arg_in_concat = NULL;
+        2:  644:          char *arg = file[i];
+        -:  645:
+        -:  646:          /* Trailing slashes are meaningful (i.e., maybe worth preserving)
+        -:  647:             only in the source file names.  */
+        2:  648:          if (remove_trailing_slashes)
+    #####:  649:            strip_trailing_slashes (arg);
+        -:  650:
+        2:  651:          if (parents_option)
+        -:  652:            {
+        -:  653:              char *arg_no_trailing_slash;
+        -:  654:
+        -:  655:              /* Use 'arg' without trailing slashes in constructing destination
+        -:  656:                 file names.  Otherwise, we can end up trying to create a
+        -:  657:                 directory via 'mkdir ("dst/foo/"...', which is not portable.
+        -:  658:                 It fails, due to the trailing slash, on at least
+        -:  659:                 NetBSD 1.[34] systems.  */
+    #####:  660:              ASSIGN_STRDUPA (arg_no_trailing_slash, arg);
+    #####:  661:              strip_trailing_slashes (arg_no_trailing_slash);
+        -:  662:
+        -:  663:              /* Append all of 'arg' (minus any trailing slash) to 'dest'.  */
+    #####:  664:              dst_name = file_name_concat (target_directory,
+        -:  665:                                           arg_no_trailing_slash,
+        -:  666:                                           &arg_in_concat);
+        -:  667:
+        -:  668:              /* For --parents, we have to make sure that the directory
+        -:  669:                 dir_name (dst_name) exists.  We may have to create a few
+        -:  670:                 leading directories. */
+    #####:  671:              parent_exists =
+        -:  672:                (make_dir_parents_private
+    #####:  673:                 (dst_name, arg_in_concat - dst_name,
+    #####:  674:                  (x->verbose ? "%s -> %s\n" : NULL),
+        -:  675:                  &attr_list, &new_dst, x));
+        -:  676:            }
+        -:  677:          else
+        -:  678:            {
+        -:  679:              char *arg_base;
+        -:  680:              /* Append the last component of 'arg' to 'target_directory'.  */
+        -:  681:
+        2:  682:              ASSIGN_BASENAME_STRDUPA (arg_base, arg);
+        -:  683:              /* For 'cp -R source/.. dest', don't copy into 'dest/..'. */
+        4:  684:              dst_name = (STREQ (arg_base, "..")
+        -:  685:                          ? xstrdup (target_directory)
+        2:  686:                          : file_name_concat (target_directory, arg_base,
+        -:  687:                                              NULL));
+        -:  688:            }
+        -:  689:
+        2:  690:          if (!parent_exists)
+        -:  691:            {
+        -:  692:              /* make_dir_parents_private failed, so don't even
+        -:  693:                 attempt the copy.  */
+    #####:  694:              ok = false;
+        -:  695:            }
+        -:  696:          else
+        -:  697:            {
+        -:  698:              bool copy_into_self;
+        2:  699:              ok &= copy (arg, dst_name, new_dst, x, &copy_into_self, NULL);
+        -:  700:
+        2:  701:              if (parents_option)
+    #####:  702:                ok &= re_protect (dst_name, arg_in_concat - dst_name,
+        -:  703:                                  attr_list, x);
+        -:  704:            }
+        -:  705:
+        2:  706:          if (parents_option)
+        -:  707:            {
+    #####:  708:              while (attr_list)
+        -:  709:                {
+    #####:  710:                  struct dir_attr *p = attr_list;
+    #####:  711:                  attr_list = attr_list->next;
+    #####:  712:                  free (p);
+        -:  713:                }
+        -:  714:            }
+        -:  715:
+        2:  716:          free (dst_name);
+        -:  717:        }
+        -:  718:    }
+        -:  719:  else /* !target_directory */
+        -:  720:    {
+        -:  721:      char const *new_dest;
+    #####:  722:      char const *source = file[0];
+    #####:  723:      char const *dest = file[1];
+        -:  724:      bool unused;
+        -:  725:
+    #####:  726:      if (parents_option)
+        -:  727:        {
+    #####:  728:          error (0, 0,
+        -:  729:                 _("with --parents, the destination must be a directory"));
+    #####:  730:          usage (EXIT_FAILURE);
+        -:  731:        }
+        -:  732:
+        -:  733:      /* When the force and backup options have been specified and
+        -:  734:         the source and destination are the same name for an existing
+        -:  735:         regular file, convert the user's command, e.g.,
+        -:  736:         'cp --force --backup foo foo' to 'cp --force foo fooSUFFIX'
+        -:  737:         where SUFFIX is determined by any version control options used.  */
+        -:  738:
+    #####:  739:      if (x->unlink_dest_after_failed_open
+    #####:  740:          && x->backup_type != no_backups
+    #####:  741:          && STREQ (source, dest)
+    #####:  742:          && !new_dst && S_ISREG (sb.st_mode))
+    #####:  743:        {
+        -:  744:          static struct cp_options x_tmp;
+        -:  745:
+    #####:  746:          new_dest = find_backup_file_name (dest, x->backup_type);
+        -:  747:          /* Set x->backup_type to 'no_backups' so that the normal backup
+        -:  748:             mechanism is not used when performing the actual copy.
+        -:  749:             backup_type must be set to 'no_backups' only *after* the above
+        -:  750:             call to find_backup_file_name -- that function uses
+        -:  751:             backup_type to determine the suffix it applies.  */
+    #####:  752:          x_tmp = *x;
+    #####:  753:          x_tmp.backup_type = no_backups;
+    #####:  754:          x = &x_tmp;
+        -:  755:        }
+        -:  756:      else
+        -:  757:        {
+    #####:  758:          new_dest = dest;
+        -:  759:        }
+        -:  760:
+    #####:  761:      ok = copy (source, new_dest, 0, x, &unused, NULL);
+        -:  762:    }
+        -:  763:
+        1:  764:  return ok;
+        -:  765:}
+        -:  766:
+        -:  767:static void
+        2:  768:cp_option_init (struct cp_options *x)
+        -:  769:{
+        2:  770:  cp_options_default (x);
+        2:  771:  x->copy_as_regular = true;
+        2:  772:  x->dereference = DEREF_UNDEFINED;
+        2:  773:  x->unlink_dest_before_opening = false;
+        2:  774:  x->unlink_dest_after_failed_open = false;
+        2:  775:  x->hard_link = false;
+        2:  776:  x->interactive = I_UNSPECIFIED;
+        2:  777:  x->move_mode = false;
+        2:  778:  x->one_file_system = false;
+        2:  779:  x->reflink_mode = REFLINK_NEVER;
+        -:  780:
+        2:  781:  x->preserve_ownership = false;
+        2:  782:  x->preserve_links = false;
+        2:  783:  x->preserve_mode = false;
+        2:  784:  x->preserve_timestamps = false;
+        2:  785:  x->explicit_no_preserve_mode = false;
+        2:  786:  x->preserve_security_context = false;
+        2:  787:  x->require_preserve_context = false;
+        2:  788:  x->preserve_xattr = false;
+        2:  789:  x->reduce_diagnostics = false;
+        2:  790:  x->require_preserve_xattr = false;
+        -:  791:
+        2:  792:  x->data_copy_required = true;
+        2:  793:  x->require_preserve = false;
+        2:  794:  x->recursive = false;
+        2:  795:  x->sparse_mode = SPARSE_AUTO;
+        2:  796:  x->symbolic_link = false;
+        2:  797:  x->set_mode = false;
+        2:  798:  x->mode = 0;
+        -:  799:
+        -:  800:  /* Not used.  */
+        2:  801:  x->stdin_tty = false;
+        -:  802:
+        2:  803:  x->update = false;
+        2:  804:  x->verbose = false;
+        -:  805:
+        -:  806:  /* By default, refuse to open a dangling destination symlink, because
+        -:  807:     in general one cannot do that safely, give the current semantics of
+        -:  808:     open's O_EXCL flag, (which POSIX doesn't even allow cp to use, btw).
+        -:  809:     But POSIX requires it.  */
+        2:  810:  x->open_dangling_dest_symlink = getenv ("POSIXLY_CORRECT") != NULL;
+        -:  811:
+        2:  812:  x->dest_info = NULL;
+        2:  813:  x->src_info = NULL;
+        2:  814:}
+        -:  815:
+        -:  816:/* Given a string, ARG, containing a comma-separated list of arguments
+        -:  817:   to the --preserve option, set the appropriate fields of X to ON_OFF.  */
+        -:  818:static void
+    #####:  819:decode_preserve_arg (char const *arg, struct cp_options *x, bool on_off)
+        -:  820:{
+        -:  821:  enum File_attribute
+        -:  822:    {
+        -:  823:      PRESERVE_MODE,
+        -:  824:      PRESERVE_TIMESTAMPS,
+        -:  825:      PRESERVE_OWNERSHIP,
+        -:  826:      PRESERVE_LINK,
+        -:  827:      PRESERVE_CONTEXT,
+        -:  828:      PRESERVE_XATTR,
+        -:  829:      PRESERVE_ALL
+        -:  830:    };
+        -:  831:  static enum File_attribute const preserve_vals[] =
+        -:  832:    {
+        -:  833:      PRESERVE_MODE, PRESERVE_TIMESTAMPS,
+        -:  834:      PRESERVE_OWNERSHIP, PRESERVE_LINK, PRESERVE_CONTEXT, PRESERVE_XATTR,
+        -:  835:      PRESERVE_ALL
+        -:  836:    };
+        -:  837:  /* Valid arguments to the '--preserve' option. */
+        -:  838:  static char const* const preserve_args[] =
+        -:  839:    {
+        -:  840:      "mode", "timestamps",
+        -:  841:      "ownership", "links", "context", "xattr", "all", NULL
+        -:  842:    };
+        -:  843:  ARGMATCH_VERIFY (preserve_args, preserve_vals);
+        -:  844:
+    #####:  845:  char *arg_writable = xstrdup (arg);
+    #####:  846:  char *s = arg_writable;
+        -:  847:  do
+        -:  848:    {
+        -:  849:      /* find next comma */
+    #####:  850:      char *comma = strchr (s, ',');
+        -:  851:      enum File_attribute val;
+        -:  852:
+        -:  853:      /* If we found a comma, put a NUL in its place and advance.  */
+    #####:  854:      if (comma)
+    #####:  855:        *comma++ = 0;
+        -:  856:
+        -:  857:      /* process S.  */
+    #####:  858:      val = XARGMATCH ("--preserve", s, preserve_args, preserve_vals);
+    #####:  859:      switch (val)
+        -:  860:        {
+        -:  861:        case PRESERVE_MODE:
+    #####:  862:          x->preserve_mode = on_off;
+    #####:  863:          x->explicit_no_preserve_mode = !on_off;
+    #####:  864:          break;
+        -:  865:
+        -:  866:        case PRESERVE_TIMESTAMPS:
+    #####:  867:          x->preserve_timestamps = on_off;
+    #####:  868:          break;
+        -:  869:
+        -:  870:        case PRESERVE_OWNERSHIP:
+    #####:  871:          x->preserve_ownership = on_off;
+    #####:  872:          break;
+        -:  873:
+        -:  874:        case PRESERVE_LINK:
+    #####:  875:          x->preserve_links = on_off;
+    #####:  876:          break;
+        -:  877:
+        -:  878:        case PRESERVE_CONTEXT:
+    #####:  879:          x->preserve_security_context = on_off;
+    #####:  880:          x->require_preserve_context = on_off;
+    #####:  881:          break;
+        -:  882:
+        -:  883:        case PRESERVE_XATTR:
+    #####:  884:          x->preserve_xattr = on_off;
+    #####:  885:          x->require_preserve_xattr = on_off;
+    #####:  886:          break;
+        -:  887:
+        -:  888:        case PRESERVE_ALL:
+    #####:  889:          x->preserve_mode = on_off;
+    #####:  890:          x->preserve_timestamps = on_off;
+    #####:  891:          x->preserve_ownership = on_off;
+    #####:  892:          x->preserve_links = on_off;
+    #####:  893:          x->explicit_no_preserve_mode = !on_off;
+    #####:  894:          if (selinux_enabled)
+    #####:  895:            x->preserve_security_context = on_off;
+    #####:  896:          x->preserve_xattr = on_off;
+    #####:  897:          break;
+        -:  898:
+        -:  899:        default:
+    #####:  900:          abort ();
+        -:  901:        }
+    #####:  902:      s = comma;
+        -:  903:    }
+    #####:  904:  while (s);
+        -:  905:
+    #####:  906:  free (arg_writable);
+    #####:  907:}
+        -:  908:
+        -:  909:int
+        2:  910:main (int argc, char **argv)
+        -:  911:{
+        -:  912:  int c;
+        -:  913:  bool ok;
+        2:  914:  bool make_backups = false;
+        -:  915:  char *backup_suffix_string;
+        2:  916:  char *version_control_string = NULL;
+        -:  917:  struct cp_options x;
+        2:  918:  bool copy_contents = false;
+        2:  919:  char *target_directory = NULL;
+        2:  920:  bool no_target_directory = false;
+        -:  921:
+        -:  922:  initialize_main (&argc, &argv);
+        2:  923:  set_program_name (argv[0]);
+        2:  924:  setlocale (LC_ALL, "");
+        -:  925:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  926:  textdomain (PACKAGE);
+        -:  927:
+        2:  928:  atexit (close_stdin);
+        -:  929:
+        2:  930:  selinux_enabled = (0 < is_selinux_enabled ());
+        2:  931:  cp_option_init (&x);
+        -:  932:
+        -:  933:  /* FIXME: consider not calling getenv for SIMPLE_BACKUP_SUFFIX unless
+        -:  934:     we'll actually use backup_suffix_string.  */
+        2:  935:  backup_suffix_string = getenv ("SIMPLE_BACKUP_SUFFIX");
+        -:  936:
+        2:  937:  while ((c = getopt_long (argc, argv, "abdfHilLnprst:uvxPRS:T",
+        -:  938:                           long_opts, NULL))
+        -:  939:         != -1)
+        -:  940:    {
+        3:  941:      switch (c)
+        -:  942:        {
+        -:  943:        case SPARSE_OPTION:
+    #####:  944:          x.sparse_mode = XARGMATCH ("--sparse", optarg,
+        -:  945:                                     sparse_type_string, sparse_type);
+    #####:  946:          break;
+        -:  947:
+        -:  948:        case REFLINK_OPTION:
+    #####:  949:          if (optarg == NULL)
+    #####:  950:            x.reflink_mode = REFLINK_ALWAYS;
+        -:  951:          else
+    #####:  952:            x.reflink_mode = XARGMATCH ("--reflink", optarg,
+        -:  953:                                       reflink_type_string, reflink_type);
+    #####:  954:          break;
+        -:  955:
+        -:  956:        case 'a':
+        -:  957:          /* Like -dR --preserve=all with reduced failure diagnostics.  */
+    #####:  958:          x.dereference = DEREF_NEVER;
+    #####:  959:          x.preserve_links = true;
+    #####:  960:          x.preserve_ownership = true;
+    #####:  961:          x.preserve_mode = true;
+    #####:  962:          x.preserve_timestamps = true;
+    #####:  963:          x.require_preserve = true;
+    #####:  964:          if (selinux_enabled)
+    #####:  965:             x.preserve_security_context = true;
+    #####:  966:          x.preserve_xattr = true;
+    #####:  967:          x.reduce_diagnostics = true;
+    #####:  968:          x.recursive = true;
+    #####:  969:          break;
+        -:  970:
+        -:  971:        case 'b':
+    #####:  972:          make_backups = true;
+    #####:  973:          if (optarg)
+    #####:  974:            version_control_string = optarg;
+    #####:  975:          break;
+        -:  976:
+        -:  977:        case ATTRIBUTES_ONLY_OPTION:
+    #####:  978:          x.data_copy_required = false;
+    #####:  979:          break;
+        -:  980:
+        -:  981:        case COPY_CONTENTS_OPTION:
+    #####:  982:          copy_contents = true;
+    #####:  983:          break;
+        -:  984:
+        -:  985:        case 'd':
+    #####:  986:          x.preserve_links = true;
+    #####:  987:          x.dereference = DEREF_NEVER;
+    #####:  988:          break;
+        -:  989:
+        -:  990:        case 'f':
+    #####:  991:          x.unlink_dest_after_failed_open = true;
+    #####:  992:          break;
+        -:  993:
+        -:  994:        case 'H':
+    #####:  995:          x.dereference = DEREF_COMMAND_LINE_ARGUMENTS;
+    #####:  996:          break;
+        -:  997:
+        -:  998:        case 'i':
+    #####:  999:          x.interactive = I_ASK_USER;
+    #####: 1000:          break;
+        -: 1001:
+        -: 1002:        case 'l':
+    #####: 1003:          x.hard_link = true;
+    #####: 1004:          break;
+        -: 1005:
+        -: 1006:        case 'L':
+        1: 1007:          x.dereference = DEREF_ALWAYS;
+        1: 1008:          break;
+        -: 1009:
+        -: 1010:        case 'n':
+    #####: 1011:          x.interactive = I_ALWAYS_NO;
+    #####: 1012:          break;
+        -: 1013:
+        -: 1014:        case 'P':
+    #####: 1015:          x.dereference = DEREF_NEVER;
+    #####: 1016:          break;
+        -: 1017:
+        -: 1018:        case NO_PRESERVE_ATTRIBUTES_OPTION:
+    #####: 1019:          decode_preserve_arg (optarg, &x, false);
+    #####: 1020:          break;
+        -: 1021:
+        -: 1022:        case PRESERVE_ATTRIBUTES_OPTION:
+    #####: 1023:          if (optarg == NULL)
+        -: 1024:            {
+        -: 1025:              /* Fall through to the case for 'p' below.  */
+        -: 1026:            }
+        -: 1027:          else
+        -: 1028:            {
+    #####: 1029:              decode_preserve_arg (optarg, &x, true);
+    #####: 1030:              x.require_preserve = true;
+    #####: 1031:              break;
+        -: 1032:            }
+        -: 1033:
+        -: 1034:        case 'p':
+    #####: 1035:          x.preserve_ownership = true;
+    #####: 1036:          x.preserve_mode = true;
+    #####: 1037:          x.preserve_timestamps = true;
+    #####: 1038:          x.require_preserve = true;
+    #####: 1039:          break;
+        -: 1040:
+        -: 1041:        case PARENTS_OPTION:
+    #####: 1042:          parents_option = true;
+    #####: 1043:          break;
+        -: 1044:
+        -: 1045:        case 'r':
+        -: 1046:        case 'R':
+        1: 1047:          x.recursive = true;
+        1: 1048:          break;
+        -: 1049:
+        -: 1050:        case UNLINK_DEST_BEFORE_OPENING:
+    #####: 1051:          x.unlink_dest_before_opening = true;
+    #####: 1052:          break;
+        -: 1053:
+        -: 1054:        case STRIP_TRAILING_SLASHES_OPTION:
+    #####: 1055:          remove_trailing_slashes = true;
+    #####: 1056:          break;
+        -: 1057:
+        -: 1058:        case 's':
+    #####: 1059:          x.symbolic_link = true;
+    #####: 1060:          break;
+        -: 1061:
+        -: 1062:        case 't':
+    #####: 1063:          if (target_directory)
+    #####: 1064:            error (EXIT_FAILURE, 0,
+        -: 1065:                   _("multiple target directories specified"));
+        -: 1066:          else
+        -: 1067:            {
+        -: 1068:              struct stat st;
+    #####: 1069:              if (stat (optarg, &st) != 0)
+    #####: 1070:                error (EXIT_FAILURE, errno, _("accessing %s"), quote (optarg));
+    #####: 1071:              if (! S_ISDIR (st.st_mode))
+    #####: 1072:                error (EXIT_FAILURE, 0, _("target %s is not a directory"),
+        -: 1073:                       quote (optarg));
+        -: 1074:            }
+    #####: 1075:          target_directory = optarg;
+    #####: 1076:          break;
+        -: 1077:
+        -: 1078:        case 'T':
+    #####: 1079:          no_target_directory = true;
+    #####: 1080:          break;
+        -: 1081:
+        -: 1082:        case 'u':
+    #####: 1083:          x.update = true;
+    #####: 1084:          break;
+        -: 1085:
+        -: 1086:        case 'v':
+    #####: 1087:          x.verbose = true;
+    #####: 1088:          break;
+        -: 1089:
+        -: 1090:        case 'x':
+    #####: 1091:          x.one_file_system = true;
+    #####: 1092:          break;
+        -: 1093:
+        -: 1094:        case 'S':
+    #####: 1095:          make_backups = true;
+    #####: 1096:          backup_suffix_string = optarg;
+    #####: 1097:          break;
+        -: 1098:
+    #####: 1099:        case_GETOPT_HELP_CHAR;
+        -: 1100:
+        1: 1101:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -: 1102:
+        -: 1103:        default:
+    #####: 1104:          usage (EXIT_FAILURE);
+        -: 1105:        }
+        -: 1106:    }
+        -: 1107:
+        1: 1108:  if (x.hard_link && x.symbolic_link)
+        -: 1109:    {
+    #####: 1110:      error (0, 0, _("cannot make both hard and symbolic links"));
+    #####: 1111:      usage (EXIT_FAILURE);
+        -: 1112:    }
+        -: 1113:
+        1: 1114:  if (make_backups && x.interactive == I_ALWAYS_NO)
+        -: 1115:    {
+    #####: 1116:      error (0, 0,
+        -: 1117:             _("options --backup and --no-clobber are mutually exclusive"));
+    #####: 1118:      usage (EXIT_FAILURE);
+        -: 1119:    }
+        -: 1120:
+        1: 1121:  if (x.reflink_mode == REFLINK_ALWAYS && x.sparse_mode != SPARSE_AUTO)
+        -: 1122:    {
+    #####: 1123:      error (0, 0, _("--reflink can be used only with --sparse=auto"));
+    #####: 1124:      usage (EXIT_FAILURE);
+        -: 1125:    }
+        -: 1126:
+        1: 1127:  if (backup_suffix_string)
+    #####: 1128:    simple_backup_suffix = xstrdup (backup_suffix_string);
+        -: 1129:
+        1: 1130:  x.backup_type = (make_backups
+        -: 1131:                   ? xget_version (_("backup type"),
+        -: 1132:                                   version_control_string)
+        -: 1133:                   : no_backups);
+        -: 1134:
+        1: 1135:  if (x.dereference == DEREF_UNDEFINED)
+        -: 1136:    {
+    #####: 1137:      if (x.recursive)
+        -: 1138:        /* This is compatible with FreeBSD.  */
+    #####: 1139:        x.dereference = DEREF_NEVER;
+        -: 1140:      else
+    #####: 1141:        x.dereference = DEREF_ALWAYS;
+        -: 1142:    }
+        -: 1143:
+        1: 1144:  if (x.recursive)
+        1: 1145:    x.copy_as_regular = copy_contents;
+        -: 1146:
+        -: 1147:  /* If --force (-f) was specified and we're in link-creation mode,
+        -: 1148:     first remove any existing destination file.  */
+        1: 1149:  if (x.unlink_dest_after_failed_open && (x.hard_link || x.symbolic_link))
+    #####: 1150:    x.unlink_dest_before_opening = true;
+        -: 1151:
+        1: 1152:  if (x.preserve_security_context)
+        -: 1153:    {
+    #####: 1154:      if (!selinux_enabled)
+    #####: 1155:        error (EXIT_FAILURE, 0,
+        -: 1156:               _("cannot preserve security context "
+        -: 1157:                 "without an SELinux-enabled kernel"));
+        -: 1158:    }
+        -: 1159:
+        -: 1160:#if !USE_XATTR
+        1: 1161:  if (x.require_preserve_xattr)
+    #####: 1162:    error (EXIT_FAILURE, 0, _("cannot preserve extended attributes, cp is "
+        -: 1163:                              "built without xattr support"));
+        -: 1164:#endif
+        -: 1165:
+        -: 1166:  /* Allocate space for remembering copied and created files.  */
+        -: 1167:
+        1: 1168:  hash_init ();
+        -: 1169:
+        1: 1170:  ok = do_copy (argc - optind, argv + optind,
+        -: 1171:                target_directory, no_target_directory, &x);
+        -: 1172:
+        1: 1173:  forget_all ();
+        -: 1174:
+        1: 1175:  exit (ok ? EXIT_SUCCESS : EXIT_FAILURE);
+        -: 1176:}

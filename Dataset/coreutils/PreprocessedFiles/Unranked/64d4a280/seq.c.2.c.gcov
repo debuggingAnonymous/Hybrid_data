@@ -1,0 +1,600 @@
+        -:    0:Source:src/seq.c
+        -:    0:Graph:src/seq.gcno
+        -:    0:Data:src/seq.gcda
+        -:    0:Runs:2
+        -:    0:Programs:1
+        -:    1:/* seq - print sequence of numbers to standard output.
+        -:    2:   Copyright (C) 1994-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by Ulrich Drepper.  */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <getopt.h>
+        -:   21:#include <stdio.h>
+        -:   22:#include <sys/types.h>
+        -:   23:
+        -:   24:#include "system.h"
+        -:   25:#include "c-strtod.h"
+        -:   26:#include "error.h"
+        -:   27:#include "quote.h"
+        -:   28:#include "xstrtod.h"
+        -:   29:
+        -:   30:/* Roll our own isfinite rather than using <math.h>, so that we don't
+        -:   31:   have to worry about linking -lm just for isfinite.  */
+        -:   32:#ifndef isfinite
+        -:   33:# define isfinite(x) ((x) * 0 == 0)
+        -:   34:#endif
+        -:   35:
+        -:   36:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   37:#define PROGRAM_NAME "seq"
+        -:   38:
+        -:   39:#define AUTHORS proper_name ("Ulrich Drepper")
+        -:   40:
+        -:   41:/* If true print all number with equal width.  */
+        -:   42:static bool equal_width;
+        -:   43:
+        -:   44:/* The string used to separate two numbers.  */
+        -:   45:static char const *separator;
+        -:   46:
+        -:   47:/* The string output after all numbers have been output.
+        -:   48:   Usually "\n" or "\0".  */
+        -:   49:static char const terminator[] = "\n";
+        -:   50:
+        -:   51:static struct option const long_options[] =
+        -:   52:{
+        -:   53:  { "equal-width", no_argument, NULL, 'w'},
+        -:   54:  { "format", required_argument, NULL, 'f'},
+        -:   55:  { "separator", required_argument, NULL, 's'},
+        -:   56:  {GETOPT_HELP_OPTION_DECL},
+        -:   57:  {GETOPT_VERSION_OPTION_DECL},
+        -:   58:  { NULL, 0, NULL, 0}
+        -:   59:};
+        -:   60:
+        -:   61:void
+    #####:   62:usage (int status)
+        -:   63:{
+    #####:   64:  if (status != EXIT_SUCCESS)
+    #####:   65:    emit_try_help ();
+        -:   66:  else
+        -:   67:    {
+    #####:   68:      printf (_("\
+        -:   69:Usage: %s [OPTION]... LAST\n\
+        -:   70:  or:  %s [OPTION]... FIRST LAST\n\
+        -:   71:  or:  %s [OPTION]... FIRST INCREMENT LAST\n\
+        -:   72:"), program_name, program_name, program_name);
+    #####:   73:      fputs (_("\
+        -:   74:Print numbers from FIRST to LAST, in steps of INCREMENT.\n\
+        -:   75:\n\
+        -:   76:  -f, --format=FORMAT      use printf style floating-point FORMAT\n\
+        -:   77:  -s, --separator=STRING   use STRING to separate numbers (default: \\n)\n\
+        -:   78:  -w, --equal-width        equalize width by padding with leading zeroes\n\
+        -:   79:"), stdout);
+    #####:   80:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:   81:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:   82:      fputs (_("\
+        -:   83:\n\
+        -:   84:If FIRST or INCREMENT is omitted, it defaults to 1.  That is, an\n\
+        -:   85:omitted INCREMENT defaults to 1 even when LAST is smaller than FIRST.\n\
+        -:   86:FIRST, INCREMENT, and LAST are interpreted as floating point values.\n\
+        -:   87:INCREMENT is usually positive if FIRST is smaller than LAST, and\n\
+        -:   88:INCREMENT is usually negative if FIRST is greater than LAST.\n\
+        -:   89:"), stdout);
+    #####:   90:      fputs (_("\
+        -:   91:FORMAT must be suitable for printing one argument of type 'double';\n\
+        -:   92:it defaults to %.PRECf if FIRST, INCREMENT, and LAST are all fixed point\n\
+        -:   93:decimal numbers with maximum precision PREC, and to %g otherwise.\n\
+        -:   94:"), stdout);
+    #####:   95:      emit_ancillary_info ();
+        -:   96:    }
+    #####:   97:  exit (status);
+        -:   98:}
+        -:   99:
+        -:  100:/* A command-line operand.  */
+        -:  101:struct operand
+        -:  102:{
+        -:  103:  /* Its value, converted to 'long double'.  */
+        -:  104:  long double value;
+        -:  105:
+        -:  106:  /* Its print width, if it were printed out in a form similar to its
+        -:  107:     input form.  An input like "-.1" is treated like "-0.1", and an
+        -:  108:     input like "1." is treated like "1", but otherwise widths are
+        -:  109:     left alone.  */
+        -:  110:  size_t width;
+        -:  111:
+        -:  112:  /* Number of digits after the decimal point, or INT_MAX if the
+        -:  113:     number can't easily be expressed as a fixed-point number.  */
+        -:  114:  int precision;
+        -:  115:};
+        -:  116:typedef struct operand operand;
+        -:  117:
+        -:  118:/* Description of what a number-generating format will generate.  */
+        -:  119:struct layout
+        -:  120:{
+        -:  121:  /* Number of bytes before and after the number.  */
+        -:  122:  size_t prefix_len;
+        -:  123:  size_t suffix_len;
+        -:  124:};
+        -:  125:
+        -:  126:/* Read a long double value from the command line.
+        -:  127:   Return if the string is correct else signal error.  */
+        -:  128:
+        -:  129:static operand
+    #####:  130:scan_arg (const char *arg)
+        -:  131:{
+        -:  132:  operand ret;
+        -:  133:
+    #####:  134:  if (! xstrtold (arg, NULL, &ret.value, c_strtold))
+        -:  135:    {
+    #####:  136:      error (0, 0, _("invalid floating point argument: %s"), arg);
+    #####:  137:      usage (EXIT_FAILURE);
+        -:  138:    }
+        -:  139:
+        -:  140:  /* We don't output spaces or '+' so don't include in width */
+    #####:  141:  while (isspace (to_uchar (*arg)) || *arg == '+')
+    #####:  142:    arg++;
+        -:  143:
+    #####:  144:  ret.width = strlen (arg);
+    #####:  145:  ret.precision = INT_MAX;
+        -:  146:
+    #####:  147:  if (! arg[strcspn (arg, "xX")] && isfinite (ret.value))
+        -:  148:    {
+    #####:  149:      char const *decimal_point = strchr (arg, '.');
+    #####:  150:      if (! decimal_point)
+    #####:  151:        ret.precision = 0;
+        -:  152:      else
+        -:  153:        {
+    #####:  154:          size_t fraction_len = strcspn (decimal_point + 1, "eE");
+    #####:  155:          if (fraction_len <= INT_MAX)
+    #####:  156:            ret.precision = fraction_len;
+    #####:  157:          ret.width += (fraction_len == 0                      /* #.  -> #   */
+        -:  158:                        ? -1
+        -:  159:                        : (decimal_point == arg                /* .#  -> 0.# */
+    #####:  160:                           || ! ISDIGIT (decimal_point[-1]))); /* -.# -> 0.# */
+        -:  161:        }
+    #####:  162:      char const *e = strchr (arg, 'e');
+    #####:  163:      if (! e)
+    #####:  164:        e = strchr (arg, 'E');
+    #####:  165:      if (e)
+        -:  166:        {
+    #####:  167:          long exponent = strtol (e + 1, NULL, 10);
+    #####:  168:          ret.precision += exponent < 0 ? -exponent : 0;
+        -:  169:        }
+        -:  170:    }
+        -:  171:
+    #####:  172:  return ret;
+        -:  173:}
+        -:  174:
+        -:  175:/* If FORMAT is a valid printf format for a double argument, return
+        -:  176:   its long double equivalent, allocated from dynamic storage, and
+        -:  177:   store into *LAYOUT a description of the output layout; otherwise,
+        -:  178:   report an error and exit.  */
+        -:  179:
+        -:  180:static char const *
+    #####:  181:long_double_format (char const *fmt, struct layout *layout)
+        -:  182:{
+        -:  183:  size_t i;
+    #####:  184:  size_t prefix_len = 0;
+    #####:  185:  size_t suffix_len = 0;
+        -:  186:  size_t length_modifier_offset;
+        -:  187:  bool has_L;
+        -:  188:
+    #####:  189:  for (i = 0; ! (fmt[i] == '%' && fmt[i + 1] != '%'); i += (fmt[i] == '%') + 1)
+        -:  190:    {
+    #####:  191:      if (!fmt[i])
+    #####:  192:        error (EXIT_FAILURE, 0,
+        -:  193:               _("format %s has no %% directive"), quote (fmt));
+    #####:  194:      prefix_len++;
+        -:  195:    }
+        -:  196:
+    #####:  197:  i++;
+    #####:  198:  i += strspn (fmt + i, "-+#0 '");
+    #####:  199:  i += strspn (fmt + i, "0123456789");
+    #####:  200:  if (fmt[i] == '.')
+        -:  201:    {
+    #####:  202:      i++;
+    #####:  203:      i += strspn (fmt + i, "0123456789");
+        -:  204:    }
+        -:  205:
+    #####:  206:  length_modifier_offset = i;
+    #####:  207:  has_L = (fmt[i] == 'L');
+    #####:  208:  i += has_L;
+    #####:  209:  if (fmt[i] == '\0')
+    #####:  210:    error (EXIT_FAILURE, 0, _("format %s ends in %%"), quote (fmt));
+    #####:  211:  if (! strchr ("efgaEFGA", fmt[i]))
+    #####:  212:    error (EXIT_FAILURE, 0,
+    #####:  213:           _("format %s has unknown %%%c directive"), quote (fmt), fmt[i]);
+        -:  214:
+    #####:  215:  for (i++; ; i += (fmt[i] == '%') + 1)
+    #####:  216:    if (fmt[i] == '%' && fmt[i + 1] != '%')
+    #####:  217:      error (EXIT_FAILURE, 0, _("format %s has too many %% directives"),
+        -:  218:             quote (fmt));
+    #####:  219:    else if (fmt[i])
+    #####:  220:      suffix_len++;
+        -:  221:    else
+        -:  222:      {
+    #####:  223:        size_t format_size = i + 1;
+    #####:  224:        char *ldfmt = xmalloc (format_size + 1);
+    #####:  225:        memcpy (ldfmt, fmt, length_modifier_offset);
+    #####:  226:        ldfmt[length_modifier_offset] = 'L';
+    #####:  227:        strcpy (ldfmt + length_modifier_offset + 1,
+    #####:  228:                fmt + length_modifier_offset + has_L);
+    #####:  229:        layout->prefix_len = prefix_len;
+    #####:  230:        layout->suffix_len = suffix_len;
+    #####:  231:        return ldfmt;
+    #####:  232:      }
+        -:  233:}
+        -:  234:
+        -:  235:/* Actually print the sequence of numbers in the specified range, with the
+        -:  236:   given or default stepping and format.  */
+        -:  237:
+        -:  238:static void
+    #####:  239:print_numbers (char const *fmt, struct layout layout,
+        -:  240:               long double first, long double step, long double last)
+        -:  241:{
+    #####:  242:  bool out_of_range = (step < 0 ? first < last : last < first);
+        -:  243:
+    #####:  244:  if (! out_of_range)
+        -:  245:    {
+    #####:  246:      long double x = first;
+        -:  247:      long double i;
+        -:  248:
+    #####:  249:      for (i = 1; ; i++)
+        -:  250:        {
+    #####:  251:          long double x0 = x;
+    #####:  252:          printf (fmt, x);
+    #####:  253:          if (out_of_range)
+    #####:  254:            break;
+    #####:  255:          x = first + i * step;
+    #####:  256:          out_of_range = (step < 0 ? x < last : last < x);
+        -:  257:
+    #####:  258:          if (out_of_range)
+        -:  259:            {
+        -:  260:              /* If the number just past LAST prints as a value equal
+        -:  261:                 to LAST, and prints differently from the previous
+        -:  262:                 number, then print the number.  This avoids problems
+        -:  263:                 with rounding.  For example, with the x86 it causes
+        -:  264:                 "seq 0 0.000001 0.000003" to print 0.000003 instead
+        -:  265:                 of stopping at 0.000002.  */
+        -:  266:
+    #####:  267:              bool print_extra_number = false;
+        -:  268:              long double x_val;
+        -:  269:              char *x_str;
+        -:  270:              int x_strlen;
+    #####:  271:              setlocale (LC_NUMERIC, "C");
+    #####:  272:              x_strlen = asprintf (&x_str, fmt, x);
+    #####:  273:              setlocale (LC_NUMERIC, "");
+    #####:  274:              if (x_strlen < 0)
+    #####:  275:                xalloc_die ();
+    #####:  276:              x_str[x_strlen - layout.suffix_len] = '\0';
+        -:  277:
+    #####:  278:              if (xstrtold (x_str + layout.prefix_len, NULL, &x_val, c_strtold)
+    #####:  279:                  && x_val == last)
+        -:  280:                {
+    #####:  281:                  char *x0_str = NULL;
+    #####:  282:                  if (asprintf (&x0_str, fmt, x0) < 0)
+    #####:  283:                    xalloc_die ();
+    #####:  284:                  print_extra_number = !STREQ (x0_str, x_str);
+    #####:  285:                  free (x0_str);
+        -:  286:                }
+        -:  287:
+    #####:  288:              free (x_str);
+    #####:  289:              if (! print_extra_number)
+    #####:  290:                break;
+        -:  291:            }
+        -:  292:
+    #####:  293:          fputs (separator, stdout);
+    #####:  294:        }
+        -:  295:
+    #####:  296:      fputs (terminator, stdout);
+        -:  297:    }
+    #####:  298:}
+        -:  299:
+        -:  300:/* Return the default format given FIRST, STEP, and LAST.  */
+        -:  301:static char const *
+    #####:  302:get_default_format (operand first, operand step, operand last)
+        -:  303:{
+        -:  304:  static char format_buf[sizeof "%0.Lf" + 2 * INT_STRLEN_BOUND (int)];
+        -:  305:
+    #####:  306:  int prec = MAX (first.precision, step.precision);
+        -:  307:
+    #####:  308:  if (prec != INT_MAX && last.precision != INT_MAX)
+        -:  309:    {
+    #####:  310:      if (equal_width)
+        -:  311:        {
+        -:  312:          /* increase first_width by any increased precision in step */
+    #####:  313:          size_t first_width = first.width + (prec - first.precision);
+        -:  314:          /* adjust last_width to use precision from first/step */
+    #####:  315:          size_t last_width = last.width + (prec - last.precision);
+    #####:  316:          if (last.precision && prec == 0)
+    #####:  317:            last_width--;  /* don't include space for '.' */
+    #####:  318:          if (last.precision == 0 && prec)
+    #####:  319:            last_width++;  /* include space for '.' */
+    #####:  320:          size_t width = MAX (first_width, last_width);
+    #####:  321:          if (width <= INT_MAX)
+        -:  322:            {
+    #####:  323:              int w = width;
+    #####:  324:              sprintf (format_buf, "%%0%d.%dLf", w, prec);
+    #####:  325:              return format_buf;
+        -:  326:            }
+        -:  327:        }
+        -:  328:      else
+        -:  329:        {
+    #####:  330:          sprintf (format_buf, "%%.%dLf", prec);
+    #####:  331:          return format_buf;
+        -:  332:        }
+        -:  333:    }
+        -:  334:
+    #####:  335:  return "%Lg";
+        -:  336:}
+        -:  337:
+        -:  338:/* The NUL-terminated string S0 of length S_LEN represents a valid
+        -:  339:   non-negative decimal integer.  Adjust the string and length so
+        -:  340:   that the pair describe the next-larger value.  */
+        -:  341:static void
+        1:  342:incr (char **s0, size_t *s_len)
+        -:  343:{
+        1:  344:  char *s = *s0;
+        1:  345:  char *endp = s + *s_len - 1;
+        -:  346:
+        -:  347:  do
+        -:  348:    {
+        1:  349:      if ((*endp)++ < '9')
+        2:  350:        return;
+    #####:  351:      *endp-- = '0';
+        -:  352:    }
+    #####:  353:  while (endp >= s);
+    #####:  354:  *--(*s0) = '1';
+    #####:  355:  ++*s_len;
+        -:  356:}
+        -:  357:
+        -:  358:/* Compare A and B (each a NUL-terminated digit string), with lengths
+        -:  359:   given by A_LEN and B_LEN.  Return +1 if A < B, -1 if B < A, else 0.  */
+        -:  360:static int
+        3:  361:cmp (char const *a, size_t a_len, char const *b, size_t b_len)
+        -:  362:{
+        3:  363:  if (a_len < b_len)
+    #####:  364:    return -1;
+        3:  365:  if (b_len < a_len)
+    #####:  366:    return 1;
+        3:  367:  return (strcmp (a, b));
+        -:  368:}
+        -:  369:
+        -:  370:/* Trim leading 0's from S, but if S is all 0's, leave one.
+        -:  371:   Return a pointer to the trimmed string.  */
+        -:  372:static char const * _GL_ATTRIBUTE_PURE
+        2:  373:trim_leading_zeros (char const *s)
+        -:  374:{
+        2:  375:  char const *p = s;
+        4:  376:  while (*s == '0')
+    #####:  377:    ++s;
+        -:  378:
+        -:  379:  /* If there were only 0's, back up, to leave one.  */
+        2:  380:  if (!*s && s != p)
+    #####:  381:    --s;
+        2:  382:  return s;
+        -:  383:}
+        -:  384:
+        -:  385:/* Print all whole numbers from A to B, inclusive -- to stdout, each
+        -:  386:   followed by a newline.  If B < A, return false and print nothing.
+        -:  387:   Otherwise, return true.  */
+        -:  388:static bool
+        1:  389:seq_fast (char const *a, char const *b)
+        -:  390:{
+        -:  391:  /* Skip past any leading 0's.  Without this, our naive cmp
+        -:  392:     function would declare 000 to be larger than 99.  */
+        1:  393:  a = trim_leading_zeros (a);
+        1:  394:  b = trim_leading_zeros (b);
+        -:  395:
+        1:  396:  size_t p_len = strlen (a);
+        1:  397:  size_t q_len = strlen (b);
+        1:  398:  size_t n = MAX (p_len, q_len);
+        1:  399:  char *p0 = xmalloc (n + 1);
+        1:  400:  char *p = memcpy (p0 + n - p_len, a, p_len + 1);
+        1:  401:  char *q0 = xmalloc (n + 1);
+        1:  402:  char *q = memcpy (q0 + n - q_len, b, q_len + 1);
+        -:  403:
+        1:  404:  bool ok = cmp (p, p_len, q, q_len) <= 0;
+        1:  405:  if (ok)
+        -:  406:    {
+        -:  407:      /* Buffer at least this many output lines per fwrite call.
+        -:  408:         This gives a speed-up of more than 2x over the unbuffered code
+        -:  409:         when printing the first 10^9 integers.  */
+        -:  410:      enum {N = 40};
+        1:  411:      char *buf = xmalloc (N * (n + 1));
+        1:  412:      char const *buf_end = buf + N * (n + 1);
+        -:  413:
+        1:  414:      puts (p);
+        1:  415:      char *z = buf;
+        3:  416:      while (cmp (p, p_len, q, q_len) < 0)
+        -:  417:        {
+        1:  418:          incr (&p, &p_len);
+        1:  419:          z = mempcpy (z, p, p_len);
+        1:  420:          *z++ = *separator;
+        1:  421:          if (buf_end - n - 1 < z)
+        -:  422:            {
+    #####:  423:              fwrite (buf, z - buf, 1, stdout);
+    #####:  424:              z = buf;
+        -:  425:            }
+        -:  426:        }
+        -:  427:
+        -:  428:      /* Write any remaining, buffered output.  */
+        1:  429:      if (buf < z)
+        1:  430:        fwrite (buf, z - buf, 1, stdout);
+        -:  431:
+        1:  432:      IF_LINT (free (buf));
+        -:  433:    }
+        -:  434:
+        1:  435:  free (p0);
+        1:  436:  free (q0);
+        1:  437:  return ok;
+        -:  438:}
+        -:  439:
+        -:  440:/* Return true if S consists of at least one digit and no non-digits.  */
+        -:  441:static bool _GL_ATTRIBUTE_PURE
+        2:  442:all_digits_p (char const *s)
+        -:  443:{
+        2:  444:  size_t n = strlen (s);
+        2:  445:  return ISDIGIT (s[0]) && n == strspn (s, "0123456789");
+        -:  446:}
+        -:  447:
+        -:  448:int
+        2:  449:main (int argc, char **argv)
+        -:  450:{
+        -:  451:  int optc;
+        2:  452:  operand first = { 1, 1, 0 };
+        2:  453:  operand step = { 1, 1, 0 };
+        -:  454:  operand last;
+        2:  455:  struct layout layout = { 0, 0 };
+        -:  456:
+        -:  457:  /* The printf(3) format used for output.  */
+        2:  458:  char const *format_str = NULL;
+        -:  459:
+        -:  460:  initialize_main (&argc, &argv);
+        2:  461:  set_program_name (argv[0]);
+        2:  462:  setlocale (LC_ALL, "");
+        -:  463:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  464:  textdomain (PACKAGE);
+        -:  465:
+        2:  466:  atexit (close_stdout);
+        -:  467:
+        2:  468:  equal_width = false;
+        2:  469:  separator = "\n";
+        -:  470:
+        -:  471:  /* We have to handle negative numbers in the command line but this
+        -:  472:     conflicts with the command line arguments.  So explicitly check first
+        -:  473:     whether the next argument looks like a negative number.  */
+        4:  474:  while (optind < argc)
+        -:  475:    {
+        2:  476:      if (argv[optind][0] == '-'
+        1:  477:          && ((optc = argv[optind][1]) == '.' || ISDIGIT (optc)))
+        -:  478:        {
+        -:  479:          /* means negative number */
+        -:  480:          break;
+        -:  481:        }
+        -:  482:
+        2:  483:      optc = getopt_long (argc, argv, "+f:s:w", long_options, NULL);
+        2:  484:      if (optc == -1)
+        1:  485:        break;
+        -:  486:
+        1:  487:      switch (optc)
+        -:  488:        {
+        -:  489:        case 'f':
+    #####:  490:          format_str = optarg;
+    #####:  491:          break;
+        -:  492:
+        -:  493:        case 's':
+    #####:  494:          separator = optarg;
+    #####:  495:          break;
+        -:  496:
+        -:  497:        case 'w':
+    #####:  498:          equal_width = true;
+    #####:  499:          break;
+        -:  500:
+    #####:  501:        case_GETOPT_HELP_CHAR;
+        -:  502:
+        1:  503:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  504:
+        -:  505:        default:
+    #####:  506:          usage (EXIT_FAILURE);
+        -:  507:        }
+        -:  508:    }
+        -:  509:
+        1:  510:  unsigned int n_args = argc - optind;
+        1:  511:  if (n_args < 1)
+        -:  512:    {
+    #####:  513:      error (0, 0, _("missing operand"));
+    #####:  514:      usage (EXIT_FAILURE);
+        -:  515:    }
+        -:  516:
+        1:  517:  if (3 < n_args)
+        -:  518:    {
+    #####:  519:      error (0, 0, _("extra operand %s"), quote (argv[optind + 3]));
+    #####:  520:      usage (EXIT_FAILURE);
+        -:  521:    }
+        -:  522:
+        1:  523:  if (format_str)
+    #####:  524:    format_str = long_double_format (format_str, &layout);
+        -:  525:
+        1:  526:  if (format_str != NULL && equal_width)
+        -:  527:    {
+    #####:  528:      error (0, 0, _("format string may not be specified"
+        -:  529:                     " when printing equal width strings"));
+    #####:  530:      usage (EXIT_FAILURE);
+        -:  531:    }
+        -:  532:
+        -:  533:  /* If the following hold:
+        -:  534:     - no format string, [FIXME: relax this, eventually]
+        -:  535:     - integer start (or no start)
+        -:  536:     - integer end
+        -:  537:     - increment == 1 or not specified [FIXME: relax this, eventually]
+        -:  538:     then use the much more efficient integer-only code.  */
+        1:  539:  if (all_digits_p (argv[optind])
+        1:  540:      && (n_args == 1 || all_digits_p (argv[optind + 1]))
+        1:  541:      && (n_args < 3 || STREQ ("1", argv[optind + 2]))
+        1:  542:      && !equal_width && !format_str && strlen (separator) == 1)
+        -:  543:    {
+        1:  544:      char const *s1 = n_args == 1 ? "1" : argv[optind];
+        1:  545:      char const *s2 = n_args == 1 ? argv[optind] : argv[optind + 1];
+        1:  546:      if (seq_fast (s1, s2))
+        1:  547:        exit (EXIT_SUCCESS);
+        -:  548:
+        -:  549:      /* Upon any failure, let the more general code deal with it.  */
+        -:  550:    }
+        -:  551:
+    #####:  552:  last = scan_arg (argv[optind++]);
+        -:  553:
+    #####:  554:  if (optind < argc)
+        -:  555:    {
+    #####:  556:      first = last;
+    #####:  557:      last = scan_arg (argv[optind++]);
+        -:  558:
+    #####:  559:      if (optind < argc)
+        -:  560:        {
+    #####:  561:          step = last;
+    #####:  562:          last = scan_arg (argv[optind++]);
+        -:  563:        }
+        -:  564:    }
+        -:  565:
+    #####:  566:  if (first.precision == 0 && step.precision == 0 && last.precision == 0
+    #####:  567:      && 0 <= first.value && step.value == 1 && 0 <= last.value
+    #####:  568:      && !equal_width && !format_str && strlen (separator) == 1)
+        -:  569:    {
+        -:  570:      char *s1;
+        -:  571:      char *s2;
+    #####:  572:      if (asprintf (&s1, "%0.Lf", first.value) < 0)
+    #####:  573:        xalloc_die ();
+    #####:  574:      if (asprintf (&s2, "%0.Lf", last.value) < 0)
+    #####:  575:        xalloc_die ();
+        -:  576:
+    #####:  577:      if (seq_fast (s1, s2))
+        -:  578:        {
+    #####:  579:          IF_LINT (free (s1));
+    #####:  580:          IF_LINT (free (s2));
+    #####:  581:          exit (EXIT_SUCCESS);
+        -:  582:        }
+        -:  583:
+    #####:  584:      free (s1);
+    #####:  585:      free (s2);
+        -:  586:      /* Upon any failure, let the more general code deal with it.  */
+        -:  587:    }
+        -:  588:
+    #####:  589:  if (format_str == NULL)
+    #####:  590:    format_str = get_default_format (first, step, last);
+        -:  591:
+    #####:  592:  print_numbers (format_str, layout, first.value, step.value, last.value);
+        -:  593:
+    #####:  594:  exit (EXIT_SUCCESS);
+        -:  595:}

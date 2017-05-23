@@ -1,0 +1,391 @@
+        -:    0:Source:exec.c
+        -:    0:Graph:exec.gcno
+        -:    0:Data:exec.gcda
+        -:    0:Runs:9
+        -:    0:Programs:2
+        -:    1:/* exec.c -- Implementation of -exec, -execdir, -ok, -okdir.
+        -:    2:   Copyright (C) 1990, 1991, 1992, 1993, 1994, 2000, 2003,
+        -:    3:                 2004, 2005, 2006, 2007, 2008, 2009,
+        -:    4:                 2010 Free Software Foundation, Inc.
+        -:    5:
+        -:    6:   This program is free software: you can redistribute it and/or modify
+        -:    7:   it under the terms of the GNU General Public License as published by
+        -:    8:   the Free Software Foundation, either version 3 of the License, or
+        -:    9:   (at your option) any later version.
+        -:   10:
+        -:   11:   This program is distributed in the hope that it will be useful,
+        -:   12:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   13:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   14:   GNU General Public License for more details.
+        -:   15:
+        -:   16:   You should have received a copy of the GNU General Public License
+        -:   17:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   18:*/
+        -:   19:
+        -:   20:/* config.h must be included first. */
+        -:   21:#include <config.h>
+        -:   22:
+        -:   23:/* system headers. */
+        -:   24:#include <assert.h>
+        -:   25:#include <errno.h>
+        -:   26:#include <fcntl.h>
+        -:   27:#include <signal.h>
+        -:   28:#include <sys/wait.h>
+        -:   29:
+        -:   30:
+        -:   31:/* gnulib headers */
+        -:   32:#include "cloexec.h"
+        -:   33:#include "dirname.h"
+        -:   34:#include "error.h"
+        -:   35:#include "gettext.h"
+        -:   36:#include "save-cwd.h"
+        -:   37:#include "xalloc.h"
+        -:   38:
+        -:   39:/* findutils headers */
+        -:   40:#include "buildcmd.h"
+        -:   41:#include "defs.h"
+        -:   42:#include "fdleak.h"
+        -:   43:
+        -:   44:#if ENABLE_NLS
+        -:   45:# include <libintl.h>
+        -:   46:# define _(Text) gettext (Text)
+        -:   47:#else
+        -:   48:# define _(Text) Text
+        -:   49:#endif
+        -:   50:#ifdef gettext_noop
+        -:   51:# define N_(String) gettext_noop (String)
+        -:   52:#else
+        -:   53:/* See locate.c for explanation as to why not use (String) */
+        -:   54:# define N_(String) String
+        -:   55:#endif
+        -:   56:
+        -:   57:
+        -:   58:/* Initialise exec->wd_for_exec.
+        -:   59:
+        -:   60:   We save in exec->wd_for_exec the directory whose path relative to
+        -:   61:   cwd_df is dir.
+        -:   62: */
+        -:   63:static bool
+    #####:   64:initialise_wd_for_exec (struct exec_val *execp, int cwd_fd, const char *dir)
+        -:   65:{
+    #####:   66:  execp->wd_for_exec = xmalloc (sizeof (*execp->wd_for_exec));
+    #####:   67:  execp->wd_for_exec->name = NULL;
+    #####:   68:  execp->wd_for_exec->desc = openat (cwd_fd, dir, O_RDONLY);
+    #####:   69:  if (execp->wd_for_exec->desc < 0)
+    #####:   70:    return false;
+    #####:   71:  set_cloexec_flag (execp->wd_for_exec->desc, true);
+    #####:   72:  return true;
+        -:   73:}
+        -:   74:
+        -:   75:
+        -:   76:static bool
+    #####:   77:record_exec_dir (struct exec_val *execp)
+        -:   78:{
+    #####:   79:  if (!execp->state.todo)
+        -:   80:    {
+        -:   81:      /* working directory not already known, so must be a *dir variant,
+        -:   82:	 and this must be the first arg we added.   However, this may
+        -:   83:	 be -execdir foo {} \; (i.e. not multiple).  */
+    #####:   84:      assert (!execp->state.todo);
+        -:   85:
+        -:   86:      /* Record the WD. If we're using -L or fts chooses to do so for
+        -:   87:	 any other reason, state.cwd_dir_fd may in fact not be the
+        -:   88:	 directory containing the target file.  When this happens,
+        -:   89:	 rel_path will contain directory components (since it is the
+        -:   90:	 path from state.cwd_dir_fd to the target file).
+        -:   91:
+        -:   92:	 We deal with this by extracting any directory part and using
+        -:   93:	 that to adjust what goes into execp->wd_for_exec.
+        -:   94:      */
+    #####:   95:      if (strchr (state.rel_pathname, '/'))
+        -:   96:	{
+    #####:   97:	  char *dir = mdir_name (state.rel_pathname);
+    #####:   98:	  bool result = initialise_wd_for_exec (execp, state.cwd_dir_fd, dir);
+    #####:   99:	  free (dir);
+    #####:  100:	  return result;
+        -:  101:	}
+        -:  102:      else
+        -:  103:	{
+    #####:  104:	  return initialise_wd_for_exec (execp, state.cwd_dir_fd, ".");
+        -:  105:	}
+        -:  106:    }
+    #####:  107:  return true;
+        -:  108:}
+        -:  109:
+        -:  110:
+        -:  111:
+        -:  112:
+        -:  113:bool
+       64:  114:impl_pred_exec (const char *pathname,
+        -:  115:		struct stat *stat_buf,
+        -:  116:		struct predicate *pred_ptr)
+        -:  117:{
+       64:  118:  struct exec_val *execp = &pred_ptr->args.exec_vec;
+       64:  119:  char *buf = NULL;
+        -:  120:  const char *target;
+        -:  121:  bool result;
+       64:  122:  const bool local = is_exec_in_local_dir (pred_ptr->pred_func);
+        -:  123:  char *prefix;
+        -:  124:  size_t pfxlen;
+        -:  125:
+        -:  126:  (void) stat_buf;
+       64:  127:  if (local)
+        -:  128:    {
+        -:  129:      /* For -execdir/-okdir predicates, the parser did not fill in
+        -:  130:	 the wd_for_exec member of sturct exec_val.  So for those
+        -:  131:	 predicates, we do so now.
+        -:  132:      */
+    #####:  133:      if (!record_exec_dir (execp))
+        -:  134:	{
+    #####:  135:	  error (EXIT_FAILURE, errno,
+        -:  136:		 _("Failed to save working directory in order to "
+        -:  137:		   "run a command on %s"),
+        -:  138:		 safely_quote_err_filename (0, pathname));
+        -:  139:	  /*NOTREACHED*/
+        -:  140:	}
+    #####:  141:      target = buf = base_name (state.rel_pathname);
+    #####:  142:      if ('/' == target[0])
+        -:  143:	{
+        -:  144:	  /* find / execdir ls -d {} \; */
+    #####:  145:	  prefix = NULL;
+    #####:  146:	  pfxlen = 0;
+        -:  147:	}
+        -:  148:      else
+        -:  149:	{
+    #####:  150:	  prefix = "./";
+    #####:  151:	  pfxlen = 2u;
+        -:  152:	}
+        -:  153:    }
+        -:  154:  else
+        -:  155:    {
+        -:  156:      /* For the others (-exec, -ok), the parser should
+        -:  157:	 have set wd_for_exec to initial_wd, indicating
+        -:  158:	 that the exec should take place from find's initial
+        -:  159:	 working directory.
+        -:  160:      */
+       64:  161:      assert (execp->wd_for_exec == initial_wd);
+       64:  162:      target = pathname;
+       64:  163:      prefix = NULL;
+       64:  164:      pfxlen = 0u;
+        -:  165:    }
+        -:  166:
+       64:  167:  if (execp->multiple)
+        -:  168:    {
+        -:  169:      /* Push the argument onto the current list.
+        -:  170:       * The command may or may not be run at this point,
+        -:  171:       * depending on the command line length limits.
+        -:  172:       */
+    #####:  173:      bc_push_arg (&execp->ctl,
+        -:  174:		   &execp->state,
+    #####:  175:		   target, strlen (target)+1,
+        -:  176:		   prefix, pfxlen,
+        -:  177:		   0);
+        -:  178:
+        -:  179:      /* remember that there are pending execdirs. */
+    #####:  180:      if (execp->state.todo)
+    #####:  181:	state.execdirs_outstanding = true;
+        -:  182:
+        -:  183:      /* POSIX: If the primary expression is punctuated by a plus
+        -:  184:       * sign, the primary shall always evaluate as true
+        -:  185:       */
+    #####:  186:      result = true;
+        -:  187:    }
+        -:  188:  else
+        -:  189:    {
+        -:  190:      int i;
+        -:  191:
+      192:  192:      for (i=0; i<execp->num_args; ++i)
+        -:  193:	{
+      384:  194:	  bc_do_insert (&execp->ctl,
+        -:  195:			&execp->state,
+      128:  196:			execp->replace_vec[i],
+      128:  197:			strlen (execp->replace_vec[i]),
+        -:  198:			prefix, pfxlen,
+        -:  199:			target, strlen (target),
+        -:  200:			0);
+        -:  201:	}
+        -:  202:
+        -:  203:      /* Actually invoke the command. */
+       64:  204:      bc_do_exec (&execp->ctl, &execp->state);
+       64:  205:      if (WIFEXITED(execp->last_child_status))
+        -:  206:	{
+       64:  207:	  if (0 == WEXITSTATUS(execp->last_child_status))
+       32:  208:	    result = true;	/* The child succeeded. */
+        -:  209:	  else
+       32:  210:	    result = false;
+        -:  211:	}
+        -:  212:      else
+        -:  213:	{
+    #####:  214:	  result = false;
+        -:  215:	}
+        -:  216:    }
+       64:  217:  if (buf)
+        -:  218:    {
+    #####:  219:      assert (local);
+    #####:  220:      free (buf);
+        -:  221:    }
+       64:  222:  return result;
+        -:  223:}
+        -:  224:
+        -:  225:
+        -:  226:
+        -:  227:/*  1) fork to get a child; parent remembers the child pid
+        -:  228:    2) child execs the command requested
+        -:  229:    3) parent waits for child; checks for proper pid of child
+        -:  230:
+        -:  231:    Possible returns:
+        -:  232:
+        -:  233:    ret		errno	status(h)   status(l)
+        -:  234:
+        -:  235:    pid		x	signal#	    0177	stopped
+        -:  236:    pid		x	exit arg    0		term by _exit
+        -:  237:    pid		x	0	    signal #	term by signal
+        -:  238:    -1		EINTR				parent got signal
+        -:  239:    -1		other				some other kind of error
+        -:  240:
+        -:  241:    Return true only if the pid matches, status(l) is
+        -:  242:    zero, and the exit arg (status high) is 0.
+        -:  243:    Otherwise return false, possibly printing an error message. */
+        -:  244:static bool
+    #####:  245:prep_child_for_exec (bool close_stdin, const struct saved_cwd *wd)
+        -:  246:{
+    #####:  247:  bool ok = true;
+    #####:  248:  if (close_stdin)
+        -:  249:    {
+    #####:  250:      const char inputfile[] = "/dev/null";
+        -:  251:
+    #####:  252:      if (close (0) < 0)
+        -:  253:	{
+    #####:  254:	  error (0, errno, _("Cannot close standard input"));
+    #####:  255:	  ok = false;
+        -:  256:	}
+        -:  257:      else
+        -:  258:	{
+    #####:  259:	  if (open (inputfile, O_RDONLY
+        -:  260:#if defined O_LARGEFILE
+        -:  261:		   |O_LARGEFILE
+        -:  262:#endif
+        -:  263:		   ) < 0)
+        -:  264:	    {
+        -:  265:	      /* This is not entirely fatal, since
+        -:  266:	       * executing the child with a closed
+        -:  267:	       * stdin is almost as good as executing it
+        -:  268:	       * with its stdin attached to /dev/null.
+        -:  269:	       */
+    #####:  270:	      error (0, errno, "%s", safely_quote_err_filename (0, inputfile));
+        -:  271:	      /* do not set ok=false, it is OK to continue anyway. */
+        -:  272:	    }
+        -:  273:	}
+        -:  274:    }
+        -:  275:
+        -:  276:  /* Even if DebugSearch is set, don't announce our change of
+        -:  277:   * directory, since we're not going to emit a subsequent
+        -:  278:   * announcement of a call to stat() anyway, as we're about to exec
+        -:  279:   * something.
+        -:  280:   */
+    #####:  281:  if (0 != restore_cwd (wd))
+        -:  282:    {
+    #####:  283:      error (0, errno, _("Failed to change directory"));
+    #####:  284:      ok = false;
+        -:  285:    }
+    #####:  286:  return ok;
+        -:  287:}
+        -:  288:
+        -:  289:
+        -:  290:int
+       64:  291:launch (struct buildcmd_control *ctl, void *usercontext, int argc, char **argv)
+        -:  292:{
+        -:  293:  pid_t child_pid;
+        -:  294:  static int first_time = 1;
+       64:  295:  struct exec_val *execp = usercontext;
+        -:  296:
+        -:  297:  /* Make sure output of command doesn't get mixed with find output. */
+       64:  298:  fflush (stdout);
+       64:  299:  fflush (stderr);
+        -:  300:
+        -:  301:  /* Make sure to listen for the kids.  */
+       64:  302:  if (first_time)
+        -:  303:    {
+        8:  304:      first_time = 0;
+        8:  305:      signal (SIGCHLD, SIG_DFL);
+        -:  306:    }
+        -:  307:
+       64:  308:  child_pid = fork ();
+       64:  309:  if (child_pid == -1)
+    #####:  310:    error (EXIT_FAILURE, errno, _("cannot fork"));
+       64:  311:  if (child_pid == 0)
+        -:  312:    {
+        -:  313:      /* We are the child. */
+    #####:  314:      assert (NULL != execp->wd_for_exec);
+    #####:  315:      if (!prep_child_for_exec (execp->close_stdin, execp->wd_for_exec))
+        -:  316:	{
+    #####:  317:	  _exit (1);
+        -:  318:	}
+        -:  319:      else
+        -:  320:	{
+    #####:  321:	  if (fd_leak_check_is_enabled ())
+        -:  322:	    {
+    #####:  323:	      complain_about_leaky_fds ();
+        -:  324:	    }
+        -:  325:	}
+        -:  326:
+    #####:  327:      if (bc_args_exceed_testing_limit (argv))
+    #####:  328:	errno = E2BIG;
+        -:  329:      else
+    #####:  330:	execvp (argv[0], argv);
+        -:  331:      /* TODO: use a pipe to pass back the errno value, like xargs does */
+    #####:  332:      error (0, errno, "%s",
+        -:  333:	     safely_quote_err_filename (0, argv[0]));
+    #####:  334:      _exit (1);
+        -:  335:    }
+        -:  336:
+      128:  337:  while (waitpid (child_pid, &(execp->last_child_status), 0) == (pid_t) -1)
+        -:  338:    {
+    #####:  339:      if (errno != EINTR)
+        -:  340:	{
+    #####:  341:	  error (0, errno, _("error waiting for %s"),
+        -:  342:		 safely_quote_err_filename (0, argv[0]));
+    #####:  343:	  state.exit_status = 1;
+    #####:  344:	  return 0;		/* FAIL */
+        -:  345:	}
+        -:  346:    }
+        -:  347:
+       64:  348:  if (WIFSIGNALED (execp->last_child_status))
+        -:  349:    {
+    #####:  350:      error (0, 0, _("%s terminated by signal %d"),
+        -:  351:	     quotearg_n_style (0, options.err_quoting_style, argv[0]),
+    #####:  352:	     WTERMSIG (execp->last_child_status));
+        -:  353:
+    #####:  354:      if (execp->multiple)
+        -:  355:	{
+        -:  356:	  /* -exec   \; just returns false if the invoked command fails.
+        -:  357:	   * -exec {} + returns true if the invoked command fails, but
+        -:  358:	   *            sets the program exit status.
+        -:  359:	   */
+    #####:  360:	  state.exit_status = 1;
+        -:  361:	}
+        -:  362:
+    #####:  363:      return 1;			/* OK */
+        -:  364:    }
+        -:  365:
+       64:  366:  if (0 == WEXITSTATUS (execp->last_child_status))
+        -:  367:    {
+       32:  368:      return 1;			/* OK */
+        -:  369:    }
+        -:  370:  else
+        -:  371:    {
+       32:  372:      if (execp->multiple)
+        -:  373:	{
+        -:  374:	  /* -exec   \; just returns false if the invoked command fails.
+        -:  375:	   * -exec {} + returns true if the invoked command fails, but
+        -:  376:	   *            sets the program exit status.
+        -:  377:	   */
+    #####:  378:	  state.exit_status = 1;
+        -:  379:	}
+        -:  380:      /* The child failed, but this is the exec callback.  We
+        -:  381:       * don't want to run the child again in this case anwyay.
+        -:  382:       */
+       32:  383:      return 1;			/* FAIL (but don't try again) */
+        -:  384:    }
+        -:  385:
+        -:  386:}

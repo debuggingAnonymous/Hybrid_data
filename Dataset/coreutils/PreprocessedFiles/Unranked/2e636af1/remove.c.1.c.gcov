@@ -1,0 +1,651 @@
+        -:    0:Source:remove.c
+        -:    0:Graph:remove.gcno
+        -:    0:Data:remove.gcda
+        -:    0:Runs:5
+        -:    0:Programs:2
+        -:    1:/* remove.c -- core functions for removing files and directories
+        -:    2:   Copyright (C) 1988, 1990-1991, 1994-2011 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Extracted from rm.c, librarified, then rewritten twice by Jim Meyering.  */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <stdio.h>
+        -:   21:#include <sys/types.h>
+        -:   22:#include <assert.h>
+        -:   23:
+        -:   24:#include "system.h"
+        -:   25:#include "error.h"
+        -:   26:#include "euidaccess-stat.h"
+        -:   27:#include "file-type.h"
+        -:   28:#include "ignore-value.h"
+        -:   29:#include "quote.h"
+        -:   30:#include "remove.h"
+        -:   31:#include "root-dev-ino.h"
+        -:   32:#include "write-any-file.h"
+        -:   33:#include "xfts.h"
+        -:   34:#include "yesno.h"
+        -:   35:
+        -:   36:enum Ternary
+        -:   37:  {
+        -:   38:    T_UNKNOWN = 2,
+        -:   39:    T_NO,
+        -:   40:    T_YES
+        -:   41:  };
+        -:   42:typedef enum Ternary Ternary;
+        -:   43:
+        -:   44:/* The prompt function may be called twice for a given directory.
+        -:   45:   The first time, we ask whether to descend into it, and the
+        -:   46:   second time, we ask whether to remove it.  */
+        -:   47:enum Prompt_action
+        -:   48:  {
+        -:   49:    PA_DESCEND_INTO_DIR = 2,
+        -:   50:    PA_REMOVE_DIR
+        -:   51:  };
+        -:   52:
+        -:   53:/* D_TYPE(D) is the type of directory entry D if known, DT_UNKNOWN
+        -:   54:   otherwise.  */
+        -:   55:#if ! HAVE_STRUCT_DIRENT_D_TYPE
+        -:   56:/* Any int values will do here, so long as they're distinct.
+        -:   57:   Undef any existing macros out of the way.  */
+        -:   58:# undef DT_UNKNOWN
+        -:   59:# undef DT_DIR
+        -:   60:# undef DT_LNK
+        -:   61:# define DT_UNKNOWN 0
+        -:   62:# define DT_DIR 1
+        -:   63:# define DT_LNK 2
+        -:   64:#endif
+        -:   65:
+        -:   66:/* Like fstatat, but cache the result.  If ST->st_size is -1, the
+        -:   67:   status has not been gotten yet.  If less than -1, fstatat failed
+        -:   68:   with errno == ST->st_ino.  Otherwise, the status has already
+        -:   69:   been gotten, so return 0.  */
+        -:   70:static int
+    #####:   71:cache_fstatat (int fd, char const *file, struct stat *st, int flag)
+        -:   72:{
+    #####:   73:  if (st->st_size == -1 && fstatat (fd, file, st, flag) != 0)
+        -:   74:    {
+    #####:   75:      st->st_size = -2;
+    #####:   76:      st->st_ino = errno;
+        -:   77:    }
+    #####:   78:  if (0 <= st->st_size)
+    #####:   79:    return 0;
+    #####:   80:  errno = (int) st->st_ino;
+    #####:   81:  return -1;
+        -:   82:}
+        -:   83:
+        -:   84:/* Initialize a fstatat cache *ST.  Return ST for convenience.  */
+        -:   85:static inline struct stat *
+        6:   86:cache_stat_init (struct stat *st)
+        -:   87:{
+        6:   88:  st->st_size = -1;
+        6:   89:  return st;
+        -:   90:}
+        -:   91:
+        -:   92:/* Return true if *ST has been statted.  */
+        -:   93:static inline bool
+        -:   94:cache_statted (struct stat *st)
+        -:   95:{
+        -:   96:  return (st->st_size != -1);
+        -:   97:}
+        -:   98:
+        -:   99:/* Return true if *ST has been statted successfully.  */
+        -:  100:static inline bool
+        -:  101:cache_stat_ok (struct stat *st)
+        -:  102:{
+        -:  103:  return (0 <= st->st_size);
+        -:  104:}
+        -:  105:
+        -:  106:/* Return 1 if FILE is an unwritable non-symlink,
+        -:  107:   0 if it is writable or some other type of file,
+        -:  108:   -1 and set errno if there is some problem in determining the answer.
+        -:  109:   Use FULL_NAME only if necessary.
+        -:  110:   Set *BUF to the file status.
+        -:  111:   This is to avoid calling euidaccess when FILE is a symlink.  */
+        -:  112:static int
+    #####:  113:write_protected_non_symlink (int fd_cwd,
+        -:  114:                             char const *file,
+        -:  115:                             char const *full_name,
+        -:  116:                             struct stat *buf)
+        -:  117:{
+    #####:  118:  if (can_write_any_file ())
+    #####:  119:    return 0;
+    #####:  120:  if (cache_fstatat (fd_cwd, file, buf, AT_SYMLINK_NOFOLLOW) != 0)
+    #####:  121:    return -1;
+    #####:  122:  if (S_ISLNK (buf->st_mode))
+    #####:  123:    return 0;
+        -:  124:  /* Here, we know FILE is not a symbolic link.  */
+        -:  125:
+        -:  126:  /* In order to be reentrant -- i.e., to avoid changing the working
+        -:  127:     directory, and at the same time to be able to deal with alternate
+        -:  128:     access control mechanisms (ACLs, xattr-style attributes) and
+        -:  129:     arbitrarily deep trees -- we need a function like eaccessat, i.e.,
+        -:  130:     like Solaris' eaccess, but fd-relative, in the spirit of openat.  */
+        -:  131:
+        -:  132:  /* In the absence of a native eaccessat function, here are some of
+        -:  133:     the implementation choices [#4 and #5 were suggested by Paul Eggert]:
+        -:  134:     1) call openat with O_WRONLY|O_NOCTTY
+        -:  135:        Disadvantage: may create the file and doesn't work for directory,
+        -:  136:        may mistakenly report `unwritable' for EROFS or ACLs even though
+        -:  137:        perm bits say the file is writable.
+        -:  138:
+        -:  139:     2) fake eaccessat (save_cwd, fchdir, call euidaccess, restore_cwd)
+        -:  140:        Disadvantage: changes working directory (not reentrant) and can't
+        -:  141:        work if save_cwd fails.
+        -:  142:
+        -:  143:     3) if (euidaccess (full_name, W_OK) == 0)
+        -:  144:        Disadvantage: doesn't work if full_name is too long.
+        -:  145:        Inefficient for very deep trees (O(Depth^2)).
+        -:  146:
+        -:  147:     4) If the full pathname is sufficiently short (say, less than
+        -:  148:        PATH_MAX or 8192 bytes, whichever is shorter):
+        -:  149:        use method (3) (i.e., euidaccess (full_name, W_OK));
+        -:  150:        Otherwise: vfork, fchdir in the child, run euidaccess in the
+        -:  151:        child, then the child exits with a status that tells the parent
+        -:  152:        whether euidaccess succeeded.
+        -:  153:
+        -:  154:        This avoids the O(N**2) algorithm of method (3), and it also avoids
+        -:  155:        the failure-due-to-too-long-file-names of method (3), but it's fast
+        -:  156:        in the normal shallow case.  It also avoids the lack-of-reentrancy
+        -:  157:        and the save_cwd problems.
+        -:  158:        Disadvantage; it uses a process slot for very-long file names,
+        -:  159:        and would be very slow for hierarchies with many such files.
+        -:  160:
+        -:  161:     5) If the full file name is sufficiently short (say, less than
+        -:  162:        PATH_MAX or 8192 bytes, whichever is shorter):
+        -:  163:        use method (3) (i.e., euidaccess (full_name, W_OK));
+        -:  164:        Otherwise: look just at the file bits.  Perhaps issue a warning
+        -:  165:        the first time this occurs.
+        -:  166:
+        -:  167:        This is like (4), except for the "Otherwise" case where it isn't as
+        -:  168:        "perfect" as (4) but is considerably faster.  It conforms to current
+        -:  169:        POSIX, and is uniformly better than what Solaris and FreeBSD do (they
+        -:  170:        mess up with long file names). */
+        -:  171:
+        -:  172:  {
+        -:  173:    /* This implements #1: on decent systems, either faccessat is
+        -:  174:       native or /proc/self/fd allows us to skip a chdir.  */
+        -:  175:    if (!openat_needs_fchdir ())
+        -:  176:      {
+    #####:  177:        if (faccessat (fd_cwd, file, W_OK, AT_EACCESS) == 0)
+    #####:  178:          return 0;
+        -:  179:
+    #####:  180:        return errno == EACCES ? 1 : -1;
+        -:  181:      }
+        -:  182:
+        -:  183:    /* This implements #5: */
+        -:  184:    size_t file_name_len = strlen (full_name);
+        -:  185:
+        -:  186:    if (MIN (PATH_MAX, 8192) <= file_name_len)
+        -:  187:      return ! euidaccess_stat (buf, W_OK);
+        -:  188:    if (euidaccess (full_name, W_OK) == 0)
+        -:  189:      return 0;
+        -:  190:    if (errno == EACCES)
+        -:  191:      {
+        -:  192:        errno = 0;
+        -:  193:        return 1;
+        -:  194:      }
+        -:  195:
+        -:  196:    /* Perhaps some other process has removed the file, or perhaps this
+        -:  197:       is a buggy NFS client.  */
+        -:  198:    return -1;
+        -:  199:  }
+        -:  200:}
+        -:  201:
+        -:  202:/* Prompt whether to remove FILENAME (ent->, if required via a combination of
+        -:  203:   the options specified by X and/or file attributes.  If the file may
+        -:  204:   be removed, return RM_OK.  If the user declines to remove the file,
+        -:  205:   return RM_USER_DECLINED.  If not ignoring missing files and we
+        -:  206:   cannot lstat FILENAME, then return RM_ERROR.
+        -:  207:
+        -:  208:   IS_DIR is true if ENT designates a directory, false otherwise.
+        -:  209:
+        -:  210:   Depending on MODE, ask whether to `descend into' or to `remove' the
+        -:  211:   directory FILENAME.  MODE is ignored when FILENAME is not a directory.
+        -:  212:   Set *IS_EMPTY_P to T_YES if FILENAME is an empty directory, and it is
+        -:  213:   appropriate to try to remove it with rmdir (e.g. recursive mode).
+        -:  214:   Don't even try to set *IS_EMPTY_P when MODE == PA_REMOVE_DIR.  */
+        -:  215:static enum RM_status
+        6:  216:prompt (FTS const *fts, FTSENT const *ent, bool is_dir,
+        -:  217:        struct rm_options const *x, enum Prompt_action mode,
+        -:  218:        Ternary *is_empty_p)
+        -:  219:{
+        6:  220:  int fd_cwd = fts->fts_cwd_fd;
+        6:  221:  char const *full_name = ent->fts_path;
+        6:  222:  char const *filename = ent->fts_accpath;
+        6:  223:  if (is_empty_p)
+    #####:  224:    *is_empty_p = T_UNKNOWN;
+        -:  225:
+        -:  226:  struct stat st;
+        6:  227:  struct stat *sbuf = &st;
+        6:  228:  cache_stat_init (sbuf);
+        -:  229:
+        6:  230:  int dirent_type = is_dir ? DT_DIR : DT_UNKNOWN;
+        6:  231:  int write_protected = 0;
+        -:  232:
+        -:  233:  /* When nonzero, this indicates that we failed to remove a child entry,
+        -:  234:     either because the user declined an interactive prompt, or due to
+        -:  235:     some other failure, like permissions.  */
+        6:  236:  if (ent->fts_number)
+    #####:  237:    return RM_USER_DECLINED;
+        -:  238:
+        6:  239:  if (x->interactive == RMI_NEVER)
+        6:  240:    return RM_OK;
+        -:  241:
+    #####:  242:  int wp_errno = 0;
+    #####:  243:  if (!x->ignore_missing_files
+    #####:  244:      && ((x->interactive == RMI_ALWAYS) || x->stdin_tty)
+    #####:  245:      && dirent_type != DT_LNK)
+        -:  246:    {
+    #####:  247:      write_protected = write_protected_non_symlink (fd_cwd, filename,
+        -:  248:                                                     full_name, sbuf);
+    #####:  249:      wp_errno = errno;
+        -:  250:    }
+        -:  251:
+    #####:  252:  if (write_protected || x->interactive == RMI_ALWAYS)
+        -:  253:    {
+    #####:  254:      if (0 <= write_protected && dirent_type == DT_UNKNOWN)
+        -:  255:        {
+    #####:  256:          if (cache_fstatat (fd_cwd, filename, sbuf, AT_SYMLINK_NOFOLLOW) == 0)
+        -:  257:            {
+    #####:  258:              if (S_ISLNK (sbuf->st_mode))
+    #####:  259:                dirent_type = DT_LNK;
+    #####:  260:              else if (S_ISDIR (sbuf->st_mode))
+    #####:  261:                dirent_type = DT_DIR;
+        -:  262:              /* Otherwise it doesn't matter, so leave it DT_UNKNOWN.  */
+        -:  263:            }
+        -:  264:          else
+        -:  265:            {
+        -:  266:              /* This happens, e.g., with `rm '''.  */
+    #####:  267:              write_protected = -1;
+    #####:  268:              wp_errno = errno;
+        -:  269:            }
+        -:  270:        }
+        -:  271:
+    #####:  272:      if (0 <= write_protected)
+    #####:  273:        switch (dirent_type)
+        -:  274:          {
+        -:  275:          case DT_LNK:
+        -:  276:            /* Using permissions doesn't make sense for symlinks.  */
+    #####:  277:            if (x->interactive != RMI_ALWAYS)
+    #####:  278:              return RM_OK;
+    #####:  279:            break;
+        -:  280:
+        -:  281:          case DT_DIR:
+    #####:  282:            if (!x->recursive)
+        -:  283:              {
+    #####:  284:                write_protected = -1;
+    #####:  285:                wp_errno = EISDIR;
+        -:  286:              }
+    #####:  287:            break;
+        -:  288:          }
+        -:  289:
+    #####:  290:      char const *quoted_name = quote (full_name);
+        -:  291:
+    #####:  292:      if (write_protected < 0)
+        -:  293:        {
+    #####:  294:          error (0, wp_errno, _("cannot remove %s"), quoted_name);
+    #####:  295:          return RM_ERROR;
+        -:  296:        }
+        -:  297:
+        -:  298:      bool is_empty;
+    #####:  299:      if (is_empty_p)
+        -:  300:        {
+    #####:  301:          is_empty = is_empty_dir (fd_cwd, filename);
+    #####:  302:          *is_empty_p = is_empty ? T_YES : T_NO;
+        -:  303:        }
+        -:  304:      else
+    #####:  305:        is_empty = false;
+        -:  306:
+        -:  307:      /* Issue the prompt.  */
+    #####:  308:      if (dirent_type == DT_DIR
+    #####:  309:          && mode == PA_DESCEND_INTO_DIR
+    #####:  310:          && !is_empty)
+    #####:  311:        fprintf (stderr,
+        -:  312:                 (write_protected
+        -:  313:                  ? _("%s: descend into write-protected directory %s? ")
+        -:  314:                  : _("%s: descend into directory %s? ")),
+        -:  315:                 program_name, quoted_name);
+        -:  316:      else
+        -:  317:        {
+    #####:  318:          if (cache_fstatat (fd_cwd, filename, sbuf, AT_SYMLINK_NOFOLLOW) != 0)
+        -:  319:            {
+    #####:  320:              error (0, errno, _("cannot remove %s"), quoted_name);
+    #####:  321:              return RM_ERROR;
+        -:  322:            }
+        -:  323:
+    #####:  324:          fprintf (stderr,
+        -:  325:                   (write_protected
+        -:  326:                    /* TRANSLATORS: You may find it more convenient to
+        -:  327:                       translate "%s: remove %s (write-protected) %s? "
+        -:  328:                       instead.  It should avoid grammatical problems
+        -:  329:                       with the output of file_type.  */
+        -:  330:                    ? _("%s: remove write-protected %s %s? ")
+        -:  331:                    : _("%s: remove %s %s? ")),
+        -:  332:                   program_name, file_type (sbuf), quoted_name);
+        -:  333:        }
+        -:  334:
+    #####:  335:      if (!yesno ())
+    #####:  336:        return RM_USER_DECLINED;
+        -:  337:    }
+    #####:  338:  return RM_OK;
+        -:  339:}
+        -:  340:
+        -:  341:/* Return true if FILENAME is a directory (and not a symlink to a directory).
+        -:  342:   Otherwise, including the case in which lstat fails, return false.
+        -:  343:   *ST is FILENAME's tstatus.
+        -:  344:   Do not modify errno.  */
+        -:  345:static inline bool
+        -:  346:is_dir_lstat (int fd_cwd, char const *filename, struct stat *st)
+        -:  347:{
+        -:  348:  int saved_errno = errno;
+        -:  349:  bool is_dir =
+        -:  350:    (cache_fstatat (fd_cwd, filename, st, AT_SYMLINK_NOFOLLOW) == 0
+        -:  351:     && S_ISDIR (st->st_mode));
+        -:  352:  errno = saved_errno;
+        -:  353:  return is_dir;
+        -:  354:}
+        -:  355:
+        -:  356:/* Return true if FILENAME is a non-directory.
+        -:  357:   Otherwise, including the case in which lstat fails, return false.
+        -:  358:   *ST is FILENAME's tstatus.
+        -:  359:   Do not modify errno.  */
+        -:  360:static inline bool
+        -:  361:is_nondir_lstat (int fd_cwd, char const *filename, struct stat *st)
+        -:  362:{
+        -:  363:  int saved_errno = errno;
+        -:  364:  bool is_non_dir =
+        -:  365:    (cache_fstatat (fd_cwd, filename, st, AT_SYMLINK_NOFOLLOW) == 0
+        -:  366:     && !S_ISDIR (st->st_mode));
+        -:  367:  errno = saved_errno;
+        -:  368:  return is_non_dir;
+        -:  369:}
+        -:  370:
+        -:  371:/* When a function like unlink, rmdir, or fstatat fails with an errno
+        -:  372:   value of ERRNUM, return true if the specified file system object
+        -:  373:   is guaranteed not to exist;  otherwise, return false.  */
+        -:  374:static inline bool
+    #####:  375:nonexistent_file_errno (int errnum)
+        -:  376:{
+        -:  377:  /* Do not include ELOOP here, since the specified file may indeed
+        -:  378:     exist, but be (in)accessible only via too long a symlink chain.
+        -:  379:     Likewise for ENAMETOOLONG, since rm -f ./././.../foo may fail
+        -:  380:     if the "..." part expands to a long enough sequence of "./"s,
+        -:  381:     even though ./foo does indeed exist.
+        -:  382:
+        -:  383:     Another case to consider is when a particular name is invalid for
+        -:  384:     a given file system.  In 2011, smbfs returns EINVAL, but the next
+        -:  385:     revision of POSIX will require EILSEQ for that situation:
+        -:  386:     http://austingroupbugs.net/view.php?id=293
+        -:  387:  */
+        -:  388:
+    #####:  389:  switch (errnum)
+        -:  390:    {
+        -:  391:    case EILSEQ:
+        -:  392:    case EINVAL:
+        -:  393:    case ENOENT:
+        -:  394:    case ENOTDIR:
+    #####:  395:      return true;
+        -:  396:    default:
+    #####:  397:      return false;
+        -:  398:    }
+        -:  399:}
+        -:  400:
+        -:  401:/* Encapsulate the test for whether the errno value, ERRNUM, is ignorable.  */
+        -:  402:static inline bool
+    #####:  403:ignorable_missing (struct rm_options const *x, int errnum)
+        -:  404:{
+    #####:  405:  return x->ignore_missing_files && nonexistent_file_errno (errnum);
+        -:  406:}
+        -:  407:
+        -:  408:/* Tell fts not to traverse into the hierarchy at ENT.  */
+        -:  409:static void
+    #####:  410:fts_skip_tree (FTS *fts, FTSENT *ent)
+        -:  411:{
+    #####:  412:  fts_set (fts, ent, FTS_SKIP);
+        -:  413:  /* Ensure that we do not process ENT a second time.  */
+    #####:  414:  ignore_value (fts_read (fts));
+    #####:  415:}
+        -:  416:
+        -:  417:/* Upon unlink failure, or when the user declines to remove ENT, mark
+        -:  418:   each of its ancestor directories, so that we know not to prompt for
+        -:  419:   its removal.  */
+        -:  420:static void
+    #####:  421:mark_ancestor_dirs (FTSENT *ent)
+        -:  422:{
+        -:  423:  FTSENT *p;
+    #####:  424:  for (p = ent->fts_parent; FTS_ROOTLEVEL <= p->fts_level; p = p->fts_parent)
+        -:  425:    {
+    #####:  426:      if (p->fts_number)
+    #####:  427:        break;
+    #####:  428:      p->fts_number = 1;
+        -:  429:    }
+    #####:  430:}
+        -:  431:
+        -:  432:/* Remove the file system object specified by ENT.  IS_DIR specifies
+        -:  433:   whether it is expected to be a directory or non-directory.
+        -:  434:   Return RM_OK upon success, else RM_ERROR.  */
+        -:  435:static enum RM_status
+        6:  436:excise (FTS *fts, FTSENT *ent, struct rm_options const *x, bool is_dir)
+        -:  437:{
+        6:  438:  int flag = is_dir ? AT_REMOVEDIR : 0;
+        6:  439:  if (unlinkat (fts->fts_cwd_fd, ent->fts_accpath, flag) == 0)
+        -:  440:    {
+        6:  441:      if (x->verbose)
+        -:  442:        {
+    #####:  443:          printf ((is_dir
+        -:  444:                   ? _("removed directory: %s\n")
+    #####:  445:                   : _("removed %s\n")), quote (ent->fts_path));
+        -:  446:        }
+        6:  447:      return RM_OK;
+        -:  448:    }
+        -:  449:
+        -:  450:  /* The unlinkat from kernels like linux-2.6.32 reports EROFS even for
+        -:  451:     nonexistent files.  When the file is indeed missing, map that to ENOENT,
+        -:  452:     so that rm -f ignores it, as required.  Even without -f, this is useful
+        -:  453:     because it makes rm print the more precise diagnostic.  */
+    #####:  454:  if (errno == EROFS)
+        -:  455:    {
+        -:  456:      struct stat st;
+    #####:  457:      if ( ! (lstatat (fts->fts_cwd_fd, ent->fts_accpath, &st)
+    #####:  458:                       && errno == ENOENT))
+    #####:  459:        errno = EROFS;
+        -:  460:    }
+        -:  461:
+    #####:  462:  if (ignorable_missing (x, errno))
+    #####:  463:    return RM_OK;
+        -:  464:
+        -:  465:  /* When failing to rmdir an unreadable directory, the typical
+        -:  466:     errno value is EISDIR, but that is not as useful to the user
+        -:  467:     as the errno value from the failed open (probably EPERM).
+        -:  468:     Use the earlier, more descriptive errno value.  */
+    #####:  469:  if (ent->fts_info == FTS_DNR)
+    #####:  470:    errno = ent->fts_errno;
+    #####:  471:  error (0, errno, _("cannot remove %s"), quote (ent->fts_path));
+    #####:  472:  mark_ancestor_dirs (ent);
+    #####:  473:  return RM_ERROR;
+        -:  474:}
+        -:  475:
+        -:  476:/* This function is called once for every file system object that fts
+        -:  477:   encounters.  fts performs a depth-first traversal.
+        -:  478:   A directory is usually processed twice, first with fts_info == FTS_D,
+        -:  479:   and later, after all of its entries have been processed, with FTS_DP.
+        -:  480:   Return RM_ERROR upon error, RM_USER_DECLINED for a negative response
+        -:  481:   to an interactive prompt, and otherwise, RM_OK.  */
+        -:  482:static enum RM_status
+        6:  483:rm_fts (FTS *fts, FTSENT *ent, struct rm_options const *x)
+        -:  484:{
+        6:  485:  switch (ent->fts_info)
+        -:  486:    {
+        -:  487:    case FTS_D:			/* preorder directory */
+    #####:  488:      if (! x->recursive)
+        -:  489:        {
+        -:  490:          /* This is the first (pre-order) encounter with a directory.
+        -:  491:             Not recursive, so arrange to skip contents.  */
+    #####:  492:          error (0, EISDIR, _("cannot remove %s"), quote (ent->fts_path));
+    #####:  493:          mark_ancestor_dirs (ent);
+    #####:  494:          fts_skip_tree (fts, ent);
+    #####:  495:          return RM_ERROR;
+        -:  496:        }
+        -:  497:
+        -:  498:      /* Perform checks that can apply only for command-line arguments.  */
+    #####:  499:      if (ent->fts_level == FTS_ROOTLEVEL)
+        -:  500:        {
+    #####:  501:          if (strip_trailing_slashes (ent->fts_path))
+    #####:  502:            ent->fts_pathlen = strlen (ent->fts_path);
+        -:  503:
+        -:  504:          /* If the basename of a command line argument is "." or "..",
+        -:  505:             diagnose it and do nothing more with that argument.  */
+    #####:  506:          if (dot_or_dotdot (last_component (ent->fts_accpath)))
+        -:  507:            {
+    #####:  508:              error (0, 0, _("cannot remove directory: %s"),
+    #####:  509:                     quote (ent->fts_path));
+    #####:  510:              fts_skip_tree (fts, ent);
+    #####:  511:              return RM_ERROR;
+        -:  512:            }
+        -:  513:
+        -:  514:          /* If a command line argument resolves to "/" (and --preserve-root
+        -:  515:             is in effect -- default) diagnose and skip it.  */
+    #####:  516:          if (ROOT_DEV_INO_CHECK (x->root_dev_ino, ent->fts_statp))
+        -:  517:            {
+    #####:  518:              ROOT_DEV_INO_WARN (ent->fts_path);
+    #####:  519:              fts_skip_tree (fts, ent);
+    #####:  520:              return RM_ERROR;
+        -:  521:            }
+        -:  522:        }
+        -:  523:
+        -:  524:      {
+        -:  525:        Ternary is_empty_directory;
+    #####:  526:        enum RM_status s = prompt (fts, ent, true /*is_dir*/, x,
+        -:  527:                                   PA_DESCEND_INTO_DIR, &is_empty_directory);
+        -:  528:
+    #####:  529:        if (s == RM_OK && is_empty_directory == T_YES)
+        -:  530:          {
+        -:  531:            /* When we know (from prompt when in interactive mode)
+        -:  532:               that this is an empty directory, don't prompt twice.  */
+    #####:  533:            s = excise (fts, ent, x, true);
+    #####:  534:            fts_skip_tree (fts, ent);
+        -:  535:          }
+        -:  536:
+    #####:  537:        if (s != RM_OK)
+        -:  538:          {
+    #####:  539:            mark_ancestor_dirs (ent);
+    #####:  540:            fts_skip_tree (fts, ent);
+        -:  541:          }
+        -:  542:
+    #####:  543:        return s;
+        -:  544:      }
+        -:  545:
+        -:  546:    case FTS_F:			/* regular file */
+        -:  547:    case FTS_NS:		/* stat(2) failed */
+        -:  548:    case FTS_SL:		/* symbolic link */
+        -:  549:    case FTS_SLNONE:		/* symbolic link without target */
+        -:  550:    case FTS_DP:		/* postorder directory */
+        -:  551:    case FTS_DNR:		/* unreadable directory */
+        -:  552:    case FTS_NSOK:		/* e.g., dangling symlink */
+        -:  553:    case FTS_DEFAULT:		/* none of the above */
+        -:  554:      {
+        -:  555:        /* With --one-file-system, do not attempt to remove a mount point.
+        -:  556:           fts' FTS_XDEV ensures that we don't process any entries under
+        -:  557:           the mount point.  */
+        6:  558:        if (ent->fts_info == FTS_DP
+    #####:  559:            && x->one_file_system
+    #####:  560:            && FTS_ROOTLEVEL < ent->fts_level
+    #####:  561:            && ent->fts_statp->st_dev != fts->fts_dev)
+        -:  562:          {
+    #####:  563:            mark_ancestor_dirs (ent);
+    #####:  564:            error (0, 0, _("skipping %s, since it's on a different device"),
+    #####:  565:                   quote (ent->fts_path));
+    #####:  566:            return RM_ERROR;
+        -:  567:          }
+        -:  568:
+        6:  569:        bool is_dir = ent->fts_info == FTS_DP || ent->fts_info == FTS_DNR;
+        6:  570:        enum RM_status s = prompt (fts, ent, is_dir, x, PA_REMOVE_DIR, NULL);
+        6:  571:        if (s != RM_OK)
+    #####:  572:          return s;
+        6:  573:        return excise (fts, ent, x, is_dir);
+        -:  574:      }
+        -:  575:
+        -:  576:    case FTS_DC:		/* directory that causes cycles */
+    #####:  577:      emit_cycle_warning (ent->fts_path);
+    #####:  578:      fts_skip_tree (fts, ent);
+    #####:  579:      return RM_ERROR;
+        -:  580:
+        -:  581:    case FTS_ERR:
+        -:  582:      /* Various failures, from opendir to ENOMEM, to failure to "return"
+        -:  583:         to preceding directory, can provoke this.  */
+    #####:  584:      error (0, ent->fts_errno, _("traversal failed: %s"),
+    #####:  585:             quote (ent->fts_path));
+    #####:  586:      fts_skip_tree (fts, ent);
+    #####:  587:      return RM_ERROR;
+        -:  588:
+        -:  589:    default:
+    #####:  590:      error (0, 0, _("unexpected failure: fts_info=%d: %s\n"
+        -:  591:                     "please report to %s"),
+    #####:  592:             ent->fts_info,
+    #####:  593:             quote (ent->fts_path),
+        -:  594:             PACKAGE_BUGREPORT);
+    #####:  595:      abort ();
+        -:  596:    }
+        -:  597:}
+        -:  598:
+        -:  599:/* Remove FILEs, honoring options specified via X.
+        -:  600:   Return RM_OK if successful.  */
+        -:  601:enum RM_status
+        5:  602:rm (char *const *file, struct rm_options const *x)
+        -:  603:{
+        5:  604:  enum RM_status rm_status = RM_OK;
+        -:  605:
+        5:  606:  if (*file)
+        -:  607:    {
+        5:  608:      int bit_flags = (FTS_CWDFD
+        -:  609:                       | FTS_NOSTAT
+        -:  610:                       | FTS_PHYSICAL);
+        -:  611:
+        5:  612:      if (x->one_file_system)
+    #####:  613:        bit_flags |= FTS_XDEV;
+        -:  614:
+        5:  615:      FTS *fts = xfts_open (file, bit_flags, NULL);
+        -:  616:
+        -:  617:      while (1)
+        -:  618:        {
+        -:  619:          FTSENT *ent;
+        -:  620:
+       11:  621:          ent = fts_read (fts);
+       11:  622:          if (ent == NULL)
+        -:  623:            {
+        5:  624:              if (errno != 0)
+        -:  625:                {
+    #####:  626:                  error (0, errno, _("fts_read failed"));
+    #####:  627:                  rm_status = RM_ERROR;
+        -:  628:                }
+        5:  629:              break;
+        -:  630:            }
+        -:  631:
+        6:  632:          enum RM_status s = rm_fts (fts, ent, x);
+        -:  633:
+        6:  634:          assert (VALID_STATUS (s));
+        6:  635:          UPDATE_STATUS (rm_status, s);
+        6:  636:        }
+        -:  637:
+        5:  638:      if (fts_close (fts) != 0)
+        -:  639:        {
+    #####:  640:          error (0, errno, _("fts_close failed"));
+    #####:  641:          rm_status = RM_ERROR;
+        -:  642:        }
+        -:  643:    }
+        -:  644:
+        5:  645:  return rm_status;
+        -:  646:}

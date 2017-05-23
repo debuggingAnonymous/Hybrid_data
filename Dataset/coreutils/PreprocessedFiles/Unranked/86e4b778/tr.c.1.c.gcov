@@ -1,0 +1,1900 @@
+        -:    0:Source:tr.c
+        -:    0:Graph:tr.gcno
+        -:    0:Data:tr.gcda
+        -:    0:Runs:18
+        -:    0:Programs:1
+        -:    1:/* tr -- a filter to translate characters
+        -:    2:   Copyright (C) 91, 1995-2007 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software; you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation; either version 2, or (at your option)
+        -:    7:   any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program; if not, write to the Free Software Foundation,
+        -:   16:   Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.  */
+        -:   17:
+        -:   18:/* Written by Jim Meyering */
+        -:   19:
+        -:   20:#include <config.h>
+        -:   21:
+        -:   22:#include <stdio.h>
+        -:   23:#include <assert.h>
+        -:   24:#include <sys/types.h>
+        -:   25:#include <getopt.h>
+        -:   26:
+        -:   27:#include "system.h"
+        -:   28:#include "error.h"
+        -:   29:#include "quote.h"
+        -:   30:#include "safe-read.h"
+        -:   31:#include "xstrtol.h"
+        -:   32:
+        -:   33:/* The official name of this program (e.g., no `g' prefix).  */
+        -:   34:#define PROGRAM_NAME "tr"
+        -:   35:
+        -:   36:#define AUTHORS "Jim Meyering"
+        -:   37:
+        -:   38:enum { N_CHARS = UCHAR_MAX + 1 };
+        -:   39:
+        -:   40:/* An unsigned integer type big enough to hold a repeat count or an
+        -:   41:   unsigned character.  POSIX requires support for repeat counts as
+        -:   42:   high as 2**31 - 1.  Since repeat counts might need to expand to
+        -:   43:   match the length of an argument string, we need at least size_t to
+        -:   44:   avoid arbitrary internal limits.  It doesn't cost much to use
+        -:   45:   uintmax_t, though.  */
+        -:   46:typedef uintmax_t count;
+        -:   47:
+        -:   48:/* The value for Spec_list->state that indicates to
+        -:   49:   get_next that it should initialize the tail pointer.
+        -:   50:   Its value should be as large as possible to avoid conflict
+        -:   51:   a valid value for the state field -- and that may be as
+        -:   52:   large as any valid repeat_count.  */
+        -:   53:#define BEGIN_STATE (UINTMAX_MAX - 1)
+        -:   54:
+        -:   55:/* The value for Spec_list->state that indicates to
+        -:   56:   get_next that the element pointed to by Spec_list->tail is
+        -:   57:   being considered for the first time on this pass through the
+        -:   58:   list -- it indicates that get_next should make any necessary
+        -:   59:   initializations.  */
+        -:   60:#define NEW_ELEMENT (BEGIN_STATE + 1)
+        -:   61:
+        -:   62:/* The maximum possible repeat count.  Due to how the states are
+        -:   63:   implemented, it can be as much as BEGIN_STATE.  */
+        -:   64:#define REPEAT_COUNT_MAXIMUM BEGIN_STATE
+        -:   65:
+        -:   66:/* The following (but not CC_NO_CLASS) are indices into the array of
+        -:   67:   valid character class strings.  */
+        -:   68:enum Char_class
+        -:   69:  {
+        -:   70:    CC_ALNUM = 0, CC_ALPHA = 1, CC_BLANK = 2, CC_CNTRL = 3,
+        -:   71:    CC_DIGIT = 4, CC_GRAPH = 5, CC_LOWER = 6, CC_PRINT = 7,
+        -:   72:    CC_PUNCT = 8, CC_SPACE = 9, CC_UPPER = 10, CC_XDIGIT = 11,
+        -:   73:    CC_NO_CLASS = 9999
+        -:   74:  };
+        -:   75:
+        -:   76:/* Character class to which a character (returned by get_next) belonged;
+        -:   77:   but it is set only if the construct from which the character was obtained
+        -:   78:   was one of the character classes [:upper:] or [:lower:].  The value
+        -:   79:   is used only when translating and then, only to make sure that upper
+        -:   80:   and lower class constructs have the same relative positions in string1
+        -:   81:   and string2.  */
+        -:   82:enum Upper_Lower_class
+        -:   83:  {
+        -:   84:    UL_LOWER,
+        -:   85:    UL_UPPER,
+        -:   86:    UL_NONE
+        -:   87:  };
+        -:   88:
+        -:   89:/* The type of a List_element.  See build_spec_list for more details.  */
+        -:   90:enum Range_element_type
+        -:   91:  {
+        -:   92:    RE_NORMAL_CHAR,
+        -:   93:    RE_RANGE,
+        -:   94:    RE_CHAR_CLASS,
+        -:   95:    RE_EQUIV_CLASS,
+        -:   96:    RE_REPEATED_CHAR
+        -:   97:  };
+        -:   98:
+        -:   99:/* One construct in one of tr's argument strings.
+        -:  100:   For example, consider the POSIX version of the classic tr command:
+        -:  101:       tr -cs 'a-zA-Z_' '[\n*]'
+        -:  102:   String1 has 3 constructs, two of which are ranges (a-z and A-Z),
+        -:  103:   and a single normal character, `_'.  String2 has one construct.  */
+        -:  104:struct List_element
+        -:  105:  {
+        -:  106:    enum Range_element_type type;
+        -:  107:    struct List_element *next;
+        -:  108:    union
+        -:  109:      {
+        -:  110:	unsigned char normal_char;
+        -:  111:	struct			/* unnamed */
+        -:  112:	  {
+        -:  113:	    unsigned char first_char;
+        -:  114:	    unsigned char last_char;
+        -:  115:	  }
+        -:  116:	range;
+        -:  117:	enum Char_class char_class;
+        -:  118:	unsigned char equiv_code;
+        -:  119:	struct			/* unnamed */
+        -:  120:	  {
+        -:  121:	    unsigned char the_repeated_char;
+        -:  122:	    count repeat_count;
+        -:  123:	  }
+        -:  124:	repeated_char;
+        -:  125:      }
+        -:  126:    u;
+        -:  127:  };
+        -:  128:
+        -:  129:/* Each of tr's argument strings is parsed into a form that is easier
+        -:  130:   to work with: a linked list of constructs (struct List_element).
+        -:  131:   Each Spec_list structure also encapsulates various attributes of
+        -:  132:   the corresponding argument string.  The attributes are used mainly
+        -:  133:   to verify that the strings are valid in the context of any options
+        -:  134:   specified (like -s, -d, or -c).  The main exception is the member
+        -:  135:   `tail', which is first used to construct the list.  After construction,
+        -:  136:   it is used by get_next to save its state when traversing the list.
+        -:  137:   The member `state' serves a similar function.  */
+        -:  138:struct Spec_list
+        -:  139:  {
+        -:  140:    /* Points to the head of the list of range elements.
+        -:  141:       The first struct is a dummy; its members are never used.  */
+        -:  142:    struct List_element *head;
+        -:  143:
+        -:  144:    /* When appending, points to the last element.  When traversing via
+        -:  145:       get_next(), points to the element to process next.  Setting
+        -:  146:       Spec_list.state to the value BEGIN_STATE before calling get_next
+        -:  147:       signals get_next to initialize tail to point to head->next.  */
+        -:  148:    struct List_element *tail;
+        -:  149:
+        -:  150:    /* Used to save state between calls to get_next.  */
+        -:  151:    count state;
+        -:  152:
+        -:  153:    /* Length, in the sense that length ('a-z[:digit:]123abc')
+        -:  154:       is 42 ( = 26 + 10 + 6).  */
+        -:  155:    count length;
+        -:  156:
+        -:  157:    /* The number of [c*] and [c*0] constructs that appear in this spec.  */
+        -:  158:    size_t n_indefinite_repeats;
+        -:  159:
+        -:  160:    /* If n_indefinite_repeats is nonzero, this points to the List_element
+        -:  161:       corresponding to the last [c*] or [c*0] construct encountered in
+        -:  162:       this spec.  Otherwise it is undefined.  */
+        -:  163:    struct List_element *indefinite_repeat_element;
+        -:  164:
+        -:  165:    /* True if this spec contains at least one equivalence
+        -:  166:       class construct e.g. [=c=].  */
+        -:  167:    bool has_equiv_class;
+        -:  168:
+        -:  169:    /* True if this spec contains at least one character class
+        -:  170:       construct.  E.g. [:digit:].  */
+        -:  171:    bool has_char_class;
+        -:  172:
+        -:  173:    /* True if this spec contains at least one of the character class
+        -:  174:       constructs (all but upper and lower) that aren't allowed in s2.  */
+        -:  175:    bool has_restricted_char_class;
+        -:  176:  };
+        -:  177:
+        -:  178:/* A representation for escaped string1 or string2.  As a string is parsed,
+        -:  179:   any backslash-escaped characters (other than octal or \a, \b, \f, \n,
+        -:  180:   etc.) are marked as such in this structure by setting the corresponding
+        -:  181:   entry in the ESCAPED vector.  */
+        -:  182:struct E_string
+        -:  183:{
+        -:  184:  char *s;
+        -:  185:  bool *escaped;
+        -:  186:  size_t len;
+        -:  187:};
+        -:  188:
+        -:  189:/* Return nonzero if the Ith character of escaped string ES matches C
+        -:  190:   and is not escaped itself.  */
+        -:  191:static inline bool
+    #####:  192:es_match (struct E_string const *es, size_t i, char c)
+        -:  193:{
+    #####:  194:  return es->s[i] == c && !es->escaped[i];
+        -:  195:}
+        -:  196:
+        -:  197:/* The name by which this program was run.  */
+        -:  198:char *program_name;
+        -:  199:
+        -:  200:/* When true, each sequence in the input of a repeated character
+        -:  201:   (call it c) is replaced (in the output) by a single occurrence of c
+        -:  202:   for every c in the squeeze set.  */
+        -:  203:static bool squeeze_repeats = false;
+        -:  204:
+        -:  205:/* When true, removes characters in the delete set from input.  */
+        -:  206:static bool delete = false;
+        -:  207:
+        -:  208:/* Use the complement of set1 in place of set1.  */
+        -:  209:static bool complement = false;
+        -:  210:
+        -:  211:/* When tr is performing translation and string1 is longer than string2,
+        -:  212:   POSIX says that the result is unspecified.  That gives the implementor
+        -:  213:   of a POSIX conforming version of tr two reasonable choices for the
+        -:  214:   semantics of this case.
+        -:  215:
+        -:  216:   * The BSD tr pads string2 to the length of string1 by
+        -:  217:   repeating the last character in string2.
+        -:  218:
+        -:  219:   * System V tr ignores characters in string1 that have no
+        -:  220:   corresponding character in string2.  That is, string1 is effectively
+        -:  221:   truncated to the length of string2.
+        -:  222:
+        -:  223:   When nonzero, this flag causes GNU tr to imitate the behavior
+        -:  224:   of System V tr when translating with string1 longer than string2.
+        -:  225:   The default is to emulate BSD tr.  This flag is ignored in modes where
+        -:  226:   no translation is performed.  Emulating the System V tr
+        -:  227:   in this exceptional case causes the relatively common BSD idiom:
+        -:  228:
+        -:  229:       tr -cs A-Za-z0-9 '\012'
+        -:  230:
+        -:  231:   to break (it would convert only zero bytes, rather than all
+        -:  232:   non-alphanumerics, to newlines).
+        -:  233:
+        -:  234:   WARNING: This switch does not provide general BSD or System V
+        -:  235:   compatibility.  For example, it doesn't disable the interpretation
+        -:  236:   of the POSIX constructs [:alpha:], [=c=], and [c*10], so if by
+        -:  237:   some unfortunate coincidence you use such constructs in scripts
+        -:  238:   expecting to use some other version of tr, the scripts will break.  */
+        -:  239:static bool truncate_set1 = false;
+        -:  240:
+        -:  241:/* An alias for (!delete && non_option_args == 2).
+        -:  242:   It is set in main and used there and in validate().  */
+        -:  243:static bool translating;
+        -:  244:
+        -:  245:static char io_buf[BUFSIZ];
+        -:  246:
+        -:  247:static char const *const char_class_name[] =
+        -:  248:{
+        -:  249:  "alnum", "alpha", "blank", "cntrl", "digit", "graph",
+        -:  250:  "lower", "print", "punct", "space", "upper", "xdigit"
+        -:  251:};
+        -:  252:enum { N_CHAR_CLASSES = sizeof char_class_name / sizeof char_class_name[0] };
+        -:  253:
+        -:  254:/* Array of boolean values.  A character `c' is a member of the
+        -:  255:   squeeze set if and only if in_squeeze_set[c] is true.  The squeeze
+        -:  256:   set is defined by the last (possibly, the only) string argument
+        -:  257:   on the command line when the squeeze option is given.  */
+        -:  258:static bool in_squeeze_set[N_CHARS];
+        -:  259:
+        -:  260:/* Array of boolean values.  A character `c' is a member of the
+        -:  261:   delete set if and only if in_delete_set[c] is true.  The delete
+        -:  262:   set is defined by the first (or only) string argument on the
+        -:  263:   command line when the delete option is given.  */
+        -:  264:static bool in_delete_set[N_CHARS];
+        -:  265:
+        -:  266:/* Array of character values defining the translation (if any) that
+        -:  267:   tr is to perform.  Translation is performed only when there are
+        -:  268:   two specification strings and the delete switch is not given.  */
+        -:  269:static char xlate[N_CHARS];
+        -:  270:
+        -:  271:static struct option const long_options[] =
+        -:  272:{
+        -:  273:  {"complement", no_argument, NULL, 'c'},
+        -:  274:  {"delete", no_argument, NULL, 'd'},
+        -:  275:  {"squeeze-repeats", no_argument, NULL, 's'},
+        -:  276:  {"truncate-set1", no_argument, NULL, 't'},
+        -:  277:  {GETOPT_HELP_OPTION_DECL},
+        -:  278:  {GETOPT_VERSION_OPTION_DECL},
+        -:  279:  {NULL, 0, NULL, 0}
+        -:  280:};
+        -:  281:
+        -:  282:void
+    #####:  283:usage (int status)
+        -:  284:{
+    #####:  285:  if (status != EXIT_SUCCESS)
+    #####:  286:    fprintf (stderr, _("Try `%s --help' for more information.\n"),
+        -:  287:	     program_name);
+        -:  288:  else
+        -:  289:    {
+    #####:  290:      printf (_("\
+        -:  291:Usage: %s [OPTION]... SET1 [SET2]\n\
+        -:  292:"),
+        -:  293:	      program_name);
+    #####:  294:      fputs (_("\
+        -:  295:Translate, squeeze, and/or delete characters from standard input,\n\
+        -:  296:writing to standard output.\n\
+        -:  297:\n\
+        -:  298:  -c, -C, --complement    first complement SET1\n\
+        -:  299:  -d, --delete            delete characters in SET1, do not translate\n\
+        -:  300:  -s, --squeeze-repeats   replace each input sequence of a repeated character\n\
+        -:  301:                            that is listed in SET1 with a single occurrence\n\
+        -:  302:                            of that character\n\
+        -:  303:  -t, --truncate-set1     first truncate SET1 to length of SET2\n\
+        -:  304:"), stdout);
+    #####:  305:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  306:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  307:      fputs (_("\
+        -:  308:\n\
+        -:  309:SETs are specified as strings of characters.  Most represent themselves.\n\
+        -:  310:Interpreted sequences are:\n\
+        -:  311:\n\
+        -:  312:  \\NNN            character with octal value NNN (1 to 3 octal digits)\n\
+        -:  313:  \\\\              backslash\n\
+        -:  314:  \\a              audible BEL\n\
+        -:  315:  \\b              backspace\n\
+        -:  316:  \\f              form feed\n\
+        -:  317:  \\n              new line\n\
+        -:  318:  \\r              return\n\
+        -:  319:  \\t              horizontal tab\n\
+        -:  320:"), stdout);
+    #####:  321:     fputs (_("\
+        -:  322:  \\v              vertical tab\n\
+        -:  323:  CHAR1-CHAR2     all characters from CHAR1 to CHAR2 in ascending order\n\
+        -:  324:  [CHAR*]         in SET2, copies of CHAR until length of SET1\n\
+        -:  325:  [CHAR*REPEAT]   REPEAT copies of CHAR, REPEAT octal if starting with 0\n\
+        -:  326:  [:alnum:]       all letters and digits\n\
+        -:  327:  [:alpha:]       all letters\n\
+        -:  328:  [:blank:]       all horizontal whitespace\n\
+        -:  329:  [:cntrl:]       all control characters\n\
+        -:  330:  [:digit:]       all digits\n\
+        -:  331:"), stdout);
+    #####:  332:     fputs (_("\
+        -:  333:  [:graph:]       all printable characters, not including space\n\
+        -:  334:  [:lower:]       all lower case letters\n\
+        -:  335:  [:print:]       all printable characters, including space\n\
+        -:  336:  [:punct:]       all punctuation characters\n\
+        -:  337:  [:space:]       all horizontal or vertical whitespace\n\
+        -:  338:  [:upper:]       all upper case letters\n\
+        -:  339:  [:xdigit:]      all hexadecimal digits\n\
+        -:  340:  [=CHAR=]        all characters which are equivalent to CHAR\n\
+        -:  341:"), stdout);
+    #####:  342:     fputs (_("\
+        -:  343:\n\
+        -:  344:Translation occurs if -d is not given and both SET1 and SET2 appear.\n\
+        -:  345:-t may be used only when translating.  SET2 is extended to length of\n\
+        -:  346:SET1 by repeating its last character as necessary.  \
+        -:  347:"), stdout);
+    #####:  348:     fputs (_("\
+        -:  349:Excess characters\n\
+        -:  350:of SET2 are ignored.  Only [:lower:] and [:upper:] are guaranteed to\n\
+        -:  351:expand in ascending order; used in SET2 while translating, they may\n\
+        -:  352:only be used in pairs to specify case conversion.  \
+        -:  353:"), stdout);
+    #####:  354:     fputs (_("\
+        -:  355:-s uses SET1 if not\n\
+        -:  356:translating nor deleting; else squeezing uses SET2 and occurs after\n\
+        -:  357:translation or deletion.\n\
+        -:  358:"), stdout);
+    #####:  359:      emit_bug_reporting_address ();
+        -:  360:    }
+    #####:  361:  exit (status);
+        -:  362:}
+        -:  363:
+        -:  364:/* Return nonzero if the character C is a member of the
+        -:  365:   equivalence class containing the character EQUIV_CLASS.  */
+        -:  366:
+        -:  367:static inline bool
+    #####:  368:is_equiv_class_member (unsigned char equiv_class, unsigned char c)
+        -:  369:{
+    #####:  370:  return (equiv_class == c);
+        -:  371:}
+        -:  372:
+        -:  373:/* Return true if the character C is a member of the
+        -:  374:   character class CHAR_CLASS.  */
+        -:  375:
+        -:  376:static bool
+    #####:  377:is_char_class_member (enum Char_class char_class, unsigned char c)
+        -:  378:{
+        -:  379:  int result;
+        -:  380:
+    #####:  381:  switch (char_class)
+        -:  382:    {
+        -:  383:    case CC_ALNUM:
+    #####:  384:      result = isalnum (c);
+    #####:  385:      break;
+        -:  386:    case CC_ALPHA:
+    #####:  387:      result = isalpha (c);
+    #####:  388:      break;
+        -:  389:    case CC_BLANK:
+    #####:  390:      result = isblank (c);
+    #####:  391:      break;
+        -:  392:    case CC_CNTRL:
+    #####:  393:      result = iscntrl (c);
+    #####:  394:      break;
+        -:  395:    case CC_DIGIT:
+    #####:  396:      result = isdigit (c);
+    #####:  397:      break;
+        -:  398:    case CC_GRAPH:
+    #####:  399:      result = isgraph (c);
+    #####:  400:      break;
+        -:  401:    case CC_LOWER:
+    #####:  402:      result = islower (c);
+    #####:  403:      break;
+        -:  404:    case CC_PRINT:
+    #####:  405:      result = isprint (c);
+    #####:  406:      break;
+        -:  407:    case CC_PUNCT:
+    #####:  408:      result = ispunct (c);
+    #####:  409:      break;
+        -:  410:    case CC_SPACE:
+    #####:  411:      result = isspace (c);
+    #####:  412:      break;
+        -:  413:    case CC_UPPER:
+    #####:  414:      result = isupper (c);
+    #####:  415:      break;
+        -:  416:    case CC_XDIGIT:
+    #####:  417:      result = isxdigit (c);
+    #####:  418:      break;
+        -:  419:    default:
+    #####:  420:      abort ();
+        -:  421:      break;
+        -:  422:    }
+        -:  423:
+    #####:  424:  return !! result;
+        -:  425:}
+        -:  426:
+        -:  427:static void
+       36:  428:es_free (struct E_string *es)
+        -:  429:{
+       36:  430:  free (es->s);
+       36:  431:  free (es->escaped);
+       36:  432:}
+        -:  433:
+        -:  434:/* Perform the first pass over each range-spec argument S, converting all
+        -:  435:   \c and \ddd escapes to their one-byte representations.  If an invalid
+        -:  436:   quote sequence is found print an error message and return false;
+        -:  437:   Otherwise set *ES to the resulting string and return true.
+        -:  438:   The resulting array of characters may contain zero-bytes;
+        -:  439:   however, on input, S is assumed to be null-terminated, and hence
+        -:  440:   cannot contain actual (non-escaped) zero bytes.  */
+        -:  441:
+        -:  442:static bool
+       36:  443:unquote (char const *s, struct E_string *es)
+        -:  444:{
+        -:  445:  size_t i, j;
+       36:  446:  size_t len = strlen (s);
+        -:  447:
+       36:  448:  es->s = xmalloc (len);
+       36:  449:  es->escaped = xcalloc (len, sizeof es->escaped[0]);
+        -:  450:
+       36:  451:  j = 0;
+       72:  452:  for (i = 0; s[i]; i++)
+        -:  453:    {
+        -:  454:      unsigned char c;
+        -:  455:      int oct_digit;
+        -:  456:
+       36:  457:      switch (s[i])
+        -:  458:	{
+        -:  459:	case '\\':
+       18:  460:	  es->escaped[j] = true;
+       18:  461:	  switch (s[i + 1])
+        -:  462:	    {
+        -:  463:	    case '\\':
+    #####:  464:	      c = '\\';
+    #####:  465:	      break;
+        -:  466:	    case 'a':
+    #####:  467:	      c = '\a';
+    #####:  468:	      break;
+        -:  469:	    case 'b':
+    #####:  470:	      c = '\b';
+    #####:  471:	      break;
+        -:  472:	    case 'f':
+    #####:  473:	      c = '\f';
+    #####:  474:	      break;
+        -:  475:	    case 'n':
+       18:  476:	      c = '\n';
+       18:  477:	      break;
+        -:  478:	    case 'r':
+    #####:  479:	      c = '\r';
+    #####:  480:	      break;
+        -:  481:	    case 't':
+    #####:  482:	      c = '\t';
+    #####:  483:	      break;
+        -:  484:	    case 'v':
+    #####:  485:	      c = '\v';
+    #####:  486:	      break;
+        -:  487:	    case '0':
+        -:  488:	    case '1':
+        -:  489:	    case '2':
+        -:  490:	    case '3':
+        -:  491:	    case '4':
+        -:  492:	    case '5':
+        -:  493:	    case '6':
+        -:  494:	    case '7':
+    #####:  495:	      c = s[i + 1] - '0';
+    #####:  496:	      oct_digit = s[i + 2] - '0';
+    #####:  497:	      if (0 <= oct_digit && oct_digit <= 7)
+        -:  498:		{
+    #####:  499:		  c = 8 * c + oct_digit;
+    #####:  500:		  ++i;
+    #####:  501:		  oct_digit = s[i + 2] - '0';
+    #####:  502:		  if (0 <= oct_digit && oct_digit <= 7)
+        -:  503:		    {
+    #####:  504:		      if (8 * c + oct_digit < N_CHARS)
+        -:  505:			{
+    #####:  506:			  c = 8 * c + oct_digit;
+    #####:  507:			  ++i;
+        -:  508:			}
+        -:  509:		      else
+        -:  510:			{
+        -:  511:			  /* A 3-digit octal number larger than \377 won't
+        -:  512:			     fit in 8 bits.  So we stop when adding the
+        -:  513:			     next digit would put us over the limit and
+        -:  514:			     give a warning about the ambiguity.  POSIX
+        -:  515:			     isn't clear on this, and we interpret this
+        -:  516:			     lack of clarity as meaning the resulting behavior
+        -:  517:			     is undefined, which means we're allowed to issue
+        -:  518:			     a warning.  */
+    #####:  519:			  error (0, 0, _("warning: the ambiguous octal escape \
+        -:  520:\\%c%c%c is being\n\tinterpreted as the 2-byte sequence \\0%c%c, %c"),
+    #####:  521:				 s[i], s[i + 1], s[i + 2],
+    #####:  522:				 s[i], s[i + 1], s[i + 2]);
+        -:  523:			}
+        -:  524:		    }
+        -:  525:		}
+    #####:  526:	      break;
+        -:  527:	    case '\0':
+        -:  528:	      /* POSIX seems to require that a trailing backslash must
+        -:  529:		 stand for itself.  Weird.  */
+    #####:  530:	      es->escaped[j] = false;
+    #####:  531:	      i--;
+    #####:  532:	      c = '\\';
+    #####:  533:	      break;
+        -:  534:	    default:
+    #####:  535:	      c = s[i + 1];
+    #####:  536:	      break;
+        -:  537:	    }
+       18:  538:	  ++i;
+       18:  539:	  es->s[j++] = c;
+       18:  540:	  break;
+        -:  541:	default:
+       18:  542:	  es->s[j++] = s[i];
+       18:  543:	  break;
+        -:  544:	}
+        -:  545:    }
+       36:  546:  es->len = j;
+       36:  547:  return true;
+        -:  548:}
+        -:  549:
+        -:  550:/* If CLASS_STR is a valid character class string, return its index
+        -:  551:   in the global char_class_name array.  Otherwise, return CC_NO_CLASS.  */
+        -:  552:
+        -:  553:static enum Char_class
+    #####:  554:look_up_char_class (char const *class_str, size_t len)
+        -:  555:{
+        -:  556:  enum Char_class i;
+        -:  557:
+    #####:  558:  for (i = 0; i < N_CHAR_CLASSES; i++)
+    #####:  559:    if (strncmp (class_str, char_class_name[i], len) == 0
+    #####:  560:	&& strlen (char_class_name[i]) == len)
+    #####:  561:      return i;
+    #####:  562:  return CC_NO_CLASS;
+        -:  563:}
+        -:  564:
+        -:  565:/* Return a newly allocated string with a printable version of C.
+        -:  566:   This function is used solely for formatting error messages.  */
+        -:  567:
+        -:  568:static char *
+    #####:  569:make_printable_char (unsigned char c)
+        -:  570:{
+    #####:  571:  char *buf = xmalloc (5);
+        -:  572:
+    #####:  573:  if (isprint (c))
+        -:  574:    {
+    #####:  575:      buf[0] = c;
+    #####:  576:      buf[1] = '\0';
+        -:  577:    }
+        -:  578:  else
+        -:  579:    {
+    #####:  580:      sprintf (buf, "\\%03o", c);
+        -:  581:    }
+    #####:  582:  return buf;
+        -:  583:}
+        -:  584:
+        -:  585:/* Return a newly allocated copy of S which is suitable for printing.
+        -:  586:   LEN is the number of characters in S.  Most non-printing
+        -:  587:   (isprint) characters are represented by a backslash followed by
+        -:  588:   3 octal digits.  However, the characters represented by \c escapes
+        -:  589:   where c is one of [abfnrtv] are represented by their 2-character \c
+        -:  590:   sequences.  This function is used solely for printing error messages.  */
+        -:  591:
+        -:  592:static char *
+    #####:  593:make_printable_str (char const *s, size_t len)
+        -:  594:{
+        -:  595:  /* Worst case is that every character expands to a backslash
+        -:  596:     followed by a 3-character octal escape sequence.  */
+    #####:  597:  char *printable_buf = xnmalloc (len + 1, 4);
+    #####:  598:  char *p = printable_buf;
+        -:  599:  size_t i;
+        -:  600:
+    #####:  601:  for (i = 0; i < len; i++)
+        -:  602:    {
+        -:  603:      char buf[5];
+    #####:  604:      char const *tmp = NULL;
+    #####:  605:      unsigned char c = s[i];
+        -:  606:
+    #####:  607:      switch (c)
+        -:  608:	{
+        -:  609:	case '\\':
+    #####:  610:	  tmp = "\\";
+    #####:  611:	  break;
+        -:  612:	case '\a':
+    #####:  613:	  tmp = "\\a";
+    #####:  614:	  break;
+        -:  615:	case '\b':
+    #####:  616:	  tmp = "\\b";
+    #####:  617:	  break;
+        -:  618:	case '\f':
+    #####:  619:	  tmp = "\\f";
+    #####:  620:	  break;
+        -:  621:	case '\n':
+    #####:  622:	  tmp = "\\n";
+    #####:  623:	  break;
+        -:  624:	case '\r':
+    #####:  625:	  tmp = "\\r";
+    #####:  626:	  break;
+        -:  627:	case '\t':
+    #####:  628:	  tmp = "\\t";
+    #####:  629:	  break;
+        -:  630:	case '\v':
+    #####:  631:	  tmp = "\\v";
+    #####:  632:	  break;
+        -:  633:	default:
+    #####:  634:	  if (isprint (c))
+        -:  635:	    {
+    #####:  636:	      buf[0] = c;
+    #####:  637:	      buf[1] = '\0';
+        -:  638:	    }
+        -:  639:	  else
+    #####:  640:	    sprintf (buf, "\\%03o", c);
+    #####:  641:	  tmp = buf;
+    #####:  642:	  break;
+        -:  643:	}
+    #####:  644:      p = stpcpy (p, tmp);
+        -:  645:    }
+    #####:  646:  return printable_buf;
+        -:  647:}
+        -:  648:
+        -:  649:/* Append a newly allocated structure representing a
+        -:  650:   character C to the specification list LIST.  */
+        -:  651:
+        -:  652:static void
+       36:  653:append_normal_char (struct Spec_list *list, unsigned char c)
+        -:  654:{
+        -:  655:  struct List_element *new;
+        -:  656:
+       36:  657:  new = xmalloc (sizeof *new);
+       36:  658:  new->next = NULL;
+       36:  659:  new->type = RE_NORMAL_CHAR;
+       36:  660:  new->u.normal_char = c;
+       36:  661:  assert (list->tail);
+       36:  662:  list->tail->next = new;
+       36:  663:  list->tail = new;
+       36:  664:}
+        -:  665:
+        -:  666:/* Append a newly allocated structure representing the range
+        -:  667:   of characters from FIRST to LAST to the specification list LIST.
+        -:  668:   Return false if LAST precedes FIRST in the collating sequence,
+        -:  669:   true otherwise.  This means that '[c-c]' is acceptable.  */
+        -:  670:
+        -:  671:static bool
+    #####:  672:append_range (struct Spec_list *list, unsigned char first, unsigned char last)
+        -:  673:{
+        -:  674:  struct List_element *new;
+        -:  675:
+    #####:  676:  if (last < first)
+        -:  677:    {
+    #####:  678:      char *tmp1 = make_printable_char (first);
+    #####:  679:      char *tmp2 = make_printable_char (last);
+        -:  680:
+    #####:  681:      error (0, 0,
+        -:  682:       _("range-endpoints of `%s-%s' are in reverse collating sequence order"),
+        -:  683:	     tmp1, tmp2);
+    #####:  684:      free (tmp1);
+    #####:  685:      free (tmp2);
+    #####:  686:      return false;
+        -:  687:    }
+    #####:  688:  new = xmalloc (sizeof *new);
+    #####:  689:  new->next = NULL;
+    #####:  690:  new->type = RE_RANGE;
+    #####:  691:  new->u.range.first_char = first;
+    #####:  692:  new->u.range.last_char = last;
+    #####:  693:  assert (list->tail);
+    #####:  694:  list->tail->next = new;
+    #####:  695:  list->tail = new;
+    #####:  696:  return true;
+        -:  697:}
+        -:  698:
+        -:  699:/* If CHAR_CLASS_STR is a valid character class string, append a
+        -:  700:   newly allocated structure representing that character class to the end
+        -:  701:   of the specification list LIST and return true.  If CHAR_CLASS_STR is not
+        -:  702:   a valid string return false.  */
+        -:  703:
+        -:  704:static bool
+    #####:  705:append_char_class (struct Spec_list *list,
+        -:  706:		   char const *char_class_str, size_t len)
+        -:  707:{
+        -:  708:  enum Char_class char_class;
+        -:  709:  struct List_element *new;
+        -:  710:
+    #####:  711:  char_class = look_up_char_class (char_class_str, len);
+    #####:  712:  if (char_class == CC_NO_CLASS)
+    #####:  713:    return false;
+    #####:  714:  new = xmalloc (sizeof *new);
+    #####:  715:  new->next = NULL;
+    #####:  716:  new->type = RE_CHAR_CLASS;
+    #####:  717:  new->u.char_class = char_class;
+    #####:  718:  assert (list->tail);
+    #####:  719:  list->tail->next = new;
+    #####:  720:  list->tail = new;
+    #####:  721:  return true;
+        -:  722:}
+        -:  723:
+        -:  724:/* Append a newly allocated structure representing a [c*n]
+        -:  725:   repeated character construct to the specification list LIST.
+        -:  726:   THE_CHAR is the single character to be repeated, and REPEAT_COUNT
+        -:  727:   is a non-negative repeat count.  */
+        -:  728:
+        -:  729:static void
+    #####:  730:append_repeated_char (struct Spec_list *list, unsigned char the_char,
+        -:  731:		      count repeat_count)
+        -:  732:{
+        -:  733:  struct List_element *new;
+        -:  734:
+    #####:  735:  new = xmalloc (sizeof *new);
+    #####:  736:  new->next = NULL;
+    #####:  737:  new->type = RE_REPEATED_CHAR;
+    #####:  738:  new->u.repeated_char.the_repeated_char = the_char;
+    #####:  739:  new->u.repeated_char.repeat_count = repeat_count;
+    #####:  740:  assert (list->tail);
+    #####:  741:  list->tail->next = new;
+    #####:  742:  list->tail = new;
+    #####:  743:}
+        -:  744:
+        -:  745:/* Given a string, EQUIV_CLASS_STR, from a [=str=] context and
+        -:  746:   the length of that string, LEN, if LEN is exactly one, append
+        -:  747:   a newly allocated structure representing the specified
+        -:  748:   equivalence class to the specification list, LIST and return true.
+        -:  749:   If LEN is not 1, return false.  */
+        -:  750:
+        -:  751:static bool
+    #####:  752:append_equiv_class (struct Spec_list *list,
+        -:  753:		    char const *equiv_class_str, size_t len)
+        -:  754:{
+        -:  755:  struct List_element *new;
+        -:  756:
+    #####:  757:  if (len != 1)
+    #####:  758:    return false;
+    #####:  759:  new = xmalloc (sizeof *new);
+    #####:  760:  new->next = NULL;
+    #####:  761:  new->type = RE_EQUIV_CLASS;
+    #####:  762:  new->u.equiv_code = *equiv_class_str;
+    #####:  763:  assert (list->tail);
+    #####:  764:  list->tail->next = new;
+    #####:  765:  list->tail = new;
+    #####:  766:  return true;
+        -:  767:}
+        -:  768:
+        -:  769:/* Search forward starting at START_IDX for the 2-char sequence
+        -:  770:   (PRE_BRACKET_CHAR,']') in the string P of length P_LEN.  If such
+        -:  771:   a sequence is found, set *RESULT_IDX to the index of the first
+        -:  772:   character and return true.  Otherwise return false.  P may contain
+        -:  773:   zero bytes.  */
+        -:  774:
+        -:  775:static bool
+    #####:  776:find_closing_delim (const struct E_string *es, size_t start_idx,
+        -:  777:		    char pre_bracket_char, size_t *result_idx)
+        -:  778:{
+        -:  779:  size_t i;
+        -:  780:
+    #####:  781:  for (i = start_idx; i < es->len - 1; i++)
+    #####:  782:    if (es->s[i] == pre_bracket_char && es->s[i + 1] == ']'
+    #####:  783:	&& !es->escaped[i] && !es->escaped[i + 1])
+        -:  784:      {
+    #####:  785:	*result_idx = i;
+    #####:  786:	return true;
+        -:  787:      }
+    #####:  788:  return false;
+        -:  789:}
+        -:  790:
+        -:  791:/* Parse the bracketed repeat-char syntax.  If the P_LEN characters
+        -:  792:   beginning with P[ START_IDX ] comprise a valid [c*n] construct,
+        -:  793:   then set *CHAR_TO_REPEAT, *REPEAT_COUNT, and *CLOSING_BRACKET_IDX
+        -:  794:   and return zero. If the second character following
+        -:  795:   the opening bracket is not `*' or if no closing bracket can be
+        -:  796:   found, return -1.  If a closing bracket is found and the
+        -:  797:   second char is `*', but the string between the `*' and `]' isn't
+        -:  798:   empty, an octal number, or a decimal number, print an error message
+        -:  799:   and return -2.  */
+        -:  800:
+        -:  801:static int
+    #####:  802:find_bracketed_repeat (const struct E_string *es, size_t start_idx,
+        -:  803:		       unsigned char *char_to_repeat, count *repeat_count,
+        -:  804:		       size_t *closing_bracket_idx)
+        -:  805:{
+        -:  806:  size_t i;
+        -:  807:
+    #####:  808:  assert (start_idx + 1 < es->len);
+    #####:  809:  if (!es_match (es, start_idx + 1, '*'))
+    #####:  810:    return -1;
+        -:  811:
+    #####:  812:  for (i = start_idx + 2; i < es->len && !es->escaped[i]; i++)
+        -:  813:    {
+    #####:  814:      if (es->s[i] == ']')
+        -:  815:	{
+    #####:  816:	  size_t digit_str_len = i - start_idx - 2;
+        -:  817:
+    #####:  818:	  *char_to_repeat = es->s[start_idx];
+    #####:  819:	  if (digit_str_len == 0)
+        -:  820:	    {
+        -:  821:	      /* We've matched [c*] -- no explicit repeat count.  */
+    #####:  822:	      *repeat_count = 0;
+        -:  823:	    }
+        -:  824:	  else
+        -:  825:	    {
+        -:  826:	      /* Here, we have found [c*s] where s should be a string
+        -:  827:		 of octal (if it starts with `0') or decimal digits.  */
+    #####:  828:	      char const *digit_str = &es->s[start_idx + 2];
+        -:  829:	      char *d_end;
+    #####:  830:	      if ((xstrtoumax (digit_str, &d_end, *digit_str == '0' ? 8 : 10,
+        -:  831:			       repeat_count, NULL)
+        -:  832:		   != LONGINT_OK)
+    #####:  833:		  || REPEAT_COUNT_MAXIMUM < *repeat_count
+    #####:  834:		  || digit_str + digit_str_len != d_end)
+        -:  835:		{
+    #####:  836:		  char *tmp = make_printable_str (digit_str, digit_str_len);
+    #####:  837:		  error (0, 0,
+        -:  838:			 _("invalid repeat count %s in [c*n] construct"),
+        -:  839:			 quote (tmp));
+    #####:  840:		  free (tmp);
+    #####:  841:		  return -2;
+        -:  842:		}
+        -:  843:	    }
+    #####:  844:	  *closing_bracket_idx = i;
+    #####:  845:	  return 0;
+        -:  846:	}
+        -:  847:    }
+    #####:  848:  return -1;			/* No bracket found.  */
+        -:  849:}
+        -:  850:
+        -:  851:/* Return true if the string at ES->s[IDX] matches the regular
+        -:  852:   expression `\*[0-9]*\]', false otherwise.  The string does not
+        -:  853:   match if any of its characters are escaped.  */
+        -:  854:
+        -:  855:static bool
+    #####:  856:star_digits_closebracket (const struct E_string *es, size_t idx)
+        -:  857:{
+        -:  858:  size_t i;
+        -:  859:
+    #####:  860:  if (!es_match (es, idx, '*'))
+    #####:  861:    return false;
+        -:  862:
+    #####:  863:  for (i = idx + 1; i < es->len; i++)
+    #####:  864:    if (!ISDIGIT (to_uchar (es->s[i])) || es->escaped[i])
+    #####:  865:      return es_match (es, i, ']');
+    #####:  866:  return false;
+        -:  867:}
+        -:  868:
+        -:  869:/* Convert string UNESCAPED_STRING (which has been preprocessed to
+        -:  870:   convert backslash-escape sequences) of length LEN characters into
+        -:  871:   a linked list of the following 5 types of constructs:
+        -:  872:      - [:str:] Character class where `str' is one of the 12 valid strings.
+        -:  873:      - [=c=] Equivalence class where `c' is any single character.
+        -:  874:      - [c*n] Repeat the single character `c' `n' times. n may be omitted.
+        -:  875:	  However, if `n' is present, it must be a non-negative octal or
+        -:  876:	  decimal integer.
+        -:  877:      - r-s Range of characters from `r' to `s'.  The second endpoint must
+        -:  878:	  not precede the first in the current collating sequence.
+        -:  879:      - c Any other character is interpreted as itself.  */
+        -:  880:
+        -:  881:static bool
+       36:  882:build_spec_list (const struct E_string *es, struct Spec_list *result)
+        -:  883:{
+        -:  884:  char const *p;
+        -:  885:  size_t i;
+        -:  886:
+       36:  887:  p = es->s;
+        -:  888:
+        -:  889:  /* The main for-loop below recognizes the 4 multi-character constructs.
+        -:  890:     A character that matches (in its context) none of the multi-character
+        -:  891:     constructs is classified as `normal'.  Since all multi-character
+        -:  892:     constructs have at least 3 characters, any strings of length 2 or
+        -:  893:     less are composed solely of normal characters.  Hence, the index of
+        -:  894:     the outer for-loop runs only as far as LEN-2.  */
+        -:  895:
+       72:  896:  for (i = 0; i + 2 < es->len; /* empty */)
+        -:  897:    {
+    #####:  898:      if (es_match (es, i, '['))
+        -:  899:	{
+        -:  900:	  bool matched_multi_char_construct;
+        -:  901:	  size_t closing_bracket_idx;
+        -:  902:	  unsigned char char_to_repeat;
+        -:  903:	  count repeat_count;
+        -:  904:	  int err;
+        -:  905:
+    #####:  906:	  matched_multi_char_construct = true;
+    #####:  907:	  if (es_match (es, i + 1, ':') || es_match (es, i + 1, '='))
+        -:  908:	    {
+        -:  909:	      size_t closing_delim_idx;
+        -:  910:
+    #####:  911:	      if (find_closing_delim (es, i + 2, p[i + 1], &closing_delim_idx))
+        -:  912:		{
+    #####:  913:		  size_t opnd_str_len = closing_delim_idx - 1 - (i + 2) + 1;
+    #####:  914:		  char const *opnd_str = p + i + 2;
+        -:  915:
+    #####:  916:		  if (opnd_str_len == 0)
+        -:  917:		    {
+    #####:  918:		      if (p[i + 1] == ':')
+    #####:  919:			error (0, 0, _("missing character class name `[::]'"));
+        -:  920:		      else
+    #####:  921:			error (0, 0,
+        -:  922:			       _("missing equivalence class character `[==]'"));
+    #####:  923:		      return false;
+        -:  924:		    }
+        -:  925:
+    #####:  926:		  if (p[i + 1] == ':')
+        -:  927:		    {
+        -:  928:		      /* FIXME: big comment.  */
+    #####:  929:		      if (!append_char_class (result, opnd_str, opnd_str_len))
+        -:  930:			{
+    #####:  931:			  if (star_digits_closebracket (es, i + 2))
+    #####:  932:			    goto try_bracketed_repeat;
+        -:  933:			  else
+        -:  934:			    {
+    #####:  935:			      char *tmp = make_printable_str (opnd_str,
+        -:  936:							      opnd_str_len);
+    #####:  937:			      error (0, 0, _("invalid character class %s"),
+        -:  938:				     quote (tmp));
+    #####:  939:			      free (tmp);
+    #####:  940:			      return false;
+        -:  941:			    }
+        -:  942:			}
+        -:  943:		    }
+        -:  944:		  else
+        -:  945:		    {
+        -:  946:		      /* FIXME: big comment.  */
+    #####:  947:		      if (!append_equiv_class (result, opnd_str, opnd_str_len))
+        -:  948:			{
+    #####:  949:			  if (star_digits_closebracket (es, i + 2))
+    #####:  950:			    goto try_bracketed_repeat;
+        -:  951:			  else
+        -:  952:			    {
+    #####:  953:			      char *tmp = make_printable_str (opnd_str,
+        -:  954:							      opnd_str_len);
+    #####:  955:			      error (0, 0,
+        -:  956:	       _("%s: equivalence class operand must be a single character"),
+        -:  957:				     tmp);
+    #####:  958:			      free (tmp);
+    #####:  959:			      return false;
+        -:  960:			    }
+        -:  961:			}
+        -:  962:		    }
+        -:  963:
+    #####:  964:		  i = closing_delim_idx + 2;
+    #####:  965:		  continue;
+        -:  966:		}
+        -:  967:	      /* Else fall through.  This could be [:*] or [=*].  */
+        -:  968:	    }
+        -:  969:
+        -:  970:	try_bracketed_repeat:
+        -:  971:
+        -:  972:	  /* Determine whether this is a bracketed repeat range
+        -:  973:	     matching the RE \[.\*(dec_or_oct_number)?\].  */
+    #####:  974:	  err = find_bracketed_repeat (es, i + 1, &char_to_repeat,
+        -:  975:				       &repeat_count,
+        -:  976:				       &closing_bracket_idx);
+    #####:  977:	  if (err == 0)
+        -:  978:	    {
+    #####:  979:	      append_repeated_char (result, char_to_repeat, repeat_count);
+    #####:  980:	      i = closing_bracket_idx + 1;
+        -:  981:	    }
+    #####:  982:	  else if (err == -1)
+        -:  983:	    {
+    #####:  984:	      matched_multi_char_construct = false;
+        -:  985:	    }
+        -:  986:	  else
+        -:  987:	    {
+        -:  988:	      /* Found a string that looked like [c*n] but the
+        -:  989:		 numeric part was invalid.  */
+    #####:  990:	      return false;
+        -:  991:	    }
+        -:  992:
+    #####:  993:	  if (matched_multi_char_construct)
+    #####:  994:	    continue;
+        -:  995:
+        -:  996:	  /* We reach this point if P does not match [:str:], [=c=],
+        -:  997:	     [c*n], or [c*].  Now, see if P looks like a range `[-c'
+        -:  998:	     (from `[' to `c').  */
+        -:  999:	}
+        -: 1000:
+        -: 1001:      /* Look ahead one char for ranges like a-z.  */
+    #####: 1002:      if (es_match (es, i + 1, '-'))
+        -: 1003:	{
+    #####: 1004:	  if (!append_range (result, p[i], p[i + 2]))
+    #####: 1005:	    return false;
+    #####: 1006:	  i += 3;
+        -: 1007:	}
+        -: 1008:      else
+        -: 1009:	{
+    #####: 1010:	  append_normal_char (result, p[i]);
+    #####: 1011:	  ++i;
+        -: 1012:	}
+        -: 1013:    }
+        -: 1014:
+        -: 1015:  /* Now handle the (2 or fewer) remaining characters p[i]..p[es->len - 1].  */
+       72: 1016:  for (; i < es->len; i++)
+       36: 1017:    append_normal_char (result, p[i]);
+        -: 1018:
+       36: 1019:  return true;
+        -: 1020:}
+        -: 1021:
+        -: 1022:/* Given a Spec_list S (with its saved state implicit in the values
+        -: 1023:   of its members `tail' and `state'), return the next single character
+        -: 1024:   in the expansion of S's constructs.  If the last character of S was
+        -: 1025:   returned on the previous call or if S was empty, this function
+        -: 1026:   returns -1.  For example, successive calls to get_next where S
+        -: 1027:   represents the spec-string 'a-d[y*3]' will return the sequence
+        -: 1028:   of values a, b, c, d, y, y, y, -1.  Finally, if the construct from
+        -: 1029:   which the returned character comes is [:upper:] or [:lower:], the
+        -: 1030:   parameter CLASS is given a value to indicate which it was.  Otherwise
+        -: 1031:   CLASS is set to UL_NONE.  This value is used only when constructing
+        -: 1032:   the translation table to verify that any occurrences of upper and
+        -: 1033:   lower class constructs in the spec-strings appear in the same relative
+        -: 1034:   positions.  */
+        -: 1035:
+        -: 1036:static int
+      104: 1037:get_next (struct Spec_list *s, enum Upper_Lower_class *class)
+        -: 1038:{
+        -: 1039:  struct List_element *p;
+        -: 1040:  int return_val;
+        -: 1041:  int i;
+        -: 1042:
+      104: 1043:  if (class)
+       72: 1044:    *class = UL_NONE;
+        -: 1045:
+      104: 1046:  if (s->state == BEGIN_STATE)
+        -: 1047:    {
+       52: 1048:      s->tail = s->head->next;
+       52: 1049:      s->state = NEW_ELEMENT;
+        -: 1050:    }
+        -: 1051:
+      104: 1052:  p = s->tail;
+      104: 1053:  if (p == NULL)
+       52: 1054:    return -1;
+        -: 1055:
+       52: 1056:  switch (p->type)
+        -: 1057:    {
+        -: 1058:    case RE_NORMAL_CHAR:
+       52: 1059:      return_val = p->u.normal_char;
+       52: 1060:      s->state = NEW_ELEMENT;
+       52: 1061:      s->tail = p->next;
+       52: 1062:      break;
+        -: 1063:
+        -: 1064:    case RE_RANGE:
+    #####: 1065:      if (s->state == NEW_ELEMENT)
+    #####: 1066:	s->state = p->u.range.first_char;
+        -: 1067:      else
+    #####: 1068:	++(s->state);
+    #####: 1069:      return_val = s->state;
+    #####: 1070:      if (s->state == p->u.range.last_char)
+        -: 1071:	{
+    #####: 1072:	  s->tail = p->next;
+    #####: 1073:	  s->state = NEW_ELEMENT;
+        -: 1074:	}
+    #####: 1075:      break;
+        -: 1076:
+        -: 1077:    case RE_CHAR_CLASS:
+    #####: 1078:      if (class)
+        -: 1079:	{
+        -: 1080:	  bool upper_or_lower;
+    #####: 1081:	  switch (p->u.char_class)
+        -: 1082:	    {
+        -: 1083:	    case CC_LOWER:
+    #####: 1084:	      *class = UL_LOWER;
+    #####: 1085:	      upper_or_lower = true;
+    #####: 1086:	      break;
+        -: 1087:	    case CC_UPPER:
+    #####: 1088:	      *class = UL_UPPER;
+    #####: 1089:	      upper_or_lower = true;
+    #####: 1090:	      break;
+        -: 1091:	    default:
+    #####: 1092:	      upper_or_lower = false;
+    #####: 1093:	      break;
+        -: 1094:	    }
+        -: 1095:
+    #####: 1096:	  if (upper_or_lower)
+        -: 1097:	    {
+    #####: 1098:	      s->tail = p->next;
+    #####: 1099:	      s->state = NEW_ELEMENT;
+    #####: 1100:	      return_val = 0;
+    #####: 1101:	      break;
+        -: 1102:	    }
+        -: 1103:	}
+        -: 1104:
+    #####: 1105:      if (s->state == NEW_ELEMENT)
+        -: 1106:	{
+    #####: 1107:	  for (i = 0; i < N_CHARS; i++)
+    #####: 1108:	    if (is_char_class_member (p->u.char_class, i))
+    #####: 1109:	      break;
+    #####: 1110:	  assert (i < N_CHARS);
+    #####: 1111:	  s->state = i;
+        -: 1112:	}
+    #####: 1113:      assert (is_char_class_member (p->u.char_class, s->state));
+    #####: 1114:      return_val = s->state;
+    #####: 1115:      for (i = s->state + 1; i < N_CHARS; i++)
+    #####: 1116:	if (is_char_class_member (p->u.char_class, i))
+    #####: 1117:	  break;
+    #####: 1118:      if (i < N_CHARS)
+    #####: 1119:	s->state = i;
+        -: 1120:      else
+        -: 1121:	{
+    #####: 1122:	  s->tail = p->next;
+    #####: 1123:	  s->state = NEW_ELEMENT;
+        -: 1124:	}
+    #####: 1125:      break;
+        -: 1126:
+        -: 1127:    case RE_EQUIV_CLASS:
+        -: 1128:      /* FIXME: this assumes that each character is alone in its own
+        -: 1129:         equivalence class (which appears to be correct for my
+        -: 1130:         LC_COLLATE.  But I don't know of any function that allows
+        -: 1131:         one to determine a character's equivalence class.  */
+        -: 1132:
+    #####: 1133:      return_val = p->u.equiv_code;
+    #####: 1134:      s->state = NEW_ELEMENT;
+    #####: 1135:      s->tail = p->next;
+    #####: 1136:      break;
+        -: 1137:
+        -: 1138:    case RE_REPEATED_CHAR:
+        -: 1139:      /* Here, a repeat count of n == 0 means don't repeat at all.  */
+    #####: 1140:      if (p->u.repeated_char.repeat_count == 0)
+        -: 1141:	{
+    #####: 1142:	  s->tail = p->next;
+    #####: 1143:	  s->state = NEW_ELEMENT;
+    #####: 1144:	  return_val = get_next (s, class);
+        -: 1145:	}
+        -: 1146:      else
+        -: 1147:	{
+    #####: 1148:	  if (s->state == NEW_ELEMENT)
+        -: 1149:	    {
+    #####: 1150:	      s->state = 0;
+        -: 1151:	    }
+    #####: 1152:	  ++(s->state);
+    #####: 1153:	  return_val = p->u.repeated_char.the_repeated_char;
+    #####: 1154:	  if (s->state == p->u.repeated_char.repeat_count)
+        -: 1155:	    {
+    #####: 1156:	      s->tail = p->next;
+    #####: 1157:	      s->state = NEW_ELEMENT;
+        -: 1158:	    }
+        -: 1159:	}
+    #####: 1160:      break;
+        -: 1161:
+        -: 1162:    default:
+    #####: 1163:      abort ();
+        -: 1164:      break;
+        -: 1165:    }
+        -: 1166:
+       52: 1167:  return return_val;
+        -: 1168:}
+        -: 1169:
+        -: 1170:/* This is a minor kludge.  This function is called from
+        -: 1171:   get_spec_stats to determine the cardinality of a set derived
+        -: 1172:   from a complemented string.  It's a kludge in that some of the
+        -: 1173:   same operations are (duplicated) performed in set_initialize.  */
+        -: 1174:
+        -: 1175:static int
+    #####: 1176:card_of_complement (struct Spec_list *s)
+        -: 1177:{
+        -: 1178:  int c;
+    #####: 1179:  int cardinality = N_CHARS;
+    #####: 1180:  bool in_set[N_CHARS] = { 0, };
+        -: 1181:
+    #####: 1182:  s->state = BEGIN_STATE;
+    #####: 1183:  while ((c = get_next (s, NULL)) != -1)
+        -: 1184:    {
+    #####: 1185:      cardinality -= (!in_set[c]);
+    #####: 1186:      in_set[c] = true;
+        -: 1187:    }
+    #####: 1188:  return cardinality;
+        -: 1189:}
+        -: 1190:
+        -: 1191:/* Gather statistics about the spec-list S in preparation for the tests
+        -: 1192:   in validate that determine the consistency of the specs.  This function
+        -: 1193:   is called at most twice; once for string1, and again for any string2.
+        -: 1194:   LEN_S1 < 0 indicates that this is the first call and that S represents
+        -: 1195:   string1.  When LEN_S1 >= 0, it is the length of the expansion of the
+        -: 1196:   constructs in string1, and we can use its value to resolve any
+        -: 1197:   indefinite repeat construct in S (which represents string2).  Hence,
+        -: 1198:   this function has the side-effect that it converts a valid [c*]
+        -: 1199:   construct in string2 to [c*n] where n is large enough (or 0) to give
+        -: 1200:   string2 the same length as string1.  For example, with the command
+        -: 1201:   tr a-z 'A[\n*]Z' on the second call to get_spec_stats, LEN_S1 would
+        -: 1202:   be 26 and S (representing string2) would be converted to 'A[\n*24]Z'.  */
+        -: 1203:
+        -: 1204:static void
+       36: 1205:get_spec_stats (struct Spec_list *s)
+        -: 1206:{
+        -: 1207:  struct List_element *p;
+       36: 1208:  count length = 0;
+        -: 1209:
+       36: 1210:  s->n_indefinite_repeats = 0;
+       36: 1211:  s->has_equiv_class = false;
+       36: 1212:  s->has_restricted_char_class = false;
+       36: 1213:  s->has_char_class = false;
+       72: 1214:  for (p = s->head->next; p; p = p->next)
+        -: 1215:    {
+        -: 1216:      int i;
+       36: 1217:      count len = 0;
+        -: 1218:      count new_length;
+        -: 1219:
+       36: 1220:      switch (p->type)
+        -: 1221:	{
+        -: 1222:	case RE_NORMAL_CHAR:
+       36: 1223:	  len = 1;
+       36: 1224:	  break;
+        -: 1225:
+        -: 1226:	case RE_RANGE:
+    #####: 1227:	  assert (p->u.range.last_char >= p->u.range.first_char);
+    #####: 1228:	  len = p->u.range.last_char - p->u.range.first_char + 1;
+    #####: 1229:	  break;
+        -: 1230:
+        -: 1231:	case RE_CHAR_CLASS:
+    #####: 1232:	  s->has_char_class = true;
+    #####: 1233:	  for (i = 0; i < N_CHARS; i++)
+    #####: 1234:	    if (is_char_class_member (p->u.char_class, i))
+    #####: 1235:	      ++len;
+    #####: 1236:	  switch (p->u.char_class)
+        -: 1237:	    {
+        -: 1238:	    case CC_UPPER:
+        -: 1239:	    case CC_LOWER:
+    #####: 1240:	      break;
+        -: 1241:	    default:
+    #####: 1242:	      s->has_restricted_char_class = true;
+    #####: 1243:	      break;
+        -: 1244:	    }
+    #####: 1245:	  break;
+        -: 1246:
+        -: 1247:	case RE_EQUIV_CLASS:
+    #####: 1248:	  for (i = 0; i < N_CHARS; i++)
+    #####: 1249:	    if (is_equiv_class_member (p->u.equiv_code, i))
+    #####: 1250:	      ++len;
+    #####: 1251:	  s->has_equiv_class = true;
+    #####: 1252:	  break;
+        -: 1253:
+        -: 1254:	case RE_REPEATED_CHAR:
+    #####: 1255:	  if (p->u.repeated_char.repeat_count > 0)
+    #####: 1256:	    len = p->u.repeated_char.repeat_count;
+        -: 1257:	  else
+        -: 1258:	    {
+    #####: 1259:	      s->indefinite_repeat_element = p;
+    #####: 1260:	      ++(s->n_indefinite_repeats);
+        -: 1261:	    }
+    #####: 1262:	  break;
+        -: 1263:
+        -: 1264:	default:
+    #####: 1265:	  abort ();
+        -: 1266:	  break;
+        -: 1267:	}
+        -: 1268:
+        -: 1269:      /* Check for arithmetic overflow in computing length.  Also, reject
+        -: 1270:	 any length greater than the maximum repeat count, in case the
+        -: 1271:	 length is later used to compute the repeat count for an
+        -: 1272:	 indefinite element.  */
+       36: 1273:      new_length = length + len;
+       36: 1274:      if (! (length <= new_length && new_length <= REPEAT_COUNT_MAXIMUM))
+    #####: 1275:	error (EXIT_FAILURE, 0, _("too many characters in set"));
+       36: 1276:      length = new_length;
+        -: 1277:    }
+        -: 1278:
+       36: 1279:  s->length = length;
+       36: 1280:}
+        -: 1281:
+        -: 1282:static void
+       18: 1283:get_s1_spec_stats (struct Spec_list *s1)
+        -: 1284:{
+       18: 1285:  get_spec_stats (s1);
+       18: 1286:  if (complement)
+    #####: 1287:    s1->length = card_of_complement (s1);
+       18: 1288:}
+        -: 1289:
+        -: 1290:static void
+       18: 1291:get_s2_spec_stats (struct Spec_list *s2, count len_s1)
+        -: 1292:{
+       18: 1293:  get_spec_stats (s2);
+       18: 1294:  if (len_s1 >= s2->length && s2->n_indefinite_repeats == 1)
+        -: 1295:    {
+    #####: 1296:      s2->indefinite_repeat_element->u.repeated_char.repeat_count =
+    #####: 1297:	len_s1 - s2->length;
+    #####: 1298:      s2->length = len_s1;
+        -: 1299:    }
+       18: 1300:}
+        -: 1301:
+        -: 1302:static void
+       36: 1303:spec_init (struct Spec_list *spec_list)
+        -: 1304:{
+       36: 1305:  struct List_element *new = xmalloc (sizeof *new);
+       36: 1306:  spec_list->head = spec_list->tail = new;
+       36: 1307:  spec_list->head->next = NULL;
+       36: 1308:}
+        -: 1309:
+        -: 1310:/* This function makes two passes over the argument string S.  The first
+        -: 1311:   one converts all \c and \ddd escapes to their one-byte representations.
+        -: 1312:   The second constructs a linked specification list, SPEC_LIST, of the
+        -: 1313:   characters and constructs that comprise the argument string.  If either
+        -: 1314:   of these passes detects an error, this function returns false.  */
+        -: 1315:
+        -: 1316:static bool
+       36: 1317:parse_str (char const *s, struct Spec_list *spec_list)
+        -: 1318:{
+        -: 1319:  struct E_string es;
+       36: 1320:  bool ok = unquote (s, &es) && build_spec_list (&es, spec_list);
+       36: 1321:  es_free (&es);
+       36: 1322:  return ok;
+        -: 1323:}
+        -: 1324:
+        -: 1325:/* Given two specification lists, S1 and S2, and assuming that
+        -: 1326:   S1->length > S2->length, append a single [c*n] element to S2 where c
+        -: 1327:   is the last character in the expansion of S2 and n is the difference
+        -: 1328:   between the two lengths.
+        -: 1329:   Upon successful completion, S2->length is set to S1->length.  The only
+        -: 1330:   way this function can fail to make S2 as long as S1 is when S2 has
+        -: 1331:   zero-length, since in that case, there is no last character to repeat.
+        -: 1332:   So S2->length is required to be at least 1.
+        -: 1333:
+        -: 1334:   Providing this functionality allows the user to do some pretty
+        -: 1335:   non-BSD (and non-portable) things:  For example, the command
+        -: 1336:       tr -cs '[:upper:]0-9' '[:lower:]'
+        -: 1337:   is almost guaranteed to give results that depend on your collating
+        -: 1338:   sequence.  */
+        -: 1339:
+        -: 1340:static void
+    #####: 1341:string2_extend (const struct Spec_list *s1, struct Spec_list *s2)
+        -: 1342:{
+        -: 1343:  struct List_element *p;
+        -: 1344:  unsigned char char_to_repeat;
+        -: 1345:  int i;
+        -: 1346:
+    #####: 1347:  assert (translating);
+    #####: 1348:  assert (s1->length > s2->length);
+    #####: 1349:  assert (s2->length > 0);
+        -: 1350:
+    #####: 1351:  p = s2->tail;
+    #####: 1352:  switch (p->type)
+        -: 1353:    {
+        -: 1354:    case RE_NORMAL_CHAR:
+    #####: 1355:      char_to_repeat = p->u.normal_char;
+    #####: 1356:      break;
+        -: 1357:    case RE_RANGE:
+    #####: 1358:      char_to_repeat = p->u.range.last_char;
+    #####: 1359:      break;
+        -: 1360:    case RE_CHAR_CLASS:
+    #####: 1361:      for (i = N_CHARS - 1; i >= 0; i--)
+    #####: 1362:	if (is_char_class_member (p->u.char_class, i))
+    #####: 1363:	  break;
+    #####: 1364:      assert (i >= 0);
+    #####: 1365:      char_to_repeat = i;
+    #####: 1366:      break;
+        -: 1367:
+        -: 1368:    case RE_REPEATED_CHAR:
+    #####: 1369:      char_to_repeat = p->u.repeated_char.the_repeated_char;
+    #####: 1370:      break;
+        -: 1371:
+        -: 1372:    case RE_EQUIV_CLASS:
+        -: 1373:      /* This shouldn't happen, because validate exits with an error
+        -: 1374:         if it finds an equiv class in string2 when translating.  */
+    #####: 1375:      abort ();
+        -: 1376:      break;
+        -: 1377:
+        -: 1378:    default:
+    #####: 1379:      abort ();
+        -: 1380:      break;
+        -: 1381:    }
+        -: 1382:
+    #####: 1383:  append_repeated_char (s2, char_to_repeat, s1->length - s2->length);
+    #####: 1384:  s2->length = s1->length;
+    #####: 1385:}
+        -: 1386:
+        -: 1387:/* Return true if S is a non-empty list in which exactly one
+        -: 1388:   character (but potentially, many instances of it) appears.
+        -: 1389:   E.g., [X*] or xxxxxxxx.  */
+        -: 1390:
+        -: 1391:static bool
+    #####: 1392:homogeneous_spec_list (struct Spec_list *s)
+        -: 1393:{
+        -: 1394:  int b, c;
+        -: 1395:
+    #####: 1396:  s->state = BEGIN_STATE;
+        -: 1397:
+    #####: 1398:  if ((b = get_next (s, NULL)) == -1)
+    #####: 1399:    return false;
+        -: 1400:
+    #####: 1401:  while ((c = get_next (s, NULL)) != -1)
+    #####: 1402:    if (c != b)
+    #####: 1403:      return false;
+        -: 1404:
+    #####: 1405:  return true;
+        -: 1406:}
+        -: 1407:
+        -: 1408:/* Die with an error message if S1 and S2 describe strings that
+        -: 1409:   are not valid with the given command line switches.
+        -: 1410:   A side effect of this function is that if a valid [c*] or
+        -: 1411:   [c*0] construct appears in string2, it is converted to [c*n]
+        -: 1412:   with a value for n that makes s2->length == s1->length.  By
+        -: 1413:   the same token, if the --truncate-set1 option is not
+        -: 1414:   given, S2 may be extended.  */
+        -: 1415:
+        -: 1416:static void
+       18: 1417:validate (struct Spec_list *s1, struct Spec_list *s2)
+        -: 1418:{
+       18: 1419:  get_s1_spec_stats (s1);
+       18: 1420:  if (s1->n_indefinite_repeats > 0)
+        -: 1421:    {
+    #####: 1422:      error (EXIT_FAILURE, 0,
+        -: 1423:	     _("the [c*] repeat construct may not appear in string1"));
+        -: 1424:    }
+        -: 1425:
+       18: 1426:  if (s2)
+        -: 1427:    {
+       18: 1428:      get_s2_spec_stats (s2, s1->length);
+        -: 1429:
+       18: 1430:      if (s2->n_indefinite_repeats > 1)
+        -: 1431:	{
+    #####: 1432:	  error (EXIT_FAILURE, 0,
+        -: 1433:		 _("only one [c*] repeat construct may appear in string2"));
+        -: 1434:	}
+        -: 1435:
+       18: 1436:      if (translating)
+        -: 1437:	{
+       18: 1438:	  if (s2->has_equiv_class)
+        -: 1439:	    {
+    #####: 1440:	      error (EXIT_FAILURE, 0,
+        -: 1441:		     _("[=c=] expressions may not appear in string2 \
+        -: 1442:when translating"));
+        -: 1443:	    }
+        -: 1444:
+       18: 1445:	  if (s1->length > s2->length)
+        -: 1446:	    {
+    #####: 1447:	      if (!truncate_set1)
+        -: 1448:		{
+        -: 1449:		  /* string2 must be non-empty unless --truncate-set1 is
+        -: 1450:		     given or string1 is empty.  */
+        -: 1451:
+    #####: 1452:		  if (s2->length == 0)
+    #####: 1453:		    error (EXIT_FAILURE, 0,
+        -: 1454:		     _("when not truncating set1, string2 must be non-empty"));
+    #####: 1455:		  string2_extend (s1, s2);
+        -: 1456:		}
+        -: 1457:	    }
+        -: 1458:
+       18: 1459:	  if (complement && s1->has_char_class
+    #####: 1460:	      && ! (s2->length == s1->length && homogeneous_spec_list (s2)))
+        -: 1461:	    {
+    #####: 1462:	      error (EXIT_FAILURE, 0,
+        -: 1463:		     _("when translating with complemented character classes,\
+        -: 1464:\nstring2 must map all characters in the domain to one"));
+        -: 1465:	    }
+        -: 1466:
+       18: 1467:	  if (s2->has_restricted_char_class)
+        -: 1468:	    {
+    #####: 1469:	      error (EXIT_FAILURE, 0,
+        -: 1470:		     _("when translating, the only character classes that may \
+        -: 1471:appear in\nstring2 are `upper' and `lower'"));
+        -: 1472:	    }
+        -: 1473:	}
+        -: 1474:      else
+        -: 1475:	/* Not translating.  */
+        -: 1476:	{
+    #####: 1477:	  if (s2->n_indefinite_repeats > 0)
+    #####: 1478:	    error (EXIT_FAILURE, 0,
+        -: 1479:		   _("the [c*] construct may appear in string2 only \
+        -: 1480:when translating"));
+        -: 1481:	}
+        -: 1482:    }
+       18: 1483:}
+        -: 1484:
+        -: 1485:/* Read buffers of SIZE bytes via the function READER (if READER is
+        -: 1486:   NULL, read from stdin) until EOF.  When non-NULL, READER is either
+        -: 1487:   read_and_delete or read_and_xlate.  After each buffer is read, it is
+        -: 1488:   processed and written to stdout.  The buffers are processed so that
+        -: 1489:   multiple consecutive occurrences of the same character in the input
+        -: 1490:   stream are replaced by a single occurrence of that character if the
+        -: 1491:   character is in the squeeze set.  */
+        -: 1492:
+        -: 1493:static void
+       16: 1494:squeeze_filter (char *buf, size_t size, size_t (*reader) (char *, size_t))
+        -: 1495:{
+        -: 1496:  /* A value distinct from any character that may have been stored in a
+        -: 1497:     buffer as the result of a block-read in the function squeeze_filter.  */
+        -: 1498:  enum { NOT_A_CHAR = CHAR_MAX + 1 };
+        -: 1499:
+       16: 1500:  int char_to_squeeze = NOT_A_CHAR;
+       16: 1501:  size_t i = 0;
+       16: 1502:  size_t nr = 0;
+        -: 1503:
+        -: 1504:  for (;;)
+        -: 1505:    {
+        -: 1506:      size_t begin;
+        -: 1507:
+      898: 1508:      if (i >= nr)
+        -: 1509:	{
+       32: 1510:	  nr = reader (buf, size);
+       32: 1511:	  if (nr == 0)
+       16: 1512:	    break;
+       16: 1513:	  i = 0;
+        -: 1514:	}
+        -: 1515:
+      882: 1516:      begin = i;
+        -: 1517:
+      882: 1518:      if (char_to_squeeze == NOT_A_CHAR)
+        -: 1519:	{
+        -: 1520:	  size_t out_len;
+        -: 1521:	  /* Here, by being a little tricky, we can get a significant
+        -: 1522:	     performance increase in most cases when the input is
+        -: 1523:	     reasonably large.  Since tr will modify the input only
+        -: 1524:	     if two consecutive (and identical) input characters are
+        -: 1525:	     in the squeeze set, we can step by two through the data
+        -: 1526:	     when searching for a character in the squeeze set.  This
+        -: 1527:	     means there may be a little more work in a few cases and
+        -: 1528:	     perhaps twice as much work in the worst cases where most
+        -: 1529:	     of the input is removed by squeezing repeats.  But most
+        -: 1530:	     uses of this functionality seem to remove less than 20-30%
+        -: 1531:	     of the input.  */
+     6052: 1532:	  for (; i < nr && !in_squeeze_set[to_uchar (buf[i])]; i += 2)
+     5170: 1533:	    continue;
+        -: 1534:
+        -: 1535:	  /* There is a special case when i == nr and we've just
+        -: 1536:	     skipped a character (the last one in buf) that is in
+        -: 1537:	     the squeeze set.  */
+      882: 1538:	  if (i == nr && in_squeeze_set[to_uchar (buf[i - 1])])
+        4: 1539:	    --i;
+        -: 1540:
+      882: 1541:	  if (i >= nr)
+    #####: 1542:	    out_len = nr - begin;
+        -: 1543:	  else
+        -: 1544:	    {
+      882: 1545:	      char_to_squeeze = buf[i];
+        -: 1546:	      /* We're about to output buf[begin..i].  */
+      882: 1547:	      out_len = i - begin + 1;
+        -: 1548:
+        -: 1549:	      /* But since we stepped by 2 in the loop above,
+        -: 1550:	         out_len may be one too large.  */
+      882: 1551:	      if (i > 0 && buf[i - 1] == char_to_squeeze)
+    #####: 1552:		--out_len;
+        -: 1553:
+        -: 1554:	      /* Advance i to the index of first character to be
+        -: 1555:	         considered when looking for a char different from
+        -: 1556:	         char_to_squeeze.  */
+      882: 1557:	      ++i;
+        -: 1558:	    }
+      882: 1559:	  if (out_len > 0
+      882: 1560:	      && fwrite (&buf[begin], 1, out_len, stdout) != out_len)
+    #####: 1561:	    error (EXIT_FAILURE, errno, _("write error"));
+        -: 1562:	}
+        -: 1563:
+      882: 1564:      if (char_to_squeeze != NOT_A_CHAR)
+        -: 1565:	{
+        -: 1566:	  /* Advance i to index of first char != char_to_squeeze
+        -: 1567:	     (or to nr if all the rest of the characters in this
+        -: 1568:	     buffer are the same as char_to_squeeze).  */
+      882: 1569:	  for (; i < nr && buf[i] == char_to_squeeze; i++)
+    #####: 1570:	    continue;
+      882: 1571:	  if (i < nr)
+      866: 1572:	    char_to_squeeze = NOT_A_CHAR;
+        -: 1573:	  /* If (i >= nr) we've squeezed the last character in this buffer.
+        -: 1574:	     So now we have to read a new buffer and continue comparing
+        -: 1575:	     characters against char_to_squeeze.  */
+        -: 1576:	}
+      882: 1577:    }
+       16: 1578:}
+        -: 1579:
+        -: 1580:static size_t
+       36: 1581:plain_read (char *buf, size_t size)
+        -: 1582:{
+       36: 1583:  size_t nr = safe_read (STDIN_FILENO, buf, size);
+       36: 1584:  if (nr == SAFE_READ_ERROR)
+    #####: 1585:    error (EXIT_FAILURE, errno, _("read error"));
+       36: 1586:  return nr;
+        -: 1587:}
+        -: 1588:
+        -: 1589:/* Read buffers of SIZE bytes from stdin until one is found that
+        -: 1590:   contains at least one character not in the delete set.  Store
+        -: 1591:   in the array BUF, all characters from that buffer that are not
+        -: 1592:   in the delete set, and return the number of characters saved
+        -: 1593:   or 0 upon EOF.  */
+        -: 1594:
+        -: 1595:static size_t
+    #####: 1596:read_and_delete (char *buf, size_t size)
+        -: 1597:{
+        -: 1598:  size_t n_saved;
+        -: 1599:
+        -: 1600:  /* This enclosing do-while loop is to make sure that
+        -: 1601:     we don't return zero (indicating EOF) when we've
+        -: 1602:     just deleted all the characters in a buffer.  */
+        -: 1603:  do
+        -: 1604:    {
+        -: 1605:      size_t i;
+    #####: 1606:      size_t nr = plain_read (buf, size);
+        -: 1607:
+    #####: 1608:      if (nr == 0)
+    #####: 1609:	return 0;
+        -: 1610:
+        -: 1611:      /* This first loop may be a waste of code, but gives much
+        -: 1612:         better performance when no characters are deleted in
+        -: 1613:         the beginning of a buffer.  It just avoids the copying
+        -: 1614:         of buf[i] into buf[n_saved] when it would be a NOP.  */
+        -: 1615:
+    #####: 1616:      for (i = 0; i < nr && !in_delete_set[to_uchar (buf[i])]; i++)
+    #####: 1617:	continue;
+    #####: 1618:      n_saved = i;
+        -: 1619:
+    #####: 1620:      for (++i; i < nr; i++)
+    #####: 1621:	if (!in_delete_set[to_uchar (buf[i])])
+    #####: 1622:	  buf[n_saved++] = buf[i];
+        -: 1623:    }
+    #####: 1624:  while (n_saved == 0);
+        -: 1625:
+    #####: 1626:  return n_saved;
+        -: 1627:}
+        -: 1628:
+        -: 1629:/* Read at most SIZE bytes from stdin into the array BUF.  Then
+        -: 1630:   perform the in-place and one-to-one mapping specified by the global
+        -: 1631:   array `xlate'.  Return the number of characters read, or 0 upon EOF.  */
+        -: 1632:
+        -: 1633:static size_t
+       36: 1634:read_and_xlate (char *buf, size_t size)
+        -: 1635:{
+       36: 1636:  size_t bytes_read = plain_read (buf, size);
+        -: 1637:  size_t i;
+        -: 1638:
+    12468: 1639:  for (i = 0; i < bytes_read; i++)
+    12432: 1640:    buf[i] = xlate[to_uchar (buf[i])];
+        -: 1641:
+       36: 1642:  return bytes_read;
+        -: 1643:}
+        -: 1644:
+        -: 1645:/* Initialize a boolean membership set, IN_SET, with the character
+        -: 1646:   values obtained by traversing the linked list of constructs S
+        -: 1647:   using the function `get_next'.  IN_SET is expected to have been
+        -: 1648:   initialized to all zeros by the caller.  If COMPLEMENT_THIS_SET
+        -: 1649:   is true the resulting set is complemented.  */
+        -: 1650:
+        -: 1651:static void
+       16: 1652:set_initialize (struct Spec_list *s, bool complement_this_set, bool *in_set)
+        -: 1653:{
+        -: 1654:  int c;
+        -: 1655:  size_t i;
+        -: 1656:
+       16: 1657:  s->state = BEGIN_STATE;
+       48: 1658:  while ((c = get_next (s, NULL)) != -1)
+       16: 1659:    in_set[c] = true;
+       16: 1660:  if (complement_this_set)
+    #####: 1661:    for (i = 0; i < N_CHARS; i++)
+    #####: 1662:      in_set[i] = (!in_set[i]);
+       16: 1663:}
+        -: 1664:
+        -: 1665:int
+       18: 1666:main (int argc, char **argv)
+        -: 1667:{
+        -: 1668:  int c;
+        -: 1669:  int non_option_args;
+        -: 1670:  int min_operands;
+        -: 1671:  int max_operands;
+        -: 1672:  struct Spec_list buf1, buf2;
+       18: 1673:  struct Spec_list *s1 = &buf1;
+       18: 1674:  struct Spec_list *s2 = &buf2;
+        -: 1675:
+        -: 1676:  initialize_main (&argc, &argv);
+       18: 1677:  program_name = argv[0];
+       18: 1678:  setlocale (LC_ALL, "");
+        -: 1679:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -: 1680:  textdomain (PACKAGE);
+        -: 1681:
+       18: 1682:  atexit (close_stdout);
+        -: 1683:
+       52: 1684:  while ((c = getopt_long (argc, argv, "+cCdst", long_options, NULL)) != -1)
+        -: 1685:    {
+       16: 1686:      switch (c)
+        -: 1687:	{
+        -: 1688:	case 'c':
+        -: 1689:	case 'C':
+    #####: 1690:	  complement = true;
+    #####: 1691:	  break;
+        -: 1692:
+        -: 1693:	case 'd':
+    #####: 1694:	  delete = true;
+    #####: 1695:	  break;
+        -: 1696:
+        -: 1697:	case 's':
+       16: 1698:	  squeeze_repeats = true;
+       16: 1699:	  break;
+        -: 1700:
+        -: 1701:	case 't':
+    #####: 1702:	  truncate_set1 = true;
+    #####: 1703:	  break;
+        -: 1704:
+    #####: 1705:	case_GETOPT_HELP_CHAR;
+        -: 1706:
+    #####: 1707:	case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -: 1708:
+        -: 1709:	default:
+    #####: 1710:	  usage (EXIT_FAILURE);
+    #####: 1711:	  break;
+        -: 1712:	}
+        -: 1713:    }
+        -: 1714:
+       18: 1715:  non_option_args = argc - optind;
+       18: 1716:  translating = (non_option_args == 2 && !delete);
+       18: 1717:  min_operands = 1 + (delete == squeeze_repeats);
+       18: 1718:  max_operands = 1 + (delete <= squeeze_repeats);
+        -: 1719:
+       18: 1720:  if (non_option_args < min_operands)
+        -: 1721:    {
+    #####: 1722:      if (non_option_args == 0)
+    #####: 1723:	error (0, 0, _("missing operand"));
+        -: 1724:      else
+        -: 1725:	{
+    #####: 1726:	  error (0, 0, _("missing operand after %s"), quote (argv[argc - 1]));
+    #####: 1727:	  fprintf (stderr, "%s\n",
+        -: 1728:		   _(squeeze_repeats
+        -: 1729:		     ? ("Two strings must be given when "
+        -: 1730:			"both deleting and squeezing repeats.")
+        -: 1731:		     : "Two strings must be given when translating."));
+        -: 1732:	}
+    #####: 1733:      usage (EXIT_FAILURE);
+        -: 1734:    }
+        -: 1735:
+       18: 1736:  if (max_operands < non_option_args)
+        -: 1737:    {
+    #####: 1738:      error (0, 0, _("extra operand %s"), quote (argv[optind + max_operands]));
+    #####: 1739:      if (non_option_args == 2)
+    #####: 1740:	fprintf (stderr, "%s\n",
+        -: 1741:		 _("Only one string may be given when "
+        -: 1742:		   "deleting without squeezing repeats."));
+    #####: 1743:      usage (EXIT_FAILURE);
+        -: 1744:    }
+        -: 1745:
+       18: 1746:  spec_init (s1);
+       18: 1747:  if (!parse_str (argv[optind], s1))
+    #####: 1748:    exit (EXIT_FAILURE);
+        -: 1749:
+       18: 1750:  if (non_option_args == 2)
+        -: 1751:    {
+       18: 1752:      spec_init (s2);
+       18: 1753:      if (!parse_str (argv[optind + 1], s2))
+    #####: 1754:	exit (EXIT_FAILURE);
+        -: 1755:    }
+        -: 1756:  else
+    #####: 1757:    s2 = NULL;
+        -: 1758:
+       18: 1759:  validate (s1, s2);
+        -: 1760:
+        -: 1761:  /* Use binary I/O, since `tr' is sometimes used to transliterate
+        -: 1762:     non-printable characters, or characters which are stripped away
+        -: 1763:     by text-mode reads (like CR and ^Z).  */
+        -: 1764:  if (O_BINARY && ! isatty (STDIN_FILENO))
+        -: 1765:    freopen (NULL, "rb", stdin);
+        -: 1766:  if (O_BINARY && ! isatty (STDOUT_FILENO))
+        -: 1767:    freopen (NULL, "wb", stdout);
+        -: 1768:
+       18: 1769:  if (squeeze_repeats && non_option_args == 1)
+        -: 1770:    {
+    #####: 1771:      set_initialize (s1, complement, in_squeeze_set);
+    #####: 1772:      squeeze_filter (io_buf, sizeof io_buf, plain_read);
+        -: 1773:    }
+       18: 1774:  else if (delete && non_option_args == 1)
+        -: 1775:    {
+    #####: 1776:      set_initialize (s1, complement, in_delete_set);
+        -: 1777:
+        -: 1778:      for (;;)
+        -: 1779:	{
+    #####: 1780:	  size_t nr = read_and_delete (io_buf, sizeof io_buf);
+    #####: 1781:	  if (nr == 0)
+    #####: 1782:	    break;
+    #####: 1783:	  if (fwrite (io_buf, 1, nr, stdout) != nr)
+    #####: 1784:	    error (EXIT_FAILURE, errno, _("write error"));
+    #####: 1785:	}
+        -: 1786:    }
+       18: 1787:  else if (squeeze_repeats && delete && non_option_args == 2)
+        -: 1788:    {
+    #####: 1789:      set_initialize (s1, complement, in_delete_set);
+    #####: 1790:      set_initialize (s2, false, in_squeeze_set);
+    #####: 1791:      squeeze_filter (io_buf, sizeof io_buf, read_and_delete);
+        -: 1792:    }
+       18: 1793:  else if (translating)
+        -: 1794:    {
+       18: 1795:      if (complement)
+        -: 1796:	{
+        -: 1797:	  int i;
+    #####: 1798:	  bool *in_s1 = in_delete_set;
+        -: 1799:
+    #####: 1800:	  set_initialize (s1, false, in_s1);
+    #####: 1801:	  s2->state = BEGIN_STATE;
+    #####: 1802:	  for (i = 0; i < N_CHARS; i++)
+    #####: 1803:	    xlate[i] = i;
+    #####: 1804:	  for (i = 0; i < N_CHARS; i++)
+        -: 1805:	    {
+    #####: 1806:	      if (!in_s1[i])
+        -: 1807:		{
+    #####: 1808:		  int ch = get_next (s2, NULL);
+    #####: 1809:		  assert (ch != -1 || truncate_set1);
+    #####: 1810:		  if (ch == -1)
+        -: 1811:		    {
+        -: 1812:		      /* This will happen when tr is invoked like e.g.
+        -: 1813:		         tr -cs A-Za-z0-9 '\012'.  */
+    #####: 1814:		      break;
+        -: 1815:		    }
+    #####: 1816:		  xlate[i] = ch;
+        -: 1817:		}
+        -: 1818:	    }
+        -: 1819:	}
+        -: 1820:      else
+        -: 1821:	{
+        -: 1822:	  int c1, c2;
+        -: 1823:	  int i;
+        -: 1824:	  enum Upper_Lower_class class_s1;
+        -: 1825:	  enum Upper_Lower_class class_s2;
+        -: 1826:
+     4626: 1827:	  for (i = 0; i < N_CHARS; i++)
+     4608: 1828:	    xlate[i] = i;
+       18: 1829:	  s1->state = BEGIN_STATE;
+       18: 1830:	  s2->state = BEGIN_STATE;
+        -: 1831:	  for (;;)
+        -: 1832:	    {
+       36: 1833:	      c1 = get_next (s1, &class_s1);
+       36: 1834:	      c2 = get_next (s2, &class_s2);
+        -: 1835:
+        -: 1836:	      /* When constructing the translation array, either one of the
+        -: 1837:		 values returned by paired calls to get_next must be from
+        -: 1838:		 [:upper:] and the other is [:lower:], or neither can be from
+        -: 1839:		 upper or lower.  */
+        -: 1840:
+       36: 1841:	      if ((class_s1 == UL_NONE) != (class_s2 == UL_NONE))
+    #####: 1842:		error (EXIT_FAILURE, 0,
+        -: 1843:		       _("misaligned [:upper:] and/or [:lower:] construct"));
+        -: 1844:
+       36: 1845:	      if (class_s1 == UL_LOWER && class_s2 == UL_UPPER)
+        -: 1846:		{
+    #####: 1847:		  for (i = 0; i < N_CHARS; i++)
+    #####: 1848:		    if (islower (i))
+    #####: 1849:		      xlate[i] = toupper (i);
+        -: 1850:		}
+       36: 1851:	      else if (class_s1 == UL_UPPER && class_s2 == UL_LOWER)
+        -: 1852:		{
+    #####: 1853:		  for (i = 0; i < N_CHARS; i++)
+    #####: 1854:		    if (isupper (i))
+    #####: 1855:		      xlate[i] = tolower (i);
+        -: 1856:		}
+       36: 1857:	      else if ((class_s1 == UL_LOWER && class_s2 == UL_LOWER)
+       36: 1858:		       || (class_s1 == UL_UPPER && class_s2 == UL_UPPER))
+        -: 1859:		{
+        -: 1860:		  /* POSIX says the behavior of `tr "[:upper:]" "[:upper:]"'
+        -: 1861:		     is undefined.  Treat it as a no-op.  */
+        -: 1862:		}
+        -: 1863:	      else
+        -: 1864:		{
+        -: 1865:		  /* The following should have been checked by validate...  */
+       36: 1866:		  if (c1 == -1 || c2 == -1)
+        -: 1867:		    break;
+       18: 1868:		  xlate[c1] = c2;
+        -: 1869:		}
+       18: 1870:	    }
+       18: 1871:	  assert (c1 == -1 || truncate_set1);
+        -: 1872:	}
+       18: 1873:      if (squeeze_repeats)
+        -: 1874:	{
+       16: 1875:	  set_initialize (s2, false, in_squeeze_set);
+       16: 1876:	  squeeze_filter (io_buf, sizeof io_buf, read_and_xlate);
+        -: 1877:	}
+        -: 1878:      else
+        -: 1879:	{
+        -: 1880:	  for (;;)
+        -: 1881:	    {
+        4: 1882:	      size_t bytes_read = read_and_xlate (io_buf, sizeof io_buf);
+        4: 1883:	      if (bytes_read == 0)
+        2: 1884:		break;
+        2: 1885:	      if (fwrite (io_buf, 1, bytes_read, stdout) != bytes_read)
+    #####: 1886:		error (EXIT_FAILURE, errno, _("write error"));
+        2: 1887:	    }
+        -: 1888:	}
+        -: 1889:    }
+        -: 1890:
+       18: 1891:  if (close (STDIN_FILENO) != 0)
+    #####: 1892:    error (EXIT_FAILURE, errno, _("standard input"));
+        -: 1893:
+       18: 1894:  exit (EXIT_SUCCESS);
+        -: 1895:}

@@ -1,0 +1,3795 @@
+        -:    0:Source:parser.c
+        -:    0:Graph:parser.gcno
+        -:    0:Data:parser.gcda
+        -:    0:Runs:9
+        -:    0:Programs:2
+        -:    1:/* parser.c -- convert the command line args into an expression tree.
+        -:    2:   Copyright (C) 1990, 1991, 1992, 1993, 1994, 2000, 2001, 2003,
+        -:    3:     2004, 2005, 2006, 2007, 2008, 2009, 2010 Free Software Foundation, Inc.
+        -:    4:
+        -:    5:   This program is free software: you can redistribute it and/or modify
+        -:    6:   it under the terms of the GNU General Public License as published by
+        -:    7:   the Free Software Foundation, either version 3 of the License, or
+        -:    8:   (at your option) any later version.
+        -:    9:
+        -:   10:   This program is distributed in the hope that it will be useful,
+        -:   11:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   12:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   13:   GNU General Public License for more details.
+        -:   14:
+        -:   15:   You should have received a copy of the GNU General Public License
+        -:   16:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   17:*/
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:
+        -:   21:#include "defs.h"
+        -:   22:#include <ctype.h>
+        -:   23:#include <math.h>
+        -:   24:#include <assert.h>
+        -:   25:#include <pwd.h>
+        -:   26:#include <errno.h>
+        -:   27:#include <grp.h>
+        -:   28:#include <fnmatch.h>
+        -:   29:#include <sys/stat.h>
+        -:   30:#include "mountlist.h"
+        -:   31:#include "modechange.h"
+        -:   32:#include "xstrtol.h"
+        -:   33:#include "xalloc.h"
+        -:   34:#include "quotearg.h"
+        -:   35:#include "buildcmd.h"
+        -:   36:#include "nextelem.h"
+        -:   37:#include "stdio-safer.h"
+        -:   38:#include "regextype.h"
+        -:   39:#include "stat-time.h"
+        -:   40:#include "xstrtod.h"
+        -:   41:#include "fts_.h"
+        -:   42:#include "getdate.h"
+        -:   43:#include "error.h"
+        -:   44:#include "findutils-version.h"
+        -:   45:#include "safe-atoi.h"
+        -:   46:#include "fdleak.h"
+        -:   47:
+        -:   48:#include <fcntl.h>
+        -:   49:
+        -:   50:
+        -:   51:/* The presence of unistd.h is assumed by gnulib these days, so we
+        -:   52: * might as well assume it too.
+        -:   53: */
+        -:   54:/* We need <unistd.h> for isatty(). */
+        -:   55:#include <unistd.h>
+        -:   56:#include <sys/stat.h>
+        -:   57:
+        -:   58:#include "selinux-at.h"
+        -:   59:
+        -:   60:#if ENABLE_NLS
+        -:   61:# include <libintl.h>
+        -:   62:# define _(Text) gettext (Text)
+        -:   63:#else
+        -:   64:# define _(Text) Text
+        -:   65:#endif
+        -:   66:#ifdef gettext_noop
+        -:   67:# define N_(String) gettext_noop (String)
+        -:   68:#else
+        -:   69:/* See locate.c for explanation as to why not use (String) */
+        -:   70:# define N_(String) String
+        -:   71:#endif
+        -:   72:
+        -:   73:#if !defined (isascii) || defined (STDC_HEADERS)
+        -:   74:#ifdef isascii
+        -:   75:#undef isascii
+        -:   76:#endif
+        -:   77:#define isascii(c) 1
+        -:   78:#endif
+        -:   79:
+        -:   80:#define ISDIGIT(c) (isascii ((unsigned char)c) && isdigit ((unsigned char)c))
+        -:   81:
+        -:   82:#ifndef HAVE_ENDGRENT
+        -:   83:#define endgrent ()
+        -:   84:#endif
+        -:   85:#ifndef HAVE_ENDPWENT
+        -:   86:#define endpwent ()
+        -:   87:#endif
+        -:   88:
+        -:   89:static bool parse_accesscheck   PARAMS((const struct parser_table* entry, char **argv, int *arg_ptr));
+        -:   90:static bool parse_amin          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:   91:static bool parse_and           PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:   92:static bool parse_anewer        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:   93:static bool parse_cmin          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:   94:static bool parse_cnewer        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:   95:static bool parse_comma         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:   96:static bool parse_daystart      PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:   97:static bool parse_delete        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:   98:static bool parse_d             PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:   99:static bool parse_depth         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  100:static bool parse_empty         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  101:static bool parse_exec          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  102:static bool parse_execdir       PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  103:static bool parse_false         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  104:static bool parse_fls           PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  105:static bool parse_fprintf       PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  106:static bool parse_follow        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  107:static bool parse_fprint        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  108:static bool parse_fprint0       PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  109:static bool parse_fstype        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  110:static bool parse_gid           PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  111:static bool parse_group         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  112:static bool parse_help          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  113:static bool parse_ilname        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  114:static bool parse_iname         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  115:static bool parse_inum          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  116:static bool parse_ipath         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  117:static bool parse_iregex        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  118:static bool parse_iwholename    PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  119:static bool parse_links         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  120:static bool parse_lname         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  121:static bool parse_ls            PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  122:static bool parse_maxdepth      PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  123:static bool parse_mindepth      PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  124:static bool parse_mmin          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  125:static bool parse_name          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  126:static bool parse_negate        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  127:static bool parse_newer         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  128:static bool parse_newerXY       PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  129:static bool parse_noleaf        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  130:static bool parse_nogroup       PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  131:static bool parse_nouser        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  132:static bool parse_nowarn        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  133:static bool parse_ok            PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  134:static bool parse_okdir         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  135:static bool parse_or            PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  136:static bool parse_path          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  137:static bool parse_perm          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  138:static bool parse_print0        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  139:static bool parse_printf        PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  140:static bool parse_prune         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  141:static bool parse_regex         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  142:static bool parse_regextype     PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  143:static bool parse_samefile      PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  144:#if 0
+        -:  145:static bool parse_show_control_chars PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  146:#endif
+        -:  147:static bool parse_size          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  148:static bool parse_time          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  149:static bool parse_true          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  150:static bool parse_type          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  151:static bool parse_uid           PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  152:static bool parse_used          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  153:static bool parse_user          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  154:static bool parse_version       PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  155:static bool parse_wholename     PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  156:static bool parse_xdev          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  157:static bool parse_ignore_race   PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  158:static bool parse_noignore_race PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  159:static bool parse_warn          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  160:static bool parse_xtype         PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  161:static bool parse_quit          PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  162:static bool parse_context       PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  163:
+        -:  164:bool parse_print             PARAMS((const struct parser_table*, char *argv[], int *arg_ptr));
+        -:  165:
+        -:  166:
+        -:  167:static bool insert_type PARAMS((char **argv, int *arg_ptr,
+        -:  168:				   const struct parser_table *entry,
+        -:  169:				   PRED_FUNC which_pred));
+        -:  170:static bool insert_regex PARAMS((char *argv[], int *arg_ptr,
+        -:  171:				    const struct parser_table *entry,
+        -:  172:				    int regex_options));
+        -:  173:static bool insert_fprintf (struct format_val *vec,
+        -:  174:			       const struct parser_table *entry,
+        -:  175:			       PRED_FUNC func,
+        -:  176:			       const char *format);
+        -:  177:
+        -:  178:static struct segment **make_segment PARAMS((struct segment **segment,
+        -:  179:					     char *format, int len,
+        -:  180:					     int kind, char format_char,
+        -:  181:					     char aux_format_char,
+        -:  182:					     struct predicate *pred));
+        -:  183:static bool insert_exec_ok PARAMS((const char *action,
+        -:  184:				   const struct parser_table *entry,
+        -:  185:				   char *argv[],
+        -:  186:				   int *arg_ptr));
+        -:  187:static bool get_comp_type PARAMS((const char **str,
+        -:  188:				     enum comparison_type *comp_type));
+        -:  189:static bool get_relative_timestamp PARAMS((const char *str,
+        -:  190:					      struct time_val *tval,
+        -:  191:					      struct timespec origin,
+        -:  192:					      double sec_per_unit,
+        -:  193:					      const char *overflowmessage));
+        -:  194:static bool get_num PARAMS((const char *str,
+        -:  195:			       uintmax_t *num,
+        -:  196:			       enum comparison_type *comp_type));
+        -:  197:static struct predicate* insert_num PARAMS((char *argv[], int *arg_ptr,
+        -:  198:					    const struct parser_table *entry));
+        -:  199:static void open_output_file (const char *path, struct format_val *p);
+        -:  200:static void open_stdout (struct format_val *p);
+        -:  201:static bool stream_is_tty(FILE *fp);
+        -:  202:static bool parse_noop PARAMS((const struct parser_table* entry,
+        -:  203:				  char **argv, int *arg_ptr));
+        -:  204:
+        -:  205:#define PASTE(x,y) x##y
+        -:  206:#define STRINGIFY(s) #s
+        -:  207:
+        -:  208:#define PARSE_OPTION(what,suffix) \
+        -:  209:  { (ARG_OPTION), (what), PASTE(parse_,suffix), NULL }
+        -:  210:
+        -:  211:#define PARSE_POSOPT(what,suffix) \
+        -:  212:  { (ARG_POSITIONAL_OPTION), (what), PASTE(parse_,suffix), NULL }
+        -:  213:
+        -:  214:#define PARSE_TEST(what,suffix) \
+        -:  215:  { (ARG_TEST), (what), PASTE(parse_,suffix), PASTE(pred_,suffix) }
+        -:  216:
+        -:  217:#define PARSE_TEST_NP(what,suffix) \
+        -:  218:  { (ARG_TEST), (what), PASTE(parse_,suffix), NULL }
+        -:  219:
+        -:  220:#define PARSE_ACTION(what,suffix) \
+        -:  221:  { (ARG_ACTION), (what), PASTE(parse_,suffix), PASTE(pred_,suffix) }
+        -:  222:
+        -:  223:#define PARSE_ACTION_NP(what,suffix) \
+        -:  224:  { (ARG_ACTION), (what), PASTE(parse_,suffix), NULL }
+        -:  225:
+        -:  226:#define PARSE_PUNCTUATION(what,suffix) \
+        -:  227:  { (ARG_PUNCTUATION), (what), PASTE(parse_,suffix), PASTE(pred_,suffix) }
+        -:  228:
+        -:  229:
+        -:  230:/* Predicates we cannot handle in the usual way.  If you add an entry
+        -:  231: * to this table, double-check the switch statement in
+        -:  232: * pred_sanity_check() to make sure that the new case is being
+        -:  233: * correctly handled.
+        -:  234: */
+        -:  235:static struct parser_table const parse_entry_newerXY =
+        -:  236:  {
+        -:  237:    ARG_SPECIAL_PARSE, "newerXY",            parse_newerXY, pred_newerXY /* BSD  */
+        -:  238:  };
+        -:  239:
+        -:  240:/* GNU find predicates that are not mentioned in POSIX.2 are marked `GNU'.
+        -:  241:   If they are in some Unix versions of find, they are marked `Unix'. */
+        -:  242:
+        -:  243:static struct parser_table const parse_table[] =
+        -:  244:{
+        -:  245:  PARSE_PUNCTUATION("!",                     negate), /* POSIX */
+        -:  246:  PARSE_PUNCTUATION("not",                   negate),	     /* GNU */
+        -:  247:  PARSE_PUNCTUATION("(",                     openparen), /* POSIX */
+        -:  248:  PARSE_PUNCTUATION(")",                     closeparen), /* POSIX */
+        -:  249:  PARSE_PUNCTUATION(",",                     comma),	     /* GNU */
+        -:  250:  PARSE_PUNCTUATION("a",                     and), /* POSIX */
+        -:  251:  PARSE_TEST       ("amin",                  amin),	     /* GNU */
+        -:  252:  PARSE_PUNCTUATION("and",                   and),		/* GNU */
+        -:  253:  PARSE_TEST       ("anewer",                anewer),	     /* GNU */
+        -:  254:  {ARG_TEST,       "atime",                  parse_time, pred_atime}, /* POSIX */
+        -:  255:  PARSE_TEST       ("cmin",                  cmin),	     /* GNU */
+        -:  256:  PARSE_TEST       ("cnewer",                cnewer),	     /* GNU */
+        -:  257:  {ARG_TEST,       "ctime",                  parse_time, pred_ctime}, /* POSIX */
+        -:  258:  PARSE_TEST       ("context",               context),      /* GNU */
+        -:  259:  PARSE_POSOPT     ("daystart",              daystart),	     /* GNU */
+        -:  260:  PARSE_ACTION     ("delete",                delete), /* GNU, Mac OS, FreeBSD */
+        -:  261:  PARSE_OPTION     ("d",                     d), /* Mac OS X, FreeBSD, NetBSD, OpenBSD, but deprecated  in favour of -depth */
+        -:  262:  PARSE_OPTION     ("depth",                 depth), /* POSIX */
+        -:  263:  PARSE_TEST       ("empty",                 empty),	     /* GNU */
+        -:  264:  {ARG_ACTION,      "exec",    parse_exec, pred_exec}, /* POSIX */
+        -:  265:  {ARG_TEST,        "executable",            parse_accesscheck, pred_executable}, /* GNU, 4.3.0+ */
+        -:  266:  PARSE_ACTION     ("execdir",               execdir), /* *BSD, GNU */
+        -:  267:  PARSE_ACTION     ("fls",                   fls),	     /* GNU */
+        -:  268:  PARSE_POSOPT     ("follow",                follow),  /* GNU, Unix */
+        -:  269:  PARSE_ACTION     ("fprint",                fprint),	     /* GNU */
+        -:  270:  PARSE_ACTION     ("fprint0",               fprint0),	     /* GNU */
+        -:  271:  {ARG_ACTION,      "fprintf", parse_fprintf, pred_fprintf}, /* GNU */
+        -:  272:  PARSE_TEST       ("fstype",                fstype),  /* GNU, Unix */
+        -:  273:  PARSE_TEST       ("gid",                   gid),	     /* GNU */
+        -:  274:  PARSE_TEST       ("group",                 group), /* POSIX */
+        -:  275:  PARSE_OPTION     ("ignore_readdir_race",   ignore_race),   /* GNU */
+        -:  276:  PARSE_TEST       ("ilname",                ilname),	     /* GNU */
+        -:  277:  PARSE_TEST       ("iname",                 iname),	     /* GNU */
+        -:  278:  PARSE_TEST       ("inum",                  inum),    /* GNU, Unix */
+        -:  279:  PARSE_TEST       ("ipath",                 ipath), /* GNU, deprecated in favour of iwholename */
+        -:  280:  PARSE_TEST_NP    ("iregex",                iregex),	     /* GNU */
+        -:  281:  PARSE_TEST_NP    ("iwholename",            iwholename),    /* GNU */
+        -:  282:  PARSE_TEST       ("links",                 links), /* POSIX */
+        -:  283:  PARSE_TEST       ("lname",                 lname),	     /* GNU */
+        -:  284:  PARSE_ACTION     ("ls",                    ls),      /* GNU, Unix */
+        -:  285:  PARSE_OPTION     ("maxdepth",              maxdepth),	     /* GNU */
+        -:  286:  PARSE_OPTION     ("mindepth",              mindepth),	     /* GNU */
+        -:  287:  PARSE_TEST       ("mmin",                  mmin),	     /* GNU */
+        -:  288:  PARSE_OPTION     ("mount",                 xdev),	    /* Unix */
+        -:  289:  {ARG_TEST,       "mtime",                  parse_time, pred_mtime}, /* POSIX */
+        -:  290:  PARSE_TEST       ("name",                  name),
+        -:  291:#ifdef UNIMPLEMENTED_UNIX
+        -:  292:  PARSE(ARG_UNIMPLEMENTED, "ncpio",          ncpio),	    /* Unix */
+        -:  293:#endif
+        -:  294:  PARSE_TEST       ("newer",                 newer), /* POSIX */
+        -:  295:  {ARG_TEST,       "atime",                  parse_time, pred_atime}, /* POSIX */
+        -:  296:  PARSE_OPTION     ("noleaf",                noleaf),	     /* GNU */
+        -:  297:  PARSE_TEST       ("nogroup",               nogroup), /* POSIX */
+        -:  298:  PARSE_TEST       ("nouser",                nouser), /* POSIX */
+        -:  299:  PARSE_OPTION     ("noignore_readdir_race", noignore_race), /* GNU */
+        -:  300:  PARSE_POSOPT     ("nowarn",                nowarn),	     /* GNU */
+        -:  301:  PARSE_PUNCTUATION("o",                     or), /* POSIX */
+        -:  302:  PARSE_PUNCTUATION("or",                    or),	     /* GNU */
+        -:  303:  PARSE_ACTION     ("ok",                    ok), /* POSIX */
+        -:  304:  PARSE_ACTION     ("okdir",                 okdir), /* GNU (-execdir is BSD) */
+        -:  305:  PARSE_TEST       ("path",                  path), /* GNU, HP-UX, RMS prefers wholename, but anyway soon POSIX */
+        -:  306:  PARSE_TEST       ("perm",                  perm), /* POSIX */
+        -:  307:  PARSE_ACTION     ("print",                 print), /* POSIX */
+        -:  308:  PARSE_ACTION     ("print0",                print0),	     /* GNU */
+        -:  309:  {ARG_ACTION,      "printf",   parse_printf, NULL},	     /* GNU */
+        -:  310:  PARSE_ACTION     ("prune",                 prune), /* POSIX */
+        -:  311:  PARSE_ACTION     ("quit",                  quit),	     /* GNU */
+        -:  312:  {ARG_TEST,       "readable",            parse_accesscheck, pred_readable}, /* GNU, 4.3.0+ */
+        -:  313:  PARSE_TEST       ("regex",                 regex),	     /* GNU */
+        -:  314:  PARSE_POSOPT     ("regextype",             regextype),     /* GNU */
+        -:  315:  PARSE_TEST       ("samefile",              samefile),	     /* GNU */
+        -:  316:#if 0
+        -:  317:  PARSE_OPTION     ("show-control-chars",    show_control_chars), /* GNU, 4.3.0+ */
+        -:  318:#endif
+        -:  319:  PARSE_TEST       ("size",                  size), /* POSIX */
+        -:  320:  PARSE_TEST       ("type",                  type), /* POSIX */
+        -:  321:  PARSE_TEST       ("uid",                   uid),	     /* GNU */
+        -:  322:  PARSE_TEST       ("used",                  used),	     /* GNU */
+        -:  323:  PARSE_TEST       ("user",                  user), /* POSIX */
+        -:  324:  PARSE_OPTION     ("warn",                  warn),	     /* GNU */
+        -:  325:  PARSE_TEST_NP    ("wholename",             wholename), /* GNU, replaced -path, but anyway -path will soon be in POSIX */
+        -:  326:  {ARG_TEST,       "writable",               parse_accesscheck, pred_writable}, /* GNU, 4.3.0+ */
+        -:  327:  PARSE_OPTION     ("xdev",                  xdev), /* POSIX */
+        -:  328:  PARSE_TEST       ("xtype",                 xtype),	     /* GNU */
+        -:  329:#ifdef UNIMPLEMENTED_UNIX
+        -:  330:  /* It's pretty ugly for find to know about archive formats.
+        -:  331:     Plus what it could do with cpio archives is very limited.
+        -:  332:     Better to leave it out.  */
+        -:  333:  PARSE(ARG_UNIMPLEMENTED,      "cpio",                  cpio),	/* Unix */
+        -:  334:#endif
+        -:  335:  /* gnulib's stdbool.h might have made true and false into macros,
+        -:  336:   * so we can't leave named 'true' and 'false' tokens, so we have
+        -:  337:   * to expeant the relevant entries longhand.
+        -:  338:   */
+        -:  339:  {ARG_TEST, "false",                 parse_false,   pred_false}, /* GNU */
+        -:  340:  {ARG_TEST, "true",                  parse_true,    pred_true }, /* GNU */
+        -:  341:  {ARG_NOOP, "noop",                  NULL,          pred_true }, /* GNU, internal use only */
+        -:  342:
+        -:  343:  /* Various other cases that don't fit neatly into our macro scheme. */
+        -:  344:  {ARG_TEST, "help",                  parse_help,    NULL},       /* GNU */
+        -:  345:  {ARG_TEST, "-help",                 parse_help,    NULL},       /* GNU */
+        -:  346:  {ARG_TEST, "version",               parse_version, NULL},	  /* GNU */
+        -:  347:  {ARG_TEST, "-version",              parse_version, NULL},	  /* GNU */
+        -:  348:  {0, 0, 0, 0}
+        -:  349:};
+        -:  350:
+        -:  351:
+        -:  352:static const char *first_nonoption_arg = NULL;
+        -:  353:static const struct parser_table *noop = NULL;
+        -:  354:
+        -:  355:static int
+    #####:  356:fallback_getfilecon (int fd, const char *name, security_context_t *p,
+        -:  357:		     int prev_rv)
+        -:  358:{
+        -:  359:  /* Our original getfilecon () call failed.  Perhaps we can't follow a
+        -:  360:   * symbolic link.  If that might be the problem, lgetfilecon () the link.
+        -:  361:   * Otherwise, admit defeat. */
+    #####:  362:  switch (errno)
+        -:  363:    {
+        -:  364:      case ENOENT:
+        -:  365:      case ENOTDIR:
+        -:  366:#ifdef DEBUG_STAT
+        -:  367:	fprintf (stderr, "fallback_getfilecon(): getfilecon(%s) failed; falling "
+        -:  368:			"back on lgetfilecon()\n", name);
+        -:  369:#endif
+    #####:  370:	return lgetfileconat (fd, name, p);
+        -:  371:
+        -:  372:      case EACCES:
+        -:  373:      case EIO:
+        -:  374:      case ELOOP:
+        -:  375:      case ENAMETOOLONG:
+        -:  376:#ifdef EOVERFLOW
+        -:  377:      case EOVERFLOW:        /* EOVERFLOW is not #defined on UNICOS. */
+        -:  378:#endif
+        -:  379:      default:
+    #####:  380:	return prev_rv;
+        -:  381:    }
+        -:  382:}
+        -:  383:
+        -:  384:/* optionh_getfilecon () implements the getfilecon operation when the
+        -:  385: * -H option is in effect.
+        -:  386: *
+        -:  387: * If the item to be examined is a command-line argument, we follow
+        -:  388: * symbolic links.  If the getfilecon () call fails on the command-line
+        -:  389: * item, we fall back on the properties of the symbolic link.
+        -:  390: *
+        -:  391: * If the item to be examined is not a command-line argument, we
+        -:  392: * examine the link itself. */
+        -:  393:int
+    #####:  394:optionh_getfilecon (int fd, const char *name, security_context_t *p)
+        -:  395:{
+        -:  396:  int rv;
+    #####:  397:  if (0 == state.curdepth)
+        -:  398:    {
+        -:  399:      /* This file is from the command line; dereference the link (if it is
+        -:  400:	 a link). */
+    #####:  401:      rv = getfileconat (fd, name, p);
+    #####:  402:      if (0 == rv)
+    #####:  403:	return 0;               /* success */
+        -:  404:      else
+    #####:  405:	return fallback_getfilecon (fd, name, p, rv);
+        -:  406:    }
+        -:  407:  else
+        -:  408:    {
+        -:  409:      /* Not a file on the command line; do not dereference the link. */
+    #####:  410:      return lgetfileconat (fd, name, p);
+        -:  411:    }
+        -:  412:}
+        -:  413:
+        -:  414:/* optionl_getfilecon () implements the getfilecon operation when the
+        -:  415: * -L option is in effect.  That option makes us examine the thing the
+        -:  416: * symbolic link points to, not the symbolic link itself. */
+        -:  417:int
+    #####:  418:optionl_getfilecon (int fd, const char *name, security_context_t *p)
+        -:  419:{
+    #####:  420:  int rv = getfileconat (fd, name, p);
+    #####:  421:  if (0 == rv)
+    #####:  422:    return 0;                  /* normal case. */
+        -:  423:  else
+    #####:  424:    return fallback_getfilecon (fd, name, p, rv);
+        -:  425:}
+        -:  426:
+        -:  427:/* optionp_getfilecon () implements the stat operation when the -P
+        -:  428: * option is in effect (this is also the default).  That option makes
+        -:  429: * us examine the symbolic link itself, not the thing it points to. */
+        -:  430:int
+    #####:  431:optionp_getfilecon (int fd, const char *name, security_context_t *p)
+        -:  432:{
+    #####:  433:  return lgetfileconat (fd, name, p);
+        -:  434:}
+        -:  435:
+        -:  436:void
+    #####:  437:check_option_combinations (const struct predicate *p)
+        -:  438:{
+        -:  439:  enum { seen_delete=1u, seen_prune=2u };
+    #####:  440:  unsigned int predicates = 0u;
+        -:  441:
+    #####:  442:  while (p)
+        -:  443:    {
+    #####:  444:      if (p->pred_func == pred_delete)
+    #####:  445:	predicates |= seen_delete;
+    #####:  446:      else if (p->pred_func == pred_prune)
+    #####:  447:	predicates |= seen_prune;
+    #####:  448:      p = p->pred_next;
+        -:  449:    }
+        -:  450:
+    #####:  451:  if ((predicates & seen_prune) && (predicates & seen_delete))
+        -:  452:    {
+        -:  453:      /* The user specified both -delete and -prune.  One might test
+        -:  454:       * this by first doing
+        -:  455:       *    find dirs   .... -prune ..... -print
+        -:  456:       * to fnd out what's going to get deleted, and then switch to
+        -:  457:       *    find dirs   .... -prune ..... -delete
+        -:  458:       * once we are happy.  Unfortunately, the -delete action also
+        -:  459:       * implicitly turns on -depth, which will affect the behaviour
+        -:  460:       * of -prune (in fact, it makes it a no-op).  In this case we
+        -:  461:       * would like to prevent unfortunate accidents, so we require
+        -:  462:       * the user to have explicitly used -depth.
+        -:  463:       *
+        -:  464:       * We only get away with this because the -delete predicate is not
+        -:  465:       * in POSIX.   If it was, we couldn't issue a fatal error here.
+        -:  466:       */
+    #####:  467:      if (!options.explicit_depth)
+        -:  468:	{
+        -:  469:	  /* This fixes Savannah bug #20865. */
+    #####:  470:	  error (EXIT_FAILURE, 0,
+        -:  471:		 _("The -delete action atomatically turns on -depth, "
+        -:  472:		   "but -prune does nothing when -depth is in effect.  "
+        -:  473:		   "If you want to carry on anyway, just explicitly use "
+        -:  474:		   "the -depth option."));
+        -:  475:	}
+        -:  476:    }
+    #####:  477:}
+        -:  478:
+        -:  479:
+        -:  480:static const struct parser_table*
+    #####:  481:get_noop (void)
+        -:  482:{
+        -:  483:  int i;
+    #####:  484:  if (NULL == noop)
+        -:  485:    {
+    #####:  486:      for (i = 0; parse_table[i].parser_name != 0; i++)
+        -:  487:	{
+    #####:  488:	  if (ARG_NOOP ==parse_table[i].type)
+        -:  489:	    {
+    #####:  490:	      noop = &(parse_table[i]);
+    #####:  491:	      break;
+        -:  492:	    }
+        -:  493:	}
+        -:  494:    }
+    #####:  495:  return noop;
+        -:  496:}
+        -:  497:
+        -:  498:static int
+    #####:  499:get_stat_Ytime (const struct stat *p,
+        -:  500:		char what,
+        -:  501:		struct timespec *ret)
+        -:  502:{
+    #####:  503:  switch (what)
+        -:  504:    {
+        -:  505:    case 'a':
+    #####:  506:      *ret = get_stat_atime (p);
+    #####:  507:      return 1;
+        -:  508:    case 'B':
+    #####:  509:      *ret = get_stat_birthtime (p);
+    #####:  510:      return (ret->tv_nsec >= 0);
+        -:  511:    case 'c':
+    #####:  512:      *ret = get_stat_ctime (p);
+    #####:  513:      return 1;
+        -:  514:    case 'm':
+    #####:  515:      *ret = get_stat_mtime (p);
+    #####:  516:      return 1;
+        -:  517:    default:
+    #####:  518:      assert (0);
+        -:  519:      abort ();
+        -:  520:    }
+        -:  521:}
+        -:  522:
+        -:  523:void
+        9:  524:set_follow_state (enum SymlinkOption opt)
+        -:  525:{
+        9:  526:  if (options.debug_options & DebugStat)
+        -:  527:    {
+        -:  528:      /* For DebugStat, the choice is made at runtime within debug_stat()
+        -:  529:       * by checking the contents of the symlink_handling variable.
+        -:  530:       */
+    #####:  531:      options.xstat = debug_stat;
+        -:  532:    }
+        -:  533:  else
+        -:  534:    {
+        9:  535:      switch (opt)
+        -:  536:	{
+        -:  537:	case SYMLINK_ALWAYS_DEREF:  /* -L */
+    #####:  538:	  options.xstat = optionl_stat;
+    #####:  539:	  options.x_getfilecon = optionl_getfilecon;
+    #####:  540:	  options.no_leaf_check = true;
+    #####:  541:	  break;
+        -:  542:
+        -:  543:	case SYMLINK_NEVER_DEREF:	/* -P (default) */
+        9:  544:	  options.xstat = optionp_stat;
+        9:  545:	  options.x_getfilecon = optionp_getfilecon;
+        -:  546:	  /* Can't turn no_leaf_check off because the user might have specified
+        -:  547:	   * -noleaf anyway
+        -:  548:	   */
+        9:  549:	  break;
+        -:  550:
+        -:  551:	case SYMLINK_DEREF_ARGSONLY: /* -H */
+    #####:  552:	  options.xstat = optionh_stat;
+    #####:  553:	  options.x_getfilecon = optionh_getfilecon;
+    #####:  554:	  options.no_leaf_check = true;
+        -:  555:	}
+        -:  556:    }
+        9:  557:  options.symlink_handling = opt;
+        9:  558:}
+        -:  559:
+        -:  560:
+        -:  561:void
+        9:  562:parse_begin_user_args (char **args, int argno,
+        -:  563:		       const struct predicate *last,
+        -:  564:		       const struct predicate *predicates)
+        -:  565:{
+        -:  566:  (void) args;
+        -:  567:  (void) argno;
+        -:  568:  (void) last;
+        -:  569:  (void) predicates;
+        9:  570:  first_nonoption_arg = NULL;
+        9:  571:}
+        -:  572:
+        -:  573:void
+    #####:  574:parse_end_user_args (char **args, int argno,
+        -:  575:		     const struct predicate *last,
+        -:  576:		     const struct predicate *predicates)
+        -:  577:{
+        -:  578:  /* does nothing */
+        -:  579:  (void) args;
+        -:  580:  (void) argno;
+        -:  581:  (void) last;
+        -:  582:  (void) predicates;
+    #####:  583:}
+        -:  584:
+        -:  585:
+        -:  586:/* Check that it is legal to fid the given primary in its
+        -:  587: * position and return it.
+        -:  588: */
+        -:  589:const struct parser_table*
+       45:  590:found_parser (const char *original_arg, const struct parser_table *entry)
+        -:  591:{
+        -:  592:  /* If this is an option, but we have already had a
+        -:  593:   * non-option argument, the user may be under the
+        -:  594:   * impression that the behaviour of the option
+        -:  595:   * argument is conditional on some preceding
+        -:  596:   * tests.  This might typically be the case with,
+        -:  597:   * for example, -maxdepth.
+        -:  598:   *
+        -:  599:   * The options -daystart and -follow are exempt
+        -:  600:   * from this treatment, since their positioning
+        -:  601:   * in the command line does have an effect on
+        -:  602:   * subsequent tests but not previous ones.  That
+        -:  603:   * might be intentional on the part of the user.
+        -:  604:   */
+       45:  605:  if (entry->type != ARG_POSITIONAL_OPTION)
+        -:  606:    {
+        -:  607:      /* Something other than -follow/-daystart.
+        -:  608:       * If this is an option, check if it followed
+        -:  609:       * a non-option and if so, issue a warning.
+        -:  610:       */
+       45:  611:      if (entry->type == ARG_OPTION)
+        -:  612:	{
+    #####:  613:	  if ((first_nonoption_arg != NULL)
+    #####:  614:	      && options.warnings )
+        -:  615:	    {
+        -:  616:	      /* option which follows a non-option */
+    #####:  617:	      error (0, 0,
+        -:  618:		     _("warning: you have specified the %s "
+        -:  619:		       "option after a non-option argument %s, "
+        -:  620:		       "but options are not positional (%s affects "
+        -:  621:		       "tests specified before it as well as those "
+        -:  622:		       "specified after it).  Please specify options "
+        -:  623:		       "before other arguments.\n"),
+        -:  624:		     original_arg,
+        -:  625:		     first_nonoption_arg,
+        -:  626:		     original_arg);
+        -:  627:	    }
+        -:  628:	}
+        -:  629:      else
+        -:  630:	{
+        -:  631:	  /* Not an option or a positional option,
+        -:  632:	   * so remember we've seen it in order to
+        -:  633:	   * use it in a possible future warning message.
+        -:  634:	   */
+       45:  635:	  if (first_nonoption_arg == NULL)
+        -:  636:	    {
+       18:  637:	      first_nonoption_arg = original_arg;
+        -:  638:	    }
+        -:  639:	}
+        -:  640:    }
+        -:  641:
+       45:  642:  return entry;
+        -:  643:}
+        -:  644:
+        -:  645:
+        -:  646:/* Return a pointer to the parser function to invoke for predicate
+        -:  647:   SEARCH_NAME.
+        -:  648:   Return NULL if SEARCH_NAME is not a valid predicate name. */
+        -:  649:
+        -:  650:const struct parser_table*
+       45:  651:find_parser (char *search_name)
+        -:  652:{
+        -:  653:  int i;
+       45:  654:  const char *original_arg = search_name;
+        -:  655:
+        -:  656:  /* Ugh.  Special case -newerXY. */
+       45:  657:  if (0 == strncmp ("-newer", search_name, 6)
+    #####:  658:      && (8 == strlen (search_name)))
+        -:  659:    {
+    #####:  660:      return found_parser (original_arg, &parse_entry_newerXY);
+        -:  661:    }
+        -:  662:
+       45:  663:  if (*search_name == '-')
+        9:  664:    search_name++;
+        -:  665:
+     1344:  666:  for (i = 0; parse_table[i].parser_name != 0; i++)
+        -:  667:    {
+     1344:  668:      if (strcmp (parse_table[i].parser_name, search_name) == 0)
+        -:  669:	{
+       45:  670:	  return found_parser (original_arg, &parse_table[i]);
+        -:  671:	}
+        -:  672:    }
+    #####:  673:  return NULL;
+        -:  674:}
+        -:  675:
+        -:  676:static float
+    #####:  677:estimate_file_age_success_rate (float num_days)
+        -:  678:{
+    #####:  679:  if (num_days < 0.1)
+        -:  680:    {
+        -:  681:      /* Assume 1% of files have timestamps in the future */
+    #####:  682:      return 0.01f;
+        -:  683:    }
+    #####:  684:  else if (num_days < 1)
+        -:  685:    {
+        -:  686:      /* Assume 30% of files have timestamps today */
+    #####:  687:      return 0.3f;
+        -:  688:    }
+    #####:  689:  else if (num_days > 100)
+        -:  690:    {
+        -:  691:      /* Assume 30% of files are very old */
+    #####:  692:      return 0.3f;
+        -:  693:    }
+        -:  694:  else
+        -:  695:    {
+        -:  696:      /* Assume 39% of files are between 1 and 100 days old. */
+    #####:  697:      return 0.39f;
+        -:  698:    }
+        -:  699:}
+        -:  700:
+        -:  701:static float
+    #####:  702:estimate_timestamp_success_rate (time_t when)
+        -:  703:{
+        -:  704:  /* This calculation ignores the nanoseconds field of the
+        -:  705:   * origin, but I don't think that makes much difference
+        -:  706:   * to our estimate.
+        -:  707:   */
+    #####:  708:  int num_days = (options.cur_day_start.tv_sec - when) / 86400;
+    #####:  709:  return estimate_file_age_success_rate (num_days);
+        -:  710:}
+        -:  711:
+        -:  712:/* Collect an argument from the argument list, or
+        -:  713: * return false.
+        -:  714: */
+        -:  715:static bool
+        8:  716:collect_arg (char **argv, int *arg_ptr, const char **collected_arg)
+        -:  717:{
+        8:  718:  if ((argv == NULL) || (argv[*arg_ptr] == NULL))
+        -:  719:    {
+    #####:  720:      *collected_arg = NULL;
+    #####:  721:      return false;
+        -:  722:    }
+        -:  723:  else
+        -:  724:    {
+        8:  725:      *collected_arg = argv[*arg_ptr];
+        8:  726:      (*arg_ptr)++;
+        8:  727:      return true;
+        -:  728:    }
+        -:  729:}
+        -:  730:
+        -:  731:static bool
+    #####:  732:collect_arg_stat_info (char **argv, int *arg_ptr, struct stat *p,
+        -:  733:		       const char **argument)
+        -:  734:{
+        -:  735:  const char *filename;
+    #####:  736:  if (collect_arg (argv, arg_ptr, &filename))
+        -:  737:    {
+    #####:  738:      *argument = filename;
+    #####:  739:      if (0 == (options.xstat)(filename, p))
+        -:  740:	{
+    #####:  741:	  return true;
+        -:  742:	}
+        -:  743:      else
+        -:  744:	{
+    #####:  745:	  fatal_target_file_error (errno, filename);
+        -:  746:	}
+        -:  747:    }
+        -:  748:  else
+        -:  749:    {
+    #####:  750:      *argument = NULL;
+    #####:  751:      return false;
+        -:  752:    }
+        -:  753:}
+        -:  754:
+        -:  755:/* The parsers are responsible to continue scanning ARGV for
+        -:  756:   their arguments.  Each parser knows what is and isn't
+        -:  757:   allowed for itself.
+        -:  758:
+        -:  759:   ARGV is the argument array.
+        -:  760:   *ARG_PTR is the index to start at in ARGV,
+        -:  761:   updated to point beyond the last element consumed.
+        -:  762:
+        -:  763:   The predicate structure is updated with the new information. */
+        -:  764:
+        -:  765:
+        -:  766:static bool
+    #####:  767:parse_and (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  768:{
+        -:  769:  struct predicate *our_pred;
+        -:  770:
+        -:  771:  (void) argv;
+        -:  772:  (void) arg_ptr;
+        -:  773:
+    #####:  774:  our_pred = get_new_pred_noarg (entry);
+    #####:  775:  our_pred->pred_func = pred_and;
+    #####:  776:  our_pred->p_type = BI_OP;
+    #####:  777:  our_pred->p_prec = AND_PREC;
+    #####:  778:  our_pred->need_stat = our_pred->need_type = false;
+    #####:  779:  return true;
+        -:  780:}
+        -:  781:
+        -:  782:static bool
+    #####:  783:parse_anewer (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  784:{
+        -:  785:  struct stat stat_newer;
+        -:  786:  const char *arg;
+        -:  787:
+    #####:  788:  set_stat_placeholders (&stat_newer);
+    #####:  789:  if (collect_arg_stat_info (argv, arg_ptr, &stat_newer, &arg))
+        -:  790:    {
+    #####:  791:      struct predicate *our_pred = insert_primary (entry, arg);
+    #####:  792:      our_pred->args.reftime.xval = XVAL_ATIME;
+    #####:  793:      our_pred->args.reftime.ts = get_stat_mtime (&stat_newer);
+    #####:  794:      our_pred->args.reftime.kind = COMP_GT;
+    #####:  795:      our_pred->est_success_rate = estimate_timestamp_success_rate (stat_newer.st_mtime);
+    #####:  796:      return true;
+        -:  797:    }
+    #####:  798:  return false;
+        -:  799:}
+        -:  800:
+        -:  801:bool
+    #####:  802:parse_closeparen (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  803:{
+        -:  804:  struct predicate *our_pred;
+        -:  805:
+        -:  806:  (void) argv;
+        -:  807:  (void) arg_ptr;
+        -:  808:
+    #####:  809:  our_pred = get_new_pred_noarg (entry);
+    #####:  810:  our_pred->pred_func = pred_closeparen;
+    #####:  811:  our_pred->p_type = CLOSE_PAREN;
+    #####:  812:  our_pred->p_prec = NO_PREC;
+    #####:  813:  our_pred->need_stat = our_pred->need_type = false;
+    #####:  814:  return true;
+        -:  815:}
+        -:  816:
+        -:  817:static bool
+    #####:  818:parse_cnewer (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  819:{
+        -:  820:  struct stat stat_newer;
+        -:  821:  const char *arg;
+        -:  822:
+    #####:  823:  set_stat_placeholders (&stat_newer);
+    #####:  824:  if (collect_arg_stat_info (argv, arg_ptr, &stat_newer, &arg))
+        -:  825:    {
+    #####:  826:      struct predicate *our_pred = insert_primary (entry, arg);
+    #####:  827:      our_pred->args.reftime.xval = XVAL_CTIME; /* like -newercm */
+    #####:  828:      our_pred->args.reftime.ts = get_stat_mtime (&stat_newer);
+    #####:  829:      our_pred->args.reftime.kind = COMP_GT;
+    #####:  830:      our_pred->est_success_rate = estimate_timestamp_success_rate (stat_newer.st_mtime);
+    #####:  831:      return true;
+        -:  832:    }
+    #####:  833:  return false;
+        -:  834:}
+        -:  835:
+        -:  836:static bool
+    #####:  837:parse_comma (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  838:{
+        -:  839:  struct predicate *our_pred;
+        -:  840:
+        -:  841:  (void) argv;
+        -:  842:  (void) arg_ptr;
+        -:  843:
+    #####:  844:  our_pred = get_new_pred_noarg (entry);
+    #####:  845:  our_pred->pred_func = pred_comma;
+    #####:  846:  our_pred->p_type = BI_OP;
+    #####:  847:  our_pred->p_prec = COMMA_PREC;
+    #####:  848:  our_pred->need_stat = our_pred->need_type = false;
+    #####:  849:  our_pred->est_success_rate = 1.0f;
+    #####:  850:  return true;
+        -:  851:}
+        -:  852:
+        -:  853:static bool
+    #####:  854:parse_daystart (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  855:{
+        -:  856:  struct tm *local;
+        -:  857:
+        -:  858:  (void) entry;
+        -:  859:  (void) argv;
+        -:  860:  (void) arg_ptr;
+        -:  861:
+    #####:  862:  if (options.full_days == false)
+        -:  863:    {
+    #####:  864:      options.cur_day_start.tv_sec += DAYSECS;
+    #####:  865:      options.cur_day_start.tv_nsec = 0;
+    #####:  866:      local = localtime (&options.cur_day_start.tv_sec);
+    #####:  867:      options.cur_day_start.tv_sec -= (local
+    #####:  868:				       ? (local->tm_sec + local->tm_min * 60
+    #####:  869:					  + local->tm_hour * 3600)
+    #####:  870:				       : options.cur_day_start.tv_sec % DAYSECS);
+    #####:  871:      options.full_days = true;
+        -:  872:    }
+    #####:  873:  return true;
+        -:  874:}
+        -:  875:
+        -:  876:static bool
+    #####:  877:parse_delete (const struct parser_table* entry, char *argv[], int *arg_ptr)
+        -:  878:{
+        -:  879:  struct predicate *our_pred;
+        -:  880:  (void) argv;
+        -:  881:  (void) arg_ptr;
+        -:  882:
+    #####:  883:  our_pred = insert_primary_noarg (entry);
+    #####:  884:  our_pred->side_effects = our_pred->no_default_print = true;
+        -:  885:  /* -delete implies -depth */
+    #####:  886:  options.do_dir_first = false;
+        -:  887:
+        -:  888:  /* We do not need stat information because we check for the case
+        -:  889:   * (errno==EISDIR) in pred_delete.
+        -:  890:   */
+    #####:  891:  our_pred->need_stat = our_pred->need_type = false;
+        -:  892:
+    #####:  893:  our_pred->est_success_rate = 1.0f;
+    #####:  894:  return true;
+        -:  895:}
+        -:  896:
+        -:  897:static bool
+    #####:  898:parse_depth (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  899:{
+        -:  900:  (void) entry;
+        -:  901:  (void) argv;
+        -:  902:
+    #####:  903:  options.do_dir_first = false;
+    #####:  904:  options.explicit_depth = true;
+    #####:  905:  return parse_noop (entry, argv, arg_ptr);
+        -:  906:}
+        -:  907:
+        -:  908:static bool
+    #####:  909:parse_d (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  910:{
+    #####:  911:  if (options.warnings)
+        -:  912:    {
+    #####:  913:      error (0, 0,
+        -:  914:	     _("warning: the -d option is deprecated; please use "
+        -:  915:	       "-depth instead, because the latter is a "
+        -:  916:	       "POSIX-compliant feature."));
+        -:  917:    }
+    #####:  918:  return parse_depth (entry, argv, arg_ptr);
+        -:  919:}
+        -:  920:
+        -:  921:static bool
+    #####:  922:parse_empty (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  923:{
+        -:  924:  struct predicate *our_pred;
+        -:  925:  (void) argv;
+        -:  926:  (void) arg_ptr;
+        -:  927:
+    #####:  928:  our_pred = insert_primary_noarg (entry);
+    #####:  929:  our_pred->est_success_rate = 0.01f; /* assume 1% of files are empty. */
+    #####:  930:  return true;
+        -:  931:}
+        -:  932:
+        -:  933:static bool
+    #####:  934:parse_exec (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  935:{
+    #####:  936:  return insert_exec_ok ("-exec", entry, argv, arg_ptr);
+        -:  937:}
+        -:  938:
+        -:  939:static bool
+    #####:  940:parse_execdir (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  941:{
+    #####:  942:  return insert_exec_ok ("-execdir", entry, argv, arg_ptr);
+        -:  943:}
+        -:  944:
+        -:  945:static bool
+    #####:  946:insert_false(void)
+        -:  947:{
+        -:  948:  struct predicate *our_pred;
+        -:  949:  const struct parser_table *entry_false;
+        -:  950:
+    #####:  951:  entry_false = find_parser("false");
+    #####:  952:  our_pred = insert_primary_noarg (entry_false);
+    #####:  953:  our_pred->need_stat = our_pred->need_type = false;
+    #####:  954:  our_pred->side_effects = our_pred->no_default_print = false;
+    #####:  955:  our_pred->est_success_rate = 0.0f;
+    #####:  956:  return true;
+        -:  957:}
+        -:  958:
+        -:  959:
+        -:  960:static bool
+    #####:  961:parse_false (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  962:{
+    #####:  963:  return insert_false ();
+        -:  964:}
+        -:  965:
+        -:  966:static bool
+    #####:  967:insert_fls (const struct parser_table* entry, const char *filename)
+        -:  968:{
+    #####:  969:  struct predicate *our_pred = insert_primary_noarg (entry);
+    #####:  970:  if (filename)
+    #####:  971:    open_output_file (filename, &our_pred->args.printf_vec);
+        -:  972:  else
+    #####:  973:    open_stdout (&our_pred->args.printf_vec);
+    #####:  974:  our_pred->side_effects = our_pred->no_default_print = true;
+    #####:  975:  our_pred->est_success_rate = 1.0f;
+    #####:  976:  return true;
+        -:  977:}
+        -:  978:
+        -:  979:
+        -:  980:static bool
+    #####:  981:parse_fls (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  982:{
+        -:  983:  const char *filename;
+    #####:  984:  if (collect_arg (argv, arg_ptr, &filename))
+        -:  985:    {
+    #####:  986:      if (insert_fls (entry, filename))
+    #####:  987:	return true;
+        -:  988:      else
+    #####:  989:	--*arg_ptr;		/* don't consume the invalid arg. */
+        -:  990:    }
+    #####:  991:  return false;
+        -:  992:}
+        -:  993:
+        -:  994:static bool
+    #####:  995:parse_follow (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -:  996:{
+    #####:  997:  set_follow_state (SYMLINK_ALWAYS_DEREF);
+    #####:  998:  return parse_noop (entry, argv, arg_ptr);
+        -:  999:}
+        -: 1000:
+        -: 1001:static bool
+    #####: 1002:parse_fprint (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1003:{
+        -: 1004:  struct predicate *our_pred;
+        -: 1005:  const char *filename;
+    #####: 1006:  if (collect_arg (argv, arg_ptr, &filename))
+        -: 1007:    {
+    #####: 1008:      our_pred = insert_primary (entry, filename);
+    #####: 1009:      open_output_file (filename, &our_pred->args.printf_vec);
+    #####: 1010:      our_pred->side_effects = our_pred->no_default_print = true;
+    #####: 1011:      our_pred->need_stat = our_pred->need_type = false;
+    #####: 1012:      our_pred->est_success_rate = 1.0f;
+    #####: 1013:      return true;
+        -: 1014:    }
+        -: 1015:  else
+        -: 1016:    {
+    #####: 1017:      return false;
+        -: 1018:    }
+        -: 1019:}
+        -: 1020:
+        -: 1021:static bool
+    #####: 1022:insert_fprint (const struct parser_table* entry, const char *filename)
+        -: 1023:{
+    #####: 1024:  struct predicate *our_pred = insert_primary (entry, filename);
+    #####: 1025:  if (filename)
+    #####: 1026:    open_output_file (filename, &our_pred->args.printf_vec);
+        -: 1027:  else
+    #####: 1028:    open_stdout (&our_pred->args.printf_vec);
+    #####: 1029:  our_pred->side_effects = our_pred->no_default_print = true;
+    #####: 1030:  our_pred->need_stat = our_pred->need_type = false;
+    #####: 1031:  our_pred->est_success_rate = 1.0f;
+    #####: 1032:  return true;
+        -: 1033:}
+        -: 1034:
+        -: 1035:
+        -: 1036:static bool
+    #####: 1037:parse_fprint0 (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1038:{
+        -: 1039:  const char *filename;
+    #####: 1040:  if (collect_arg (argv, arg_ptr, &filename))
+        -: 1041:    {
+    #####: 1042:      if (insert_fprint (entry, filename))
+    #####: 1043:	return true;
+        -: 1044:      else
+    #####: 1045:	--*arg_ptr;		/* don't consume the bad arg. */
+        -: 1046:    }
+    #####: 1047:  return false;
+        -: 1048:}
+        -: 1049:
+    #####: 1050:static float estimate_fstype_success_rate (const char *fsname)
+        -: 1051:{
+        -: 1052:  struct stat dir_stat;
+    #####: 1053:  const char *the_root_dir = "/";
+    #####: 1054:  if (0 == stat (the_root_dir, &dir_stat)) /* it's an absolute path anyway */
+        -: 1055:    {
+    #####: 1056:      const char *fstype = filesystem_type (&dir_stat, the_root_dir);
+        -: 1057:      /* Assume most files are on the same file system type as the root fs. */
+    #####: 1058:      if (0 == strcmp (fsname, fstype))
+    #####: 1059:	  return 0.7f;
+        -: 1060:      else
+    #####: 1061:	return 0.3f;
+        -: 1062:    }
+    #####: 1063:  return 1.0f;
+        -: 1064:}
+        -: 1065:
+        -: 1066:
+        -: 1067:
+        -: 1068:static bool
+    #####: 1069:is_used_fs_type(const char *name)
+        -: 1070:{
+    #####: 1071:  if (0 == strcmp("afs", name))
+        -: 1072:    {
+        -: 1073:      /* I guess AFS may not appear in /etc/mtab (or equivalent) but still be in use,
+        -: 1074:	 so assume we always need to check for AFS.  */
+    #####: 1075:      return true;
+        -: 1076:    }
+        -: 1077:  else
+        -: 1078:    {
+    #####: 1079:      const struct mount_entry *entries = read_file_system_list(false);
+    #####: 1080:      if (entries)
+        -: 1081:	{
+        -: 1082:	  const struct mount_entry *entry;
+    #####: 1083:	  for (entry = entries; entry; entry = entry->me_next)
+        -: 1084:	    {
+    #####: 1085:	      if (0 == strcmp(name, entry->me_type))
+    #####: 1086:		return true;
+        -: 1087:	    }
+        -: 1088:	}
+        -: 1089:      else
+        -: 1090:	{
+    #####: 1091:	  return true;
+        -: 1092:	}
+        -: 1093:    }
+    #####: 1094:  return false;
+        -: 1095:}
+        -: 1096:
+        -: 1097:
+        -: 1098:static bool
+    #####: 1099:parse_fstype (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1100:{
+        -: 1101:  const char *typename;
+    #####: 1102:  if (collect_arg (argv, arg_ptr, &typename))
+        -: 1103:    {
+    #####: 1104:      if (options.optimisation_level < 2 || is_used_fs_type (typename))
+        -: 1105:	{
+    #####: 1106:	  struct predicate *our_pred = insert_primary (entry, typename);
+    #####: 1107:	  our_pred->args.str = typename;
+        -: 1108:
+        -: 1109:	  /* This is an expensive operation, so although there are
+        -: 1110:	   * circumstances where it is selective, we ignore this fact
+        -: 1111:	   * because we probably don't want to promote this test to the
+        -: 1112:	   * front anyway.
+        -: 1113:	   */
+    #####: 1114:	  our_pred->est_success_rate = estimate_fstype_success_rate (typename);
+    #####: 1115:	  return true;
+        -: 1116:	}
+        -: 1117:      else
+        -: 1118:	{
+        -: 1119:	  /* This filesystem type is not listed in the mount table.
+        -: 1120:	   * Hence this predicate will always return false (with this argument).
+        -: 1121:	   * Substitute a predicate with the same effect as -false.
+        -: 1122:	   */
+    #####: 1123:	  if (options.debug_options & DebugTreeOpt)
+        -: 1124:	    {
+    #####: 1125:	      fprintf (stderr,
+        -: 1126:		       "-fstype %s can never succeed, substituting -false\n",
+        -: 1127:		       typename);
+        -: 1128:	    }
+    #####: 1129:	  return insert_false ();
+        -: 1130:	}
+        -: 1131:    }
+        -: 1132:  else
+        -: 1133:    {
+    #####: 1134:      return false;
+        -: 1135:    }
+        -: 1136:}
+        -: 1137:
+        -: 1138:static bool
+    #####: 1139:parse_gid (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1140:{
+    #####: 1141:  struct predicate *p = insert_num (argv, arg_ptr, entry);
+    #####: 1142:  if (p)
+        -: 1143:    {
+    #####: 1144:      p->est_success_rate = (p->args.numinfo.l_val < 100) ? 0.99 : 0.2;
+    #####: 1145:      return true;
+        -: 1146:    }
+        -: 1147:  else
+        -: 1148:    {
+    #####: 1149:      --*arg_ptr;		/* don't consume the invalid argument. */
+    #####: 1150:      return false;
+        -: 1151:    }
+        -: 1152:}
+        -: 1153:
+        -: 1154:
+        -: 1155:static bool
+    #####: 1156:parse_group (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1157:{
+        -: 1158:  const char *groupname;
+    #####: 1159:  const int saved_argc = *arg_ptr;
+        -: 1160:
+    #####: 1161:  if (collect_arg (argv, arg_ptr, &groupname))
+        -: 1162:    {
+        -: 1163:      gid_t gid;
+        -: 1164:      struct predicate *our_pred;
+    #####: 1165:      struct group *cur_gr = getgrnam (groupname);
+    #####: 1166:      endgrent ();
+    #####: 1167:      if (cur_gr)
+        -: 1168:	{
+    #####: 1169:	  gid = cur_gr->gr_gid;
+        -: 1170:	}
+        -: 1171:      else
+        -: 1172:	{
+    #####: 1173:	  const int gid_len = strspn (groupname, "0123456789");
+    #####: 1174:	  if (gid_len)
+        -: 1175:	    {
+    #####: 1176:	      if (groupname[gid_len] == 0)
+        -: 1177:		{
+    #####: 1178:		  gid = safe_atoi (groupname, options.err_quoting_style);
+        -: 1179:		}
+        -: 1180:	      else
+        -: 1181:		{
+        -: 1182:		  /* XXX: no test in test suite for this */
+    #####: 1183:		  error (EXIT_FAILURE, 0,
+        -: 1184:			 _("%s is not the name of an existing group and"
+        -: 1185:			   " it does not look like a numeric group ID "
+        -: 1186:			   "because it has the unexpected suffix %s"),
+        -: 1187:			 quotearg_n_style (0, options.err_quoting_style, groupname),
+        -: 1188:			 quotearg_n_style (1, options.err_quoting_style, groupname+gid_len));
+    #####: 1189:		  *arg_ptr = saved_argc; /* don't consume the invalid argument. */
+    #####: 1190:		  return false;
+        -: 1191:		}
+        -: 1192:	    }
+        -: 1193:	  else
+        -: 1194:	    {
+    #####: 1195:	      if (*groupname)
+        -: 1196:		{
+        -: 1197:		  /* XXX: no test in test suite for this */
+    #####: 1198:		  error (EXIT_FAILURE, 0,
+        -: 1199:			 _("%s is not the name of an existing group"),
+        -: 1200:			 quotearg_n_style (0, options.err_quoting_style, groupname));
+        -: 1201:		}
+        -: 1202:	      else
+        -: 1203:		{
+    #####: 1204:		  error (EXIT_FAILURE, 0,
+        -: 1205:			 _("argument to -group is empty, but should be a group name"));
+        -: 1206:		}
+    #####: 1207:	      *arg_ptr = saved_argc; /* don't consume the invalid argument. */
+    #####: 1208:	      return false;
+        -: 1209:	    }
+        -: 1210:	}
+    #####: 1211:      our_pred = insert_primary (entry, groupname);
+    #####: 1212:      our_pred->args.gid = gid;
+    #####: 1213:      our_pred->est_success_rate = (our_pred->args.numinfo.l_val < 100) ? 0.99 : 0.2;
+    #####: 1214:      return true;
+        -: 1215:    }
+    #####: 1216:  return false;
+        -: 1217:}
+        -: 1218:
+        -: 1219:static bool
+    #####: 1220:parse_help (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1221:{
+        -: 1222:  (void) entry;
+        -: 1223:  (void) argv;
+        -: 1224:  (void) arg_ptr;
+        -: 1225:
+    #####: 1226:  usage (stdout, 0, NULL);
+    #####: 1227:  puts (_("\n\
+        -: 1228:default path is the current directory; default expression is -print\n\
+        -: 1229:expression may consist of: operators, options, tests, and actions:\n"));
+    #####: 1230:  puts (_("\
+        -: 1231:operators (decreasing precedence; -and is implicit where no others are given):\n\
+        -: 1232:      ( EXPR )   ! EXPR   -not EXPR   EXPR1 -a EXPR2   EXPR1 -and EXPR2\n\
+        -: 1233:      EXPR1 -o EXPR2   EXPR1 -or EXPR2   EXPR1 , EXPR2\n"));
+    #####: 1234:  puts (_("\
+        -: 1235:positional options (always true): -daystart -follow -regextype\n\n\
+        -: 1236:normal options (always true, specified before other expressions):\n\
+        -: 1237:      -depth --help -maxdepth LEVELS -mindepth LEVELS -mount -noleaf\n\
+        -: 1238:      --version -xdev -ignore_readdir_race -noignore_readdir_race\n"));
+    #####: 1239:  puts (_("\
+        -: 1240:tests (N can be +N or -N or N): -amin N -anewer FILE -atime N -cmin N\n\
+        -: 1241:      -cnewer FILE -ctime N -empty -false -fstype TYPE -gid N -group NAME\n\
+        -: 1242:      -ilname PATTERN -iname PATTERN -inum N -iwholename PATTERN -iregex PATTERN\n\
+        -: 1243:      -links N -lname PATTERN -mmin N -mtime N -name PATTERN -newer FILE"));
+    #####: 1244:  puts (_("\
+        -: 1245:      -nouser -nogroup -path PATTERN -perm [+-]MODE -regex PATTERN\n\
+        -: 1246:      -readable -writable -executable\n\
+        -: 1247:      -wholename PATTERN -size N[bcwkMG] -true -type [bcdpflsD] -uid N\n\
+        -: 1248:      -used N -user NAME -xtype [bcdpfls]"));
+    #####: 1249:  puts (_("\
+        -: 1250:      -context CONTEXT\n"));
+    #####: 1251:  puts (_("\n\
+        -: 1252:actions: -delete -print0 -printf FORMAT -fprintf FILE FORMAT -print \n\
+        -: 1253:      -fprint0 FILE -fprint FILE -ls -fls FILE -prune -quit\n\
+        -: 1254:      -exec COMMAND ; -exec COMMAND {} + -ok COMMAND ;\n\
+        -: 1255:      -execdir COMMAND ; -execdir COMMAND {} + -okdir COMMAND ;\n\
+        -: 1256:"));
+    #####: 1257:  puts (_("Report (and track progress on fixing) bugs via the findutils bug-reporting\n\
+        -: 1258:page at http://savannah.gnu.org/ or, if you have no web access, by sending\n\
+        -: 1259:email to <bug-findutils@gnu.org>."));
+    #####: 1260:  exit (EXIT_SUCCESS);
+        -: 1261:}
+        -: 1262:
+        -: 1263:static float
+    #####: 1264:estimate_pattern_match_rate (const char *pattern, int is_regex)
+        -: 1265:{
+    #####: 1266:  if (strpbrk (pattern, "*?[") || (is_regex && strpbrk(pattern, ".")))
+        -: 1267:    {
+        -: 1268:      /* A wildcard; assume the pattern matches most files. */
+    #####: 1269:      return 0.8f;
+        -: 1270:    }
+        -: 1271:  else
+        -: 1272:    {
+    #####: 1273:      return 0.1f;
+        -: 1274:    }
+        -: 1275:}
+        -: 1276:
+        -: 1277:static bool
+    #####: 1278:parse_ilname (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1279:{
+        -: 1280:  const char *name;
+    #####: 1281:  if (collect_arg (argv, arg_ptr, &name))
+        -: 1282:    {
+    #####: 1283:      struct predicate *our_pred = insert_primary (entry, name);
+    #####: 1284:      our_pred->args.str = name;
+        -: 1285:      /* Use the generic glob pattern estimator to figure out how many
+        -: 1286:       * links will match, but bear in mind that most files won't be links.
+        -: 1287:       */
+    #####: 1288:      our_pred->est_success_rate = 0.1 * estimate_pattern_match_rate (name, 0);
+    #####: 1289:      return true;
+        -: 1290:    }
+        -: 1291:  else
+        -: 1292:    {
+    #####: 1293:      return false;
+        -: 1294:    }
+        -: 1295:}
+        -: 1296:
+        -: 1297:
+        -: 1298:/* sanity check the fnmatch() function to make sure that case folding
+        -: 1299: * is supported (as opposed to just having the flag ignored).
+        -: 1300: */
+        -: 1301:static bool
+    #####: 1302:fnmatch_sanitycheck (void)
+        -: 1303:{
+        -: 1304:  static bool checked = false;
+    #####: 1305:  if (!checked)
+        -: 1306:    {
+    #####: 1307:      if (0 != fnmatch ("foo", "foo", 0)
+    #####: 1308:	  || 0 == fnmatch ("Foo", "foo", 0)
+    #####: 1309:	  || 0 != fnmatch ("Foo", "foo", FNM_CASEFOLD))
+        -: 1310:	{
+    #####: 1311:	  error (EXIT_FAILURE, 0,
+        -: 1312:		 _("sanity check of the fnmatch() library function failed."));
+    #####: 1313:	  return false;
+        -: 1314:	}
+    #####: 1315:      checked = true;
+        -: 1316:    }
+    #####: 1317:  return checked;
+        -: 1318:}
+        -: 1319:
+        -: 1320:
+        -: 1321:static bool
+    #####: 1322:check_name_arg (const char *pred, const char *arg)
+        -: 1323:{
+    #####: 1324:  if (options.warnings && strchr (arg, '/'))
+        -: 1325:    {
+    #####: 1326:      error (0, 0,_("warning: Unix filenames usually don't contain slashes "
+        -: 1327:		    "(though pathnames do).  That means that '%s %s' will "
+        -: 1328:		    "probably evaluate to false all the time on this system.  "
+        -: 1329:		    "You might find the '-wholename' test more useful, or "
+        -: 1330:		    "perhaps '-samefile'.  Alternatively, if you are using "
+        -: 1331:		    "GNU grep, you could "
+        -: 1332:		    "use 'find ... -print0 | grep -FzZ %s'."),
+        -: 1333:	    pred,
+        -: 1334:	    safely_quote_err_filename (0, arg),
+        -: 1335:	    safely_quote_err_filename (1, arg));
+        -: 1336:    }
+    #####: 1337:  return true;			/* allow it anyway */
+        -: 1338:}
+        -: 1339:
+        -: 1340:
+        -: 1341:
+        -: 1342:static bool
+    #####: 1343:parse_iname (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1344:{
+        -: 1345:  const char *name;
+    #####: 1346:  fnmatch_sanitycheck ();
+    #####: 1347:  if (collect_arg (argv, arg_ptr, &name))
+        -: 1348:    {
+    #####: 1349:      if (check_name_arg ("-iname", name))
+        -: 1350:	{
+    #####: 1351:	  struct predicate *our_pred = insert_primary (entry, name);
+    #####: 1352:	  our_pred->need_stat = our_pred->need_type = false;
+    #####: 1353:	  our_pred->args.str = name;
+    #####: 1354:	  our_pred->est_success_rate = estimate_pattern_match_rate (name, 0);
+    #####: 1355:	  return true;
+        -: 1356:	}
+        -: 1357:    }
+    #####: 1358:  return false;
+        -: 1359:}
+        -: 1360:
+        -: 1361:static bool
+    #####: 1362:parse_inum (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1363:{
+    #####: 1364:  struct predicate *p =  insert_num (argv, arg_ptr, entry);
+    #####: 1365:  if (p)
+        -: 1366:    {
+        -: 1367:      /* inode number is exact match only, so very low proportions of
+        -: 1368:       * files match
+        -: 1369:       */
+    #####: 1370:      p->est_success_rate = 1e-6;
+    #####: 1371:      p->need_inum = true;
+    #####: 1372:      p->need_stat = false;
+    #####: 1373:      p->need_type = false;
+    #####: 1374:      return true;
+        -: 1375:    }
+        -: 1376:  else
+        -: 1377:    {
+    #####: 1378:      --*arg_ptr;		/* don't consume the invalid argument. */
+    #####: 1379:      return false;
+        -: 1380:    }
+        -: 1381:}
+        -: 1382:
+        -: 1383:static bool
+    #####: 1384:parse_iregex (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1385:{
+    #####: 1386:  return insert_regex (argv, arg_ptr, entry, RE_ICASE|options.regex_options);
+        -: 1387:}
+        -: 1388:
+        -: 1389:static bool
+    #####: 1390:parse_links (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1391:{
+    #####: 1392:  struct predicate *p = insert_num (argv, arg_ptr, entry);
+    #####: 1393:  if (p)
+        -: 1394:    {
+    #####: 1395:      if (p->args.numinfo.l_val == 1)
+    #####: 1396:	p->est_success_rate = 0.99;
+    #####: 1397:      else if (p->args.numinfo.l_val == 2)
+    #####: 1398:	p->est_success_rate = 0.01;
+        -: 1399:      else
+    #####: 1400:	p->est_success_rate = 1e-3;
+    #####: 1401:      return true;
+        -: 1402:    }
+        -: 1403:  else
+        -: 1404:    {
+    #####: 1405:      --*arg_ptr;		/* don't consume the invalid argument. */
+    #####: 1406:      return false;
+        -: 1407:    }
+        -: 1408:}
+        -: 1409:
+        -: 1410:static bool
+    #####: 1411:parse_lname (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1412:{
+        -: 1413:  const char *name;
+    #####: 1414:  fnmatch_sanitycheck ();
+    #####: 1415:  if (collect_arg (argv, arg_ptr, &name))
+        -: 1416:    {
+    #####: 1417:      struct predicate *our_pred = insert_primary (entry, name);
+    #####: 1418:      our_pred->args.str = name;
+    #####: 1419:      our_pred->est_success_rate = 0.1 * estimate_pattern_match_rate (name, 0);
+    #####: 1420:      return true;
+        -: 1421:    }
+    #####: 1422:  return false;
+        -: 1423:}
+        -: 1424:
+        -: 1425:static bool
+    #####: 1426:parse_ls (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1427:{
+        -: 1428:  (void) &argv;
+        -: 1429:  (void) &arg_ptr;
+    #####: 1430:  return insert_fls (entry, NULL);
+        -: 1431:}
+        -: 1432:
+        -: 1433:static bool
+    #####: 1434:insert_depthspec (const struct parser_table* entry, char **argv, int *arg_ptr,
+        -: 1435:		  int *limitptr)
+        -: 1436:{
+        -: 1437:  const char *depthstr;
+        -: 1438:  int depth_len;
+    #####: 1439:  const char *predicate = argv[(*arg_ptr)-1];
+    #####: 1440:  if (collect_arg (argv, arg_ptr, &depthstr))
+        -: 1441:    {
+    #####: 1442:      depth_len = strspn (depthstr, "0123456789");
+    #####: 1443:      if ((depth_len > 0) && (depthstr[depth_len] == 0))
+        -: 1444:	{
+    #####: 1445:	  (*limitptr) = safe_atoi (depthstr, options.err_quoting_style);
+    #####: 1446:	  if (*limitptr >= 0)
+        -: 1447:	    {
+    #####: 1448:	      return parse_noop (entry, argv, arg_ptr);
+        -: 1449:	    }
+        -: 1450:	}
+    #####: 1451:      error (EXIT_FAILURE, 0,
+        -: 1452:	     _("Expected a positive decimal integer argument to %s, but got %s"),
+        -: 1453:	     predicate,
+        -: 1454:	     quotearg_n_style (0, options.err_quoting_style, depthstr));
+        -: 1455:      /* NOTREACHED */
+    #####: 1456:      return false;
+        -: 1457:    }
+        -: 1458:  /* missing argument */
+    #####: 1459:  return false;
+        -: 1460:}
+        -: 1461:
+        -: 1462:
+        -: 1463:static bool
+    #####: 1464:parse_maxdepth (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1465:{
+    #####: 1466:  return insert_depthspec (entry, argv, arg_ptr, &options.maxdepth);
+        -: 1467:}
+        -: 1468:
+        -: 1469:static bool
+    #####: 1470:parse_mindepth (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1471:{
+    #####: 1472:  return insert_depthspec (entry, argv, arg_ptr, &options.mindepth);
+        -: 1473:}
+        -: 1474:
+        -: 1475:
+        -: 1476:static bool
+    #####: 1477:do_parse_xmin (const struct parser_table* entry,
+        -: 1478:	       char **argv,
+        -: 1479:	       int *arg_ptr,
+        -: 1480:	       enum xval xv)
+        -: 1481:{
+        -: 1482:  const char *minutes;
+    #####: 1483:  const int saved_argc = *arg_ptr;
+        -: 1484:
+    #####: 1485:  if (collect_arg (argv, arg_ptr, &minutes))
+        -: 1486:    {
+        -: 1487:      struct time_val tval;
+    #####: 1488:      struct timespec origin = options.cur_day_start;
+    #####: 1489:      tval.xval = xv;
+    #####: 1490:      origin.tv_sec += DAYSECS;
+    #####: 1491:      if (get_relative_timestamp (minutes, &tval, origin, 60,
+        -: 1492:				  "arithmetic overflow while converting %s "
+        -: 1493:				  "minutes to a number of seconds"))
+        -: 1494:	{
+    #####: 1495:	  struct predicate *our_pred = insert_primary (entry, minutes);
+    #####: 1496:	  our_pred->args.reftime = tval;
+    #####: 1497:	  our_pred->est_success_rate = estimate_timestamp_success_rate (tval.ts.tv_sec);
+    #####: 1498:	  return true;
+        -: 1499:	}
+        -: 1500:      else
+        -: 1501:	{
+        -: 1502:	  /* Don't consume the invalid argument. */
+    #####: 1503:	  *arg_ptr = saved_argc;
+        -: 1504:	}
+        -: 1505:    }
+    #####: 1506:  return false;
+        -: 1507:}
+        -: 1508:static bool
+    #####: 1509:parse_amin (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1510:{
+    #####: 1511:  return do_parse_xmin (entry, argv, arg_ptr, XVAL_ATIME);
+        -: 1512:}
+        -: 1513:
+        -: 1514:static bool
+    #####: 1515:parse_cmin (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1516:{
+    #####: 1517:  return do_parse_xmin (entry, argv, arg_ptr, XVAL_CTIME);
+        -: 1518:}
+        -: 1519:
+        -: 1520:
+        -: 1521:static bool
+    #####: 1522:parse_mmin (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1523:{
+    #####: 1524:  return do_parse_xmin (entry, argv, arg_ptr, XVAL_MTIME);
+        -: 1525:}
+        -: 1526:
+        -: 1527:static bool
+    #####: 1528:parse_name (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1529:{
+        -: 1530:  const char *name;
+    #####: 1531:  const int saved_argc = *arg_ptr;
+        -: 1532:
+    #####: 1533:  if (collect_arg (argv, arg_ptr, &name))
+        -: 1534:    {
+    #####: 1535:      fnmatch_sanitycheck ();
+    #####: 1536:      if (check_name_arg ("-name", name))
+        -: 1537:	{
+    #####: 1538:	  struct predicate *our_pred = insert_primary (entry, name);
+    #####: 1539:	  our_pred->need_stat = our_pred->need_type = false;
+    #####: 1540:	  our_pred->args.str = name;
+    #####: 1541:	  our_pred->est_success_rate = estimate_pattern_match_rate (name, 0);
+    #####: 1542:	  return true;
+        -: 1543:	}
+        -: 1544:      else
+        -: 1545:	{
+    #####: 1546:	  *arg_ptr = saved_argc; /* don't consume the invalid argument. */
+        -: 1547:	}
+        -: 1548:    }
+    #####: 1549:  return false;
+        -: 1550:}
+        -: 1551:
+        -: 1552:static bool
+    #####: 1553:parse_negate (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1554:{
+        -: 1555:  struct predicate *our_pred;
+        -: 1556:
+        -: 1557:  (void) &argv;
+        -: 1558:  (void) &arg_ptr;
+        -: 1559:
+    #####: 1560:  our_pred = get_new_pred_chk_op (entry, NULL);
+    #####: 1561:  our_pred->pred_func = pred_negate;
+    #####: 1562:  our_pred->p_type = UNI_OP;
+    #####: 1563:  our_pred->p_prec = NEGATE_PREC;
+    #####: 1564:  our_pred->need_stat = our_pred->need_type = false;
+    #####: 1565:  return true;
+        -: 1566:}
+        -: 1567:
+        -: 1568:static bool
+    #####: 1569:parse_newer (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1570:{
+        -: 1571:  struct predicate *our_pred;
+        -: 1572:  struct stat stat_newer;
+        -: 1573:  const char *arg;
+        -: 1574:
+    #####: 1575:  set_stat_placeholders (&stat_newer);
+    #####: 1576:  if (collect_arg_stat_info (argv, arg_ptr, &stat_newer, &arg))
+        -: 1577:    {
+    #####: 1578:      our_pred = insert_primary (entry, arg);
+    #####: 1579:      our_pred->args.reftime.ts = get_stat_mtime (&stat_newer);
+    #####: 1580:      our_pred->args.reftime.xval = XVAL_MTIME;
+    #####: 1581:      our_pred->args.reftime.kind = COMP_GT;
+    #####: 1582:      our_pred->est_success_rate = estimate_timestamp_success_rate (stat_newer.st_mtime);
+    #####: 1583:      return true;
+        -: 1584:    }
+    #####: 1585:  return false;
+        -: 1586:}
+        -: 1587:
+        -: 1588:
+        -: 1589:static bool
+    #####: 1590:parse_newerXY (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1591:{
+        -: 1592:  (void) argv;
+        -: 1593:  (void) arg_ptr;
+        -: 1594:
+    #####: 1595:  if ((argv == NULL) || (argv[*arg_ptr] == NULL))
+        -: 1596:    {
+    #####: 1597:      return false;
+        -: 1598:    }
+    #####: 1599:  else if (8u != strlen (argv[*arg_ptr]))
+        -: 1600:    {
+    #####: 1601:      return false;
+        -: 1602:    }
+        -: 1603:  else
+        -: 1604:    {
+        -: 1605:      char x, y;
+    #####: 1606:      const char validchars[] = "aBcmt";
+        -: 1607:
+    #####: 1608:      assert (0 == strncmp ("-newer", argv[*arg_ptr], 6));
+    #####: 1609:      x = argv[*arg_ptr][6];
+    #####: 1610:      y = argv[*arg_ptr][7];
+        -: 1611:
+        -: 1612:
+        -: 1613:#if !defined(HAVE_STRUCT_STAT_ST_BIRTHTIME) && !defined(HAVE_STRUCT_STAT_ST_BIRTHTIMENSEC) && !defined(HAVE_STRUCT_STAT_ST_BIRTHTIMESPEC_TV_NSEC) && !defined HAVE_STRUCT_STAT_ST_BIRTHTIM_TV_NSEC
+    #####: 1614:      if ('B' == x || 'B' == y)
+        -: 1615:	{
+    #####: 1616:	  error (0, 0,
+        -: 1617:		 _("This system does not provide a way to find the birth time of a file."));
+    #####: 1618:	  return false;
+        -: 1619:	}
+        -: 1620:#endif
+        -: 1621:
+        -: 1622:      /* -newertY (for any Y) is invalid. */
+    #####: 1623:      if (x == 't'
+    #####: 1624:	  || 0 == strchr (validchars, x)
+    #####: 1625:	  || 0 == strchr ( validchars, y))
+        -: 1626:	{
+    #####: 1627:	  return false;
+        -: 1628:	}
+        -: 1629:      else
+        -: 1630:	{
+        -: 1631:	  struct predicate *our_pred;
+        -: 1632:
+        -: 1633:	  /* Because this item is ARG_SPECIAL_PARSE, we have to advance arg_ptr
+        -: 1634:	   * past the test name (for most other tests, this is already done)
+        -: 1635:	   */
+    #####: 1636:	  if (argv[1+*arg_ptr] == NULL)
+        -: 1637:	    {
+    #####: 1638:	      error (EXIT_FAILURE, 0, _("The %s test needs an argument"),
+    #####: 1639:		     quotearg_n_style (0, options.err_quoting_style, argv[*arg_ptr]));
+        -: 1640:	    }
+        -: 1641:	  else
+        -: 1642:	    {
+    #####: 1643:	      (*arg_ptr)++;
+        -: 1644:	    }
+        -: 1645:
+    #####: 1646:	  our_pred = insert_primary (entry, argv[*arg_ptr]);
+        -: 1647:
+        -: 1648:
+    #####: 1649:	  switch (x)
+        -: 1650:	    {
+        -: 1651:	    case 'a':
+    #####: 1652:	      our_pred->args.reftime.xval = XVAL_ATIME;
+    #####: 1653:	      break;
+        -: 1654:	    case 'B':
+    #####: 1655:	      our_pred->args.reftime.xval = XVAL_BIRTHTIME;
+    #####: 1656:	      break;
+        -: 1657:	    case 'c':
+    #####: 1658:	      our_pred->args.reftime.xval = XVAL_CTIME;
+    #####: 1659:	      break;
+        -: 1660:	    case 'm':
+    #####: 1661:	      our_pred->args.reftime.xval = XVAL_MTIME;
+    #####: 1662:	      break;
+        -: 1663:	    default:
+    #####: 1664:	      assert (strchr (validchars, x));
+    #####: 1665:	      assert (0);
+        -: 1666:	    }
+        -: 1667:
+    #####: 1668:	  if ('t' == y)
+        -: 1669:	    {
+    #####: 1670:	      if (!get_date (&our_pred->args.reftime.ts,
+        -: 1671:			    argv[*arg_ptr],
+        -: 1672:			    &options.start_time))
+        -: 1673:		{
+    #####: 1674:		  error (EXIT_FAILURE, 0,
+        -: 1675:			 _("I cannot figure out how to interpret %s as a date or time"),
+    #####: 1676:			 quotearg_n_style (0, options.err_quoting_style, argv[*arg_ptr]));
+        -: 1677:		}
+        -: 1678:	    }
+        -: 1679:	  else
+        -: 1680:	    {
+        -: 1681:	      struct stat stat_newer;
+        -: 1682:
+        -: 1683:	      /* Stat the named file. */
+    #####: 1684:	      set_stat_placeholders (&stat_newer);
+    #####: 1685:	      if ((*options.xstat) (argv[*arg_ptr], &stat_newer))
+    #####: 1686:		fatal_target_file_error (errno, argv[*arg_ptr]);
+        -: 1687:
+    #####: 1688:	      if (!get_stat_Ytime (&stat_newer, y, &our_pred->args.reftime.ts))
+        -: 1689:		{
+        -: 1690:		  /* We cannot extract a timestamp from the struct stat. */
+    #####: 1691:		  error (EXIT_FAILURE, 0,
+        -: 1692:			 _("Cannot obtain birth time of file %s"),
+    #####: 1693:			 safely_quote_err_filename (0, argv[*arg_ptr]));
+        -: 1694:		}
+        -: 1695:	    }
+    #####: 1696:	  our_pred->args.reftime.kind = COMP_GT;
+    #####: 1697:	  our_pred->est_success_rate = estimate_timestamp_success_rate (our_pred->args.reftime.ts.tv_sec);
+    #####: 1698:	  (*arg_ptr)++;
+        -: 1699:
+    #####: 1700:	  assert (our_pred->pred_func != NULL);
+    #####: 1701:	  assert (our_pred->pred_func == pred_newerXY);
+    #####: 1702:	  assert (our_pred->need_stat);
+    #####: 1703:	  return true;
+        -: 1704:	}
+        -: 1705:    }
+        -: 1706:}
+        -: 1707:
+        -: 1708:
+        -: 1709:static bool
+    #####: 1710:parse_noleaf (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1711:{
+    #####: 1712:  options.no_leaf_check = true;
+    #####: 1713:  return parse_noop (entry, argv, arg_ptr);
+        -: 1714:}
+        -: 1715:
+        -: 1716:#ifdef CACHE_IDS
+        -: 1717:/* Arbitrary amount by which to increase size
+        -: 1718:   of `uid_unused' and `gid_unused'. */
+        -: 1719:#define ALLOC_STEP 2048
+        -: 1720:
+        -: 1721:/* Boolean: if uid_unused[n] is nonzero, then UID n has no passwd entry. */
+        -: 1722:char *uid_unused = NULL;
+        -: 1723:
+        -: 1724:/* Number of elements in `uid_unused'. */
+        -: 1725:unsigned uid_allocated;
+        -: 1726:
+        -: 1727:/* Similar for GIDs and group entries. */
+        -: 1728:char *gid_unused = NULL;
+        -: 1729:unsigned gid_allocated;
+        -: 1730:#endif
+        -: 1731:
+        -: 1732:static bool
+    #####: 1733:parse_nogroup (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1734:{
+        -: 1735:  struct predicate *our_pred;
+        -: 1736:
+        -: 1737:  (void) &argv;
+        -: 1738:  (void) &arg_ptr;
+        -: 1739:
+    #####: 1740:  our_pred = insert_primary (entry, NULL);
+    #####: 1741:  our_pred->est_success_rate = 1e-4;
+        -: 1742:#ifdef CACHE_IDS
+        -: 1743:  if (gid_unused == NULL)
+        -: 1744:    {
+        -: 1745:      struct group *gr;
+        -: 1746:
+        -: 1747:      gid_allocated = ALLOC_STEP;
+        -: 1748:      gid_unused = xmalloc (gid_allocated);
+        -: 1749:      memset (gid_unused, 1, gid_allocated);
+        -: 1750:      setgrent ();
+        -: 1751:      while ((gr = getgrent ()) != NULL)
+        -: 1752:	{
+        -: 1753:	  if ((unsigned) gr->gr_gid >= gid_allocated)
+        -: 1754:	    {
+        -: 1755:	      unsigned new_allocated = (unsigned) gr->gr_gid + ALLOC_STEP;
+        -: 1756:	      gid_unused = xrealloc (gid_unused, new_allocated);
+        -: 1757:	      memset (gid_unused + gid_allocated, 1,
+        -: 1758:		      new_allocated - gid_allocated);
+        -: 1759:	      gid_allocated = new_allocated;
+        -: 1760:	    }
+        -: 1761:	  gid_unused[(unsigned) gr->gr_gid] = 0;
+        -: 1762:	}
+        -: 1763:      endgrent ();
+        -: 1764:    }
+        -: 1765:#endif
+    #####: 1766:  return true;
+        -: 1767:}
+        -: 1768:
+        -: 1769:static bool
+    #####: 1770:parse_nouser (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1771:{
+        -: 1772:  struct predicate *our_pred;
+        -: 1773:  (void) argv;
+        -: 1774:  (void) arg_ptr;
+        -: 1775:
+        -: 1776:
+    #####: 1777:  our_pred = insert_primary_noarg (entry);
+    #####: 1778:  our_pred->est_success_rate = 1e-3;
+        -: 1779:#ifdef CACHE_IDS
+        -: 1780:  if (uid_unused == NULL)
+        -: 1781:    {
+        -: 1782:      struct passwd *pw;
+        -: 1783:
+        -: 1784:      uid_allocated = ALLOC_STEP;
+        -: 1785:      uid_unused = xmalloc (uid_allocated);
+        -: 1786:      memset (uid_unused, 1, uid_allocated);
+        -: 1787:      setpwent ();
+        -: 1788:      while ((pw = getpwent ()) != NULL)
+        -: 1789:	{
+        -: 1790:	  if ((unsigned) pw->pw_uid >= uid_allocated)
+        -: 1791:	    {
+        -: 1792:	      unsigned new_allocated = (unsigned) pw->pw_uid + ALLOC_STEP;
+        -: 1793:	      uid_unused = xrealloc (uid_unused, new_allocated);
+        -: 1794:	      memset (uid_unused + uid_allocated, 1,
+        -: 1795:		      new_allocated - uid_allocated);
+        -: 1796:	      uid_allocated = new_allocated;
+        -: 1797:	    }
+        -: 1798:	  uid_unused[(unsigned) pw->pw_uid] = 0;
+        -: 1799:	}
+        -: 1800:      endpwent ();
+        -: 1801:    }
+        -: 1802:#endif
+    #####: 1803:  return true;
+        -: 1804:}
+        -: 1805:
+        -: 1806:static bool
+    #####: 1807:parse_nowarn (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1808:{
+    #####: 1809:  options.warnings = false;
+    #####: 1810:  return parse_noop (entry, argv, arg_ptr);
+        -: 1811:}
+        -: 1812:
+        -: 1813:static bool
+    #####: 1814:parse_ok (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1815:{
+    #####: 1816:  return insert_exec_ok ("-ok", entry, argv, arg_ptr);
+        -: 1817:}
+        -: 1818:
+        -: 1819:static bool
+    #####: 1820:parse_okdir (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1821:{
+    #####: 1822:  return insert_exec_ok ("-okdir", entry, argv, arg_ptr);
+        -: 1823:}
+        -: 1824:
+        -: 1825:bool
+        9: 1826:parse_openparen (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1827:{
+        -: 1828:  struct predicate *our_pred;
+        -: 1829:
+        -: 1830:  (void) argv;
+        -: 1831:  (void) arg_ptr;
+        -: 1832:
+        9: 1833:  our_pred = get_new_pred_chk_op (entry, NULL);
+        9: 1834:  our_pred->pred_func = pred_openparen;
+        9: 1835:  our_pred->p_type = OPEN_PAREN;
+        9: 1836:  our_pred->p_prec = NO_PREC;
+        9: 1837:  our_pred->need_stat = our_pred->need_type = false;
+        9: 1838:  return true;
+        -: 1839:}
+        -: 1840:
+        -: 1841:static bool
+    #####: 1842:parse_or (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1843:{
+        -: 1844:  struct predicate *our_pred;
+        -: 1845:
+        -: 1846:  (void) argv;
+        -: 1847:  (void) arg_ptr;
+        -: 1848:
+    #####: 1849:  our_pred = get_new_pred_noarg (entry);
+    #####: 1850:  our_pred->pred_func = pred_or;
+    #####: 1851:  our_pred->p_type = BI_OP;
+    #####: 1852:  our_pred->p_prec = OR_PREC;
+    #####: 1853:  our_pred->need_stat = our_pred->need_type = false;
+    #####: 1854:  return true;
+        -: 1855:}
+        -: 1856:
+        -: 1857:static bool
+    #####: 1858:is_feasible_path_argument (const char *arg, bool foldcase)
+        -: 1859:{
+    #####: 1860:  const char *last = strrchr (arg, '/');
+    #####: 1861:  if (last && !last[1])
+        -: 1862:    {
+        -: 1863:      /* The name ends with "/". */
+    #####: 1864:      if (matches_start_point (arg, foldcase))
+        -: 1865:	{
+        -: 1866:	  /* "-path foo/" can succeed if one of the start points is "foo/". */
+    #####: 1867:	  return true;
+        -: 1868:	}
+        -: 1869:      else
+        -: 1870:	{
+    #####: 1871:	  return false;
+        -: 1872:	}
+        -: 1873:    }
+    #####: 1874:  return true;
+        -: 1875:}
+        -: 1876:
+        -: 1877:
+        -: 1878:static bool
+    #####: 1879:insert_path_check (const struct parser_table* entry, char **argv, int *arg_ptr,
+        -: 1880:		   const char *pred_name, PREDICATEFUNCTION pred)
+        -: 1881:{
+        -: 1882:  const char *name;
+    #####: 1883:  bool foldcase = false;
+        -: 1884:
+    #####: 1885:  if (pred == pred_ipath)
+    #####: 1886:    foldcase = true;
+        -: 1887:
+    #####: 1888:  fnmatch_sanitycheck ();
+        -: 1889:
+    #####: 1890:  if (collect_arg (argv, arg_ptr, &name))
+        -: 1891:    {
+    #####: 1892:      struct predicate *our_pred = insert_primary_withpred (entry, pred, name);
+    #####: 1893:      our_pred->need_stat = our_pred->need_type = false;
+    #####: 1894:      our_pred->args.str = name;
+    #####: 1895:      our_pred->est_success_rate = estimate_pattern_match_rate (name, 0);
+        -: 1896:
+    #####: 1897:      if (!options.posixly_correct
+    #####: 1898:	  && !is_feasible_path_argument (name, foldcase))
+        -: 1899:	{
+    #####: 1900:	  error (0, 0, _("warning: -%s %s will not match anything "
+        -: 1901:			 "because it ends with /."),
+        -: 1902:		 pred_name, name);
+    #####: 1903:	  our_pred->est_success_rate = 1.0e-8;
+        -: 1904:	}
+    #####: 1905:      return true;
+        -: 1906:    }
+    #####: 1907:  return false;
+        -: 1908:}
+        -: 1909:
+        -: 1910:/* For some time, -path was deprecated (at RMS's request) in favour of
+        -: 1911: * -iwholename.  See the node "GNU Manuals" in standards.texi for the
+        -: 1912: * rationale for this (basically, GNU prefers the use of the phrase
+        -: 1913: * "file name" to "path name".
+        -: 1914: *
+        -: 1915: * We do not issue a warning that this usage is deprecated
+        -: 1916: * since
+        -: 1917: * (a) HPUX find supports this predicate also and
+        -: 1918: * (b) it will soon be in POSIX anyway.
+        -: 1919: */
+        -: 1920:static bool
+    #####: 1921:parse_path (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1922:{
+    #####: 1923:  return insert_path_check (entry, argv, arg_ptr, "path", pred_path);
+        -: 1924:}
+        -: 1925:
+        -: 1926:static bool
+    #####: 1927:parse_wholename (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1928:{
+    #####: 1929:  return insert_path_check (entry, argv, arg_ptr, "wholename", pred_path);
+        -: 1930:}
+        -: 1931:
+        -: 1932:/* -ipath was deprecated (at RMS's request) in favour of
+        -: 1933: * -iwholename.   See the node "GNU Manuals" in standards.texi
+        -: 1934: * for the rationale for this (basically, GNU prefers the use
+        -: 1935: * of the phrase "file name" to "path name".
+        -: 1936: * However, -path is now standardised so I un-deprecated -ipath.
+        -: 1937: */
+        -: 1938:static bool
+    #####: 1939:parse_ipath (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1940:{
+    #####: 1941:  return insert_path_check (entry, argv, arg_ptr, "ipath", pred_ipath);
+        -: 1942:}
+        -: 1943:
+        -: 1944:static bool
+    #####: 1945:parse_iwholename (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1946:{
+    #####: 1947:  return insert_path_check (entry, argv, arg_ptr, "iwholename", pred_ipath);
+        -: 1948:}
+        -: 1949:
+        -: 1950:static void
+    #####: 1951:non_posix_mode (const char *mode)
+        -: 1952:{
+    #####: 1953:  if (options.posixly_correct)
+        -: 1954:    {
+    #####: 1955:      error (EXIT_FAILURE, 0,
+        -: 1956:	     _("Mode %s is not valid when POSIXLY_CORRECT is on."),
+        -: 1957:	     quotearg_n_style (0, options.err_quoting_style, mode));
+        -: 1958:    }
+    #####: 1959:}
+        -: 1960:
+        -: 1961:
+        -: 1962:static bool
+    #####: 1963:parse_perm (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 1964:{
+        -: 1965:  mode_t perm_val[2];
+        -: 1966:  float rate;
+    #####: 1967:  int mode_start = 0;
+    #####: 1968:  bool havekind = false;
+    #####: 1969:  enum permissions_type kind = PERM_EXACT;
+    #####: 1970:  struct mode_change *change = NULL;
+        -: 1971:  struct predicate *our_pred;
+        -: 1972:  const char *perm_expr;
+        -: 1973:
+    #####: 1974:  if (!collect_arg (argv, arg_ptr, &perm_expr))
+    #####: 1975:    return false;
+        -: 1976:
+    #####: 1977:  switch (perm_expr[0])
+        -: 1978:    {
+        -: 1979:    case '-':
+    #####: 1980:      mode_start = 1;
+    #####: 1981:      kind = PERM_AT_LEAST;
+    #####: 1982:      havekind = true;
+    #####: 1983:      rate = 0.2;
+    #####: 1984:      break;
+        -: 1985:
+        -: 1986:     case '+':
+    #####: 1987:       change = mode_compile (perm_expr);
+    #####: 1988:       if (NULL == change)
+        -: 1989:	 {
+        -: 1990:	   /* Most likely the caller is an old script that is still
+        -: 1991:	    * using the obsolete GNU syntax '-perm +MODE'.  This old
+        -: 1992:	    * syntax was withdrawn in favor of '-perm /MODE' because
+        -: 1993:	    * it is incompatible with POSIX in some cases, but we
+        -: 1994:	    * still support uses of it that are not incompatible with
+        -: 1995:	    * POSIX.
+        -: 1996:	    *
+        -: 1997:	    * Example: POSIXLY_CORRECT=y find -perm +a+x
+        -: 1998:	    */
+    #####: 1999:	   non_posix_mode (perm_expr);
+        -: 2000:
+        -: 2001:	   /* support the previous behaviour. */
+    #####: 2002:	   mode_start = 1;
+    #####: 2003:	   kind = PERM_ANY;
+    #####: 2004:	   rate = 0.3;
+        -: 2005:	 }
+        -: 2006:       else
+        -: 2007:	 {
+        -: 2008:	   /* This is a POSIX-compatible usage */
+    #####: 2009:	   mode_start = 0;
+    #####: 2010:	   kind = PERM_EXACT;
+    #####: 2011:	   rate = 0.1;
+        -: 2012:	 }
+    #####: 2013:       havekind = true;
+    #####: 2014:       break;
+        -: 2015:
+        -: 2016:    case '/':			/* GNU extension */
+    #####: 2017:      non_posix_mode (perm_expr);
+    #####: 2018:      mode_start = 1;
+    #####: 2019:      kind = PERM_ANY;
+    #####: 2020:      havekind = true;
+    #####: 2021:      rate = 0.3;
+    #####: 2022:      break;
+        -: 2023:
+        -: 2024:    default:
+        -: 2025:      /* For example, '-perm 0644', which is valid and matches
+        -: 2026:       * only files whose mode is exactly 0644.
+        -: 2027:       */
+    #####: 2028:      mode_start = 0;
+    #####: 2029:      kind = PERM_EXACT;
+    #####: 2030:      havekind = true;
+    #####: 2031:      rate = 0.01;
+    #####: 2032:      break;
+        -: 2033:    }
+        -: 2034:
+    #####: 2035:  if (NULL == change)
+        -: 2036:    {
+    #####: 2037:      change = mode_compile (perm_expr + mode_start);
+    #####: 2038:      if (NULL == change)
+    #####: 2039:	error (EXIT_FAILURE, 0, _("invalid mode %s"),
+        -: 2040:	       quotearg_n_style (0, options.err_quoting_style, perm_expr));
+        -: 2041:    }
+    #####: 2042:  perm_val[0] = mode_adjust (0, false, 0, change, NULL);
+    #####: 2043:  perm_val[1] = mode_adjust (0, true, 0, change, NULL);
+    #####: 2044:  free (change);
+        -: 2045:
+    #####: 2046:  if (('/' == perm_expr[0]) && (0 == perm_val[0]) && (0 == perm_val[1]))
+        -: 2047:    {
+        -: 2048:      /* The meaning of -perm /000 will change in the future.  It
+        -: 2049:       * currently matches no files, but like -perm -000 it should
+        -: 2050:       * match all files.
+        -: 2051:       *
+        -: 2052:       * Starting in 2005, we used to issue a warning message
+        -: 2053:       * informing the user that the behaviour would change in the
+        -: 2054:       * future.  We have now changed the behaviour and issue a
+        -: 2055:       * warning message that the behaviour recently changed.
+        -: 2056:       */
+    #####: 2057:      error (0, 0,
+        -: 2058:	     _("warning: you have specified a mode pattern %s (which is "
+        -: 2059:	       "equivalent to /000). The meaning of -perm /000 has now been "
+        -: 2060:	       "changed to be consistent with -perm -000; that is, while it "
+        -: 2061:	       "used to match no files, it now matches all files."),
+        -: 2062:	     perm_expr);
+        -: 2063:
+    #####: 2064:      kind = PERM_AT_LEAST;
+    #####: 2065:      havekind = true;
+        -: 2066:
+        -: 2067:      /* The "magic" number below is just the fraction of files on my
+        -: 2068:       * own system that "-type l -xtype l" fails for (i.e. unbroken symlinks).
+        -: 2069:       * Actual totals are 1472 and 1073833.
+        -: 2070:       */
+    #####: 2071:      rate = 0.9986; /* probably matches anything but a broken symlink */
+        -: 2072:    }
+        -: 2073:
+    #####: 2074:  our_pred = insert_primary (entry, perm_expr);
+    #####: 2075:  our_pred->est_success_rate = rate;
+    #####: 2076:  if (havekind)
+        -: 2077:    {
+    #####: 2078:      our_pred->args.perm.kind = kind;
+        -: 2079:    }
+        -: 2080:  else
+        -: 2081:    {
+        -: 2082:
+    #####: 2083:      switch (perm_expr[0])
+        -: 2084:	{
+        -: 2085:	case '-':
+    #####: 2086:	  our_pred->args.perm.kind = PERM_AT_LEAST;
+    #####: 2087:	  break;
+        -: 2088:	case '+':
+    #####: 2089:	  our_pred->args.perm.kind = PERM_ANY;
+    #####: 2090:	  break;
+        -: 2091:	default:
+    #####: 2092:	  our_pred->args.perm.kind = PERM_EXACT;
+    #####: 2093:	  break;
+        -: 2094:	}
+        -: 2095:    }
+    #####: 2096:  memcpy (our_pred->args.perm.val, perm_val, sizeof perm_val);
+    #####: 2097:  return true;
+        -: 2098:}
+        -: 2099:
+        -: 2100:bool
+    #####: 2101:parse_print (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2102:{
+        -: 2103:  struct predicate *our_pred;
+        -: 2104:
+        -: 2105:  (void) argv;
+        -: 2106:  (void) arg_ptr;
+        -: 2107:
+    #####: 2108:  our_pred = insert_primary_noarg (entry);
+        -: 2109:  /* -print has the side effect of printing.  This prevents us
+        -: 2110:     from doing undesired multiple printing when the user has
+        -: 2111:     already specified -print. */
+    #####: 2112:  our_pred->side_effects = our_pred->no_default_print = true;
+    #####: 2113:  our_pred->need_stat = our_pred->need_type = false;
+    #####: 2114:  open_stdout (&our_pred->args.printf_vec);
+    #####: 2115:  return true;
+        -: 2116:}
+        -: 2117:
+        -: 2118:static bool
+    #####: 2119:parse_print0 (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2120:{
+    #####: 2121:  return insert_fprint (entry, NULL);
+        -: 2122:}
+        -: 2123:
+        -: 2124:static bool
+    #####: 2125:parse_printf (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2126:{
+        -: 2127:  const char *format;
+    #####: 2128:  const int saved_argc = *arg_ptr;
+        -: 2129:
+    #####: 2130:  if (collect_arg (argv, arg_ptr, &format))
+        -: 2131:    {
+        -: 2132:      struct format_val fmt;
+    #####: 2133:      open_stdout (&fmt);
+    #####: 2134:      if (insert_fprintf (&fmt, entry, pred_fprintf, format))
+        -: 2135:	{
+    #####: 2136:	  return true;
+        -: 2137:	}
+        -: 2138:      else
+        -: 2139:	{
+    #####: 2140:	  *arg_ptr = saved_argc; /* don't consume the invalid argument. */
+    #####: 2141:	  return false;
+        -: 2142:	}
+        -: 2143:    }
+    #####: 2144:  return false;
+        -: 2145:}
+        -: 2146:
+        -: 2147:static bool
+    #####: 2148:parse_fprintf (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2149:{
+        -: 2150:  const char *format, *filename;
+    #####: 2151:  int saved_argc = *arg_ptr;
+        -: 2152:
+    #####: 2153:  if (collect_arg (argv, arg_ptr, &filename))
+        -: 2154:    {
+    #####: 2155:      if (collect_arg (argv, arg_ptr, &format))
+        -: 2156:	{
+        -: 2157:	  struct format_val fmt;
+    #####: 2158:	  open_output_file (filename, &fmt);
+    #####: 2159:	  saved_argc = *arg_ptr;
+        -: 2160:
+    #####: 2161:	  if (insert_fprintf (&fmt, entry, pred_fprintf, format))
+    #####: 2162:	    return true;
+        -: 2163:	}
+        -: 2164:    }
+    #####: 2165:  *arg_ptr = saved_argc; /* don't consume the invalid argument. */
+    #####: 2166:  return false;
+        -: 2167:}
+        -: 2168:
+        -: 2169:static bool
+    #####: 2170:parse_prune (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2171:{
+        -: 2172:  struct predicate *our_pred;
+        -: 2173:
+        -: 2174:  (void) argv;
+        -: 2175:  (void) arg_ptr;
+        -: 2176:
+    #####: 2177:  our_pred = insert_primary_noarg (entry);
+    #####: 2178:  if (options.do_dir_first == false)
+    #####: 2179:    our_pred->need_stat = our_pred->need_type = false;
+        -: 2180:  /* -prune has a side effect that it does not descend into
+        -: 2181:     the current directory. */
+    #####: 2182:  our_pred->side_effects = true;
+    #####: 2183:  our_pred->no_default_print = false;
+    #####: 2184:  return true;
+        -: 2185:}
+        -: 2186:
+        -: 2187:static bool
+    #####: 2188:parse_quit  (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2189:{
+    #####: 2190:  struct predicate *our_pred = insert_primary_noarg (entry);
+        -: 2191:  (void) argv;
+        -: 2192:  (void) arg_ptr;
+    #####: 2193:  our_pred->need_stat = our_pred->need_type = false;
+    #####: 2194:  our_pred->side_effects = true; /* Exiting is a side effect... */
+    #####: 2195:  our_pred->no_default_print = false; /* Don't inhibit the default print, though. */
+    #####: 2196:  our_pred->est_success_rate = 1.0f;
+    #####: 2197:  return true;
+        -: 2198:}
+        -: 2199:
+        -: 2200:
+        -: 2201:static bool
+    #####: 2202:parse_regextype (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2203:{
+        -: 2204:  const char *type_name;
+    #####: 2205:  if (collect_arg (argv, arg_ptr, &type_name))
+        -: 2206:    {
+        -: 2207:      /* collect the regex type name */
+    #####: 2208:      options.regex_options = get_regex_type (type_name);
+    #####: 2209:      return parse_noop (entry, argv, arg_ptr);
+        -: 2210:    }
+    #####: 2211:  return false;
+        -: 2212:}
+        -: 2213:
+        -: 2214:
+        -: 2215:static bool
+    #####: 2216:parse_regex (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2217:{
+    #####: 2218:  return insert_regex (argv, arg_ptr, entry, options.regex_options);
+        -: 2219:}
+        -: 2220:
+        -: 2221:static bool
+    #####: 2222:insert_regex (char **argv,
+        -: 2223:	      int *arg_ptr,
+        -: 2224:	      const struct parser_table *entry,
+        -: 2225:	      int regex_options)
+        -: 2226:{
+        -: 2227:  const char *rx;
+    #####: 2228:  if (collect_arg (argv, arg_ptr, &rx))
+        -: 2229:    {
+        -: 2230:      struct re_pattern_buffer *re;
+        -: 2231:      const char *error_message;
+    #####: 2232:      struct predicate *our_pred = insert_primary_withpred (entry, pred_regex, rx);
+    #####: 2233:      our_pred->need_stat = our_pred->need_type = false;
+    #####: 2234:      re = xmalloc (sizeof (struct re_pattern_buffer));
+    #####: 2235:      our_pred->args.regex = re;
+    #####: 2236:      re->allocated = 100;
+    #####: 2237:      re->buffer = xmalloc (re->allocated);
+    #####: 2238:      re->fastmap = NULL;
+        -: 2239:
+    #####: 2240:      re_set_syntax (regex_options);
+    #####: 2241:      re->syntax = regex_options;
+    #####: 2242:      re->translate = NULL;
+        -: 2243:
+    #####: 2244:      error_message = re_compile_pattern (rx, strlen (rx), re);
+    #####: 2245:      if (error_message)
+    #####: 2246:	error (EXIT_FAILURE, 0, "%s", error_message);
+    #####: 2247:      our_pred->est_success_rate = estimate_pattern_match_rate (rx, 1);
+    #####: 2248:      return true;
+        -: 2249:    }
+    #####: 2250:  return false;
+        -: 2251:}
+        -: 2252:
+        -: 2253:static bool
+    #####: 2254:parse_size (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2255:{
+        -: 2256:  struct predicate *our_pred;
+        -: 2257:  char *arg;
+        -: 2258:  uintmax_t num;
+        -: 2259:  char suffix;
+        -: 2260:  enum comparison_type c_type;
+        -: 2261:
+    #####: 2262:  int blksize = 512;
+        -: 2263:  int len;
+        -: 2264:
+        -: 2265:  /* XXX: cannot (yet) convert to ue collect_arg() as this
+        -: 2266:   * function modifies the args in-place.
+        -: 2267:   */
+    #####: 2268:  if ((argv == NULL) || (argv[*arg_ptr] == NULL))
+    #####: 2269:    return false;
+    #####: 2270:  arg = argv[*arg_ptr];
+        -: 2271:
+    #####: 2272:  len = strlen (arg);
+    #####: 2273:  if (len == 0)
+    #####: 2274:    error (EXIT_FAILURE, 0, _("invalid null argument to -size"));
+        -: 2275:
+    #####: 2276:  suffix = arg[len - 1];
+    #####: 2277:  switch (suffix)
+        -: 2278:    {
+        -: 2279:    case 'b':
+    #####: 2280:      blksize = 512;
+    #####: 2281:      arg[len - 1] = '\0';
+    #####: 2282:      break;
+        -: 2283:
+        -: 2284:    case 'c':
+    #####: 2285:      blksize = 1;
+    #####: 2286:      arg[len - 1] = '\0';
+    #####: 2287:      break;
+        -: 2288:
+        -: 2289:    case 'k':
+    #####: 2290:      blksize = 1024;
+    #####: 2291:      arg[len - 1] = '\0';
+    #####: 2292:      break;
+        -: 2293:
+        -: 2294:    case 'M':			/* Megabytes */
+    #####: 2295:      blksize = 1024*1024;
+    #####: 2296:      arg[len - 1] = '\0';
+    #####: 2297:      break;
+        -: 2298:
+        -: 2299:    case 'G':			/* Gigabytes */
+    #####: 2300:      blksize = 1024*1024*1024;
+    #####: 2301:      arg[len - 1] = '\0';
+    #####: 2302:      break;
+        -: 2303:
+        -: 2304:    case 'w':
+    #####: 2305:      blksize = 2;
+    #####: 2306:      arg[len - 1] = '\0';
+    #####: 2307:      break;
+        -: 2308:
+        -: 2309:    case '0':
+        -: 2310:    case '1':
+        -: 2311:    case '2':
+        -: 2312:    case '3':
+        -: 2313:    case '4':
+        -: 2314:    case '5':
+        -: 2315:    case '6':
+        -: 2316:    case '7':
+        -: 2317:    case '8':
+        -: 2318:    case '9':
+    #####: 2319:      break;
+        -: 2320:
+        -: 2321:    default:
+    #####: 2322:      error (EXIT_FAILURE, 0,
+    #####: 2323:	     _("invalid -size type `%c'"), argv[*arg_ptr][len - 1]);
+        -: 2324:    }
+        -: 2325:  /* TODO: accept fractional megabytes etc. ? */
+    #####: 2326:  if (!get_num (arg, &num, &c_type))
+        -: 2327:    {
+    #####: 2328:      error (EXIT_FAILURE, 0,
+        -: 2329:	     _("Invalid argument `%s%c' to -size"),
+        -: 2330:	     arg, (int)suffix);
+    #####: 2331:      return false;
+        -: 2332:    }
+    #####: 2333:our_pred = insert_primary (entry, arg);
+    #####: 2334:  our_pred->args.size.kind = c_type;
+    #####: 2335:  our_pred->args.size.blocksize = blksize;
+    #####: 2336:  our_pred->args.size.size = num;
+    #####: 2337:  our_pred->need_stat = true;
+    #####: 2338:  our_pred->need_type = false;
+        -: 2339:
+    #####: 2340:  if (COMP_GT == c_type)
+    #####: 2341:    our_pred->est_success_rate = (num*blksize > 20480) ? 0.1 : 0.9;
+    #####: 2342:  else if (COMP_LT == c_type)
+    #####: 2343:    our_pred->est_success_rate = (num*blksize > 20480) ? 0.9 : 0.1;
+        -: 2344:  else
+    #####: 2345:    our_pred->est_success_rate = 0.01;
+        -: 2346:
+    #####: 2347:  (*arg_ptr)++;
+    #####: 2348:  return true;
+        -: 2349:}
+        -: 2350:
+        -: 2351:
+        -: 2352:static bool
+    #####: 2353:parse_samefile (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2354:{
+        -: 2355:  /* General idea: stat the file, remember device and inode numbers.
+        -: 2356:   * If a candidate file matches those, it's the same file.
+        -: 2357:   */
+        -: 2358:  struct predicate *our_pred;
+        -: 2359:  struct stat st, fst;
+        -: 2360:  int fd, openflags;
+        -: 2361:  const char *filename;
+        -: 2362:
+    #####: 2363:  set_stat_placeholders (&st);
+    #####: 2364:  if (!collect_arg_stat_info (argv, arg_ptr, &st, &filename))
+    #####: 2365:    return false;
+        -: 2366:
+    #####: 2367:  set_stat_placeholders (&fst);
+        -: 2368:  /* POSIX systems are free to re-use the inode number of a deleted
+        -: 2369:   * file.  To ensure that we are not fooled by inode reuse, we hold
+        -: 2370:   * the file open if we can.  This would prevent the system reusing
+        -: 2371:   * the file.
+        -: 2372:   */
+    #####: 2373:  fd = -3;			/* means, uninitialised */
+    #####: 2374:  openflags = O_RDONLY;
+        -: 2375:
+    #####: 2376:  if (options.symlink_handling == SYMLINK_NEVER_DEREF)
+        -: 2377:    {
+    #####: 2378:      if (options.open_nofollow_available)
+        -: 2379:	{
+        -: 2380:	  assert (O_NOFOLLOW != 0);
+    #####: 2381:	  openflags |= O_NOFOLLOW;
+    #####: 2382:	  fd = -1;		/* safe to open it. */
+        -: 2383:	}
+        -: 2384:      else
+        -: 2385:	{
+    #####: 2386:	  if (S_ISLNK(st.st_mode))
+        -: 2387:	    {
+        -: 2388:	      /* no way to ensure that a symlink will not be followed
+        -: 2389:	       * by open(2), so fall back on using lstat().  Accept
+        -: 2390:	       * the risk that the named file will be deleted and
+        -: 2391:	       * replaced with another having the same inode.
+        -: 2392:	       *
+        -: 2393:	       * Avoid opening the file.
+        -: 2394:	       */
+    #####: 2395:	      fd = -2;		/* Do not open it */
+        -: 2396:	    }
+        -: 2397:	  else
+        -: 2398:	    {
+    #####: 2399:	      fd = -1;
+        -: 2400:	      /* Race condition here: the file might become a symlink here. */
+        -: 2401:	    }
+        -: 2402:	}
+        -: 2403:    }
+        -: 2404:  else
+        -: 2405:    {
+        -: 2406:      /* We want to dereference the symlink anyway */
+    #####: 2407:      fd = -1;			/* safe to open it without O_NOFOLLOW */
+        -: 2408:    }
+        -: 2409:
+    #####: 2410:  assert (fd != -3);		/* check we made a decision */
+    #####: 2411:  if (fd == -1)
+        -: 2412:    {
+        -: 2413:      /* Race condition here.  The file might become a
+        -: 2414:       * symbolic link in between our call to stat and
+        -: 2415:       * the call to open_cloexec.
+        -: 2416:       */
+    #####: 2417:      fd = open_cloexec (filename, openflags);
+        -: 2418:
+    #####: 2419:      if (fd >= 0)
+        -: 2420:	{
+        -: 2421:	  /* We stat the file again here to prevent a race condition
+        -: 2422:	   * between the first stat and the call to open(2).
+        -: 2423:	   */
+    #####: 2424:	  if (0 != fstat (fd, &fst))
+        -: 2425:	    {
+    #####: 2426:	      fatal_target_file_error (errno, filename);
+        -: 2427:	    }
+        -: 2428:	  else
+        -: 2429:	    {
+        -: 2430:	      /* Worry about the race condition.  If the file became a
+        -: 2431:	       * symlink after our first stat and before our call to
+        -: 2432:	       * open, fst may contain the stat information for the
+        -: 2433:	       * destination of the link, not the link itself.
+        -: 2434:	       */
+    #####: 2435:	      if ((*options.xstat) (filename, &st))
+    #####: 2436:		fatal_target_file_error (errno, filename);
+        -: 2437:
+    #####: 2438:	      if ((options.symlink_handling == SYMLINK_NEVER_DEREF)
+    #####: 2439:		  && (!options.open_nofollow_available))
+        -: 2440:		{
+    #####: 2441:		  if (S_ISLNK(st.st_mode))
+        -: 2442:		    {
+        -: 2443:		      /* We lost the race.  Leave the data in st.  The
+        -: 2444:		       * file descriptor points to the wrong thing.
+        -: 2445:		       */
+    #####: 2446:		      close (fd);
+    #####: 2447:		      fd = -1;
+        -: 2448:		    }
+        -: 2449:		  else
+        -: 2450:		    {
+        -: 2451:		      /* Several possibilities here:
+        -: 2452:		       * 1. There was no race
+        -: 2453:		       * 2. The file changed into a symlink after the stat and
+        -: 2454:		       *    before the open, and then back into a non-symlink
+        -: 2455:		       *    before the second stat.
+        -: 2456:		       *
+        -: 2457:		       * In case (1) there is no problem.  In case (2),
+        -: 2458:		       * the stat() and fstat() calls will have returned
+        -: 2459:		       * different data.  O_NOFOLLOW was not available,
+        -: 2460:		       * so the open() call may have followed a symlink
+        -: 2461:		       * even if the -P option is in effect.
+        -: 2462:		       */
+    #####: 2463:		      if ((st.st_dev == fst.st_dev)
+    #####: 2464:			  && (st.st_ino == fst.st_ino))
+        -: 2465:			{
+        -: 2466:			  /* No race.  No need to copy fst to st,
+        -: 2467:			   * since they should be identical (modulo
+        -: 2468:			   * differences in padding bytes).
+        -: 2469:			   */
+        -: 2470:			}
+        -: 2471:		      else
+        -: 2472:			{
+        -: 2473:			  /* We lost the race.  Leave the data in st.  The
+        -: 2474:			   * file descriptor points to the wrong thing.
+        -: 2475:			   */
+    #####: 2476:			  close (fd);
+    #####: 2477:			  fd = -1;
+        -: 2478:			}
+        -: 2479:		    }
+        -: 2480:		}
+        -: 2481:	      else
+        -: 2482:		{
+    #####: 2483:		  st = fst;
+        -: 2484:		}
+        -: 2485:	    }
+        -: 2486:	}
+        -: 2487:    }
+        -: 2488:
+    #####: 2489:  our_pred = insert_primary (entry, filename);
+    #####: 2490:  our_pred->args.samefileid.ino = st.st_ino;
+    #####: 2491:  our_pred->args.samefileid.dev = st.st_dev;
+    #####: 2492:  our_pred->args.samefileid.fd  = fd;
+    #####: 2493:  our_pred->need_type = false;
+        -: 2494:  /* smarter way: compare type and inode number first. */
+        -: 2495:  /* TODO: maybe optimise this away by being optimistic */
+    #####: 2496:  our_pred->need_stat = true;
+    #####: 2497:  our_pred->est_success_rate = 0.01f;
+    #####: 2498:  return true;
+        -: 2499:}
+        -: 2500:
+        -: 2501:#if 0
+        -: 2502:/* This function is commented out partly because support for it is
+        -: 2503: * uneven.
+        -: 2504: */
+        -: 2505:static bool
+        -: 2506:parse_show_control_chars (const struct parser_table* entry,
+        -: 2507:			  char **argv,
+        -: 2508:			  int *arg_ptr)
+        -: 2509:{
+        -: 2510:  const char *arg;
+        -: 2511:  const char *errmsg = _("The -show-control-chars option takes "
+        -: 2512:			 "a single argument which "
+        -: 2513:			 "must be 'literal' or 'safe'");
+        -: 2514:
+        -: 2515:  if ((argv == NULL) || (argv[*arg_ptr] == NULL))
+        -: 2516:    {
+        -: 2517:      error (EXIT_FAILURE, errno, "%s", errmsg);
+        -: 2518:      return false;
+        -: 2519:    }
+        -: 2520:  else
+        -: 2521:    {
+        -: 2522:      arg = argv[*arg_ptr];
+        -: 2523:
+        -: 2524:      if (0 == strcmp ("literal", arg))
+        -: 2525:	{
+        -: 2526:	  options.literal_control_chars = true;
+        -: 2527:	}
+        -: 2528:      else if (0 == strcmp ("safe", arg))
+        -: 2529:	{
+        -: 2530:	  options.literal_control_chars = false;
+        -: 2531:	}
+        -: 2532:      else
+        -: 2533:	{
+        -: 2534:	  error (EXIT_FAILURE, errno, "%s", errmsg);
+        -: 2535:	  return false;
+        -: 2536:	}
+        -: 2537:      (*arg_ptr)++;		/* consume the argument. */
+        -: 2538:      return true;
+        -: 2539:    }
+        -: 2540:}
+        -: 2541:#endif
+        -: 2542:
+        -: 2543:
+        -: 2544:static bool
+    #####: 2545:parse_true (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2546:{
+        -: 2547:  struct predicate *our_pred;
+        -: 2548:
+        -: 2549:  (void) argv;
+        -: 2550:  (void) arg_ptr;
+        -: 2551:
+    #####: 2552:  our_pred = insert_primary_noarg (entry);
+    #####: 2553:  our_pred->need_stat = our_pred->need_type = false;
+    #####: 2554:  our_pred->est_success_rate = 1.0f;
+    #####: 2555:  return true;
+        -: 2556:}
+        -: 2557:
+        -: 2558:static bool
+    #####: 2559:parse_noop (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2560:{
+        -: 2561:  (void) entry;
+    #####: 2562:  return parse_true (get_noop (), argv, arg_ptr);
+        -: 2563:}
+        -: 2564:
+        -: 2565:static bool
+    #####: 2566:parse_accesscheck (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2567:{
+        -: 2568:  struct predicate *our_pred;
+        -: 2569:  (void) argv;
+        -: 2570:  (void) arg_ptr;
+    #####: 2571:  our_pred = insert_primary_noarg (entry);
+    #####: 2572:  our_pred->need_stat = our_pred->need_type = false;
+    #####: 2573:  our_pred->side_effects = our_pred->no_default_print = false;
+    #####: 2574:  if (pred_is(our_pred, pred_executable))
+    #####: 2575:    our_pred->est_success_rate = 0.2;
+        -: 2576:  else
+    #####: 2577:    our_pred->est_success_rate = 0.9;
+    #####: 2578:  return true;
+        -: 2579:}
+        -: 2580:
+        -: 2581:static bool
+    #####: 2582:parse_type (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2583:{
+    #####: 2584:  return insert_type (argv, arg_ptr, entry, pred_type);
+        -: 2585:}
+        -: 2586:
+        -: 2587:static bool
+    #####: 2588:parse_uid (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2589:{
+    #####: 2590:  struct predicate *p = insert_num (argv, arg_ptr, entry);
+    #####: 2591:  if (p)
+        -: 2592:    {
+    #####: 2593:      p->est_success_rate = (p->args.numinfo.l_val < 100) ? 0.99 : 0.2;
+    #####: 2594:      return true;
+        -: 2595:    }
+        -: 2596:  else
+        -: 2597:    {
+    #####: 2598:      --*arg_ptr;		/* don't consume the invalid argument. */
+    #####: 2599:      return false;
+        -: 2600:    }
+        -: 2601:}
+        -: 2602:
+        -: 2603:static bool
+    #####: 2604:parse_used (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2605:{
+        -: 2606:  struct predicate *our_pred;
+        -: 2607:  struct time_val tval;
+        -: 2608:  const char *offset_str;
+    #####: 2609:  const char *errmsg = "arithmetic overflow while converting %s days to a number of seconds";
+        -: 2610:
+    #####: 2611:  if (collect_arg (argv, arg_ptr, &offset_str))
+        -: 2612:    {
+        -: 2613:      /* The timespec is actually a delta value, so we use an origin of 0. */
+    #####: 2614:      struct timespec zero = {0,0};
+    #####: 2615:      if (get_relative_timestamp (offset_str, &tval, zero, DAYSECS, errmsg))
+        -: 2616:	{
+    #####: 2617:	  our_pred = insert_primary (entry, offset_str);
+    #####: 2618:	  our_pred->args.reftime = tval;
+    #####: 2619:	  our_pred->est_success_rate = estimate_file_age_success_rate (tval.ts.tv_sec / DAYSECS);
+    #####: 2620:	  return true;
+        -: 2621:	}
+        -: 2622:      else
+        -: 2623:	{
+    #####: 2624:	  error (EXIT_FAILURE, 0,
+        -: 2625:		 _("Invalid argument %s to -used"), offset_str);
+        -: 2626:	  /*NOTREACHED*/
+    #####: 2627:	  return false;
+        -: 2628:	}
+        -: 2629:    }
+        -: 2630:  else
+        -: 2631:    {
+    #####: 2632:      return false;		/* missing argument */
+        -: 2633:    }
+        -: 2634:}
+        -: 2635:
+        -: 2636:static bool
+        8: 2637:parse_user (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2638:{
+        -: 2639:  const char *username;
+        -: 2640:
+        8: 2641:  if (collect_arg (argv, arg_ptr, &username))
+        -: 2642:    {
+        -: 2643:      struct predicate *our_pred;
+        -: 2644:      uid_t uid;
+        8: 2645:      struct passwd *cur_pwd = getpwnam (username);
+        8: 2646:      endpwent ();
+        8: 2647:      if (cur_pwd != NULL)
+        -: 2648:	{
+    #####: 2649:	  uid = cur_pwd->pw_uid;
+        -: 2650:	}
+        -: 2651:      else
+        -: 2652:	{
+        8: 2653:	  const size_t uid_len = strspn (username, "0123456789");
+        8: 2654:	  if (uid_len && (username[uid_len]==0))
+        -: 2655:	    {
+    #####: 2656:	      uid = safe_atoi (username, options.err_quoting_style);
+        -: 2657:	    }
+        -: 2658:	  else
+        -: 2659:	    {
+        -: 2660:	      /* This is a fatal error (if we just return false, the caller
+        -: 2661:	       * will say "invalid argument `username' to -user", which is
+        -: 2662:	       * not as helpful). */
+        8: 2663:	      if (username[0])
+        -: 2664:		{
+    #####: 2665:		  error (EXIT_FAILURE, 0,
+        -: 2666:			 _("%s is not the name of a known user"),
+        -: 2667:			 quotearg_n_style (0, options.err_quoting_style,
+        -: 2668:					   username));
+        -: 2669:		}
+        -: 2670:	      else
+        -: 2671:		{
+        8: 2672:		  error (EXIT_FAILURE, 0,
+        -: 2673:			 _("The argument to -user should not be empty"));
+        -: 2674:		}
+        -: 2675:	      /*NOTREACHED*/
+    #####: 2676:	      return false;
+        -: 2677:	    }
+        -: 2678:	}
+    #####: 2679:      our_pred = insert_primary (entry, username);
+    #####: 2680:      our_pred->args.uid = uid;
+    #####: 2681:      our_pred->est_success_rate = (our_pred->args.uid < 100) ? 0.99 : 0.2;
+    #####: 2682:      return true;
+        -: 2683:    }
+    #####: 2684:  return false;
+        -: 2685:}
+        -: 2686:
+        -: 2687:static bool
+        1: 2688:parse_version (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2689:{
+        1: 2690:  int features = 0;
+        -: 2691:  int flags;
+        -: 2692:
+        -: 2693:  (void) argv;
+        -: 2694:  (void) arg_ptr;
+        -: 2695:  (void) entry;
+        -: 2696:
+        1: 2697:  display_findutils_version ("find");
+        1: 2698:  printf (_("Features enabled: "));
+        -: 2699:
+        -: 2700:#if CACHE_IDS
+        -: 2701:  printf ("CACHE_IDS ");
+        -: 2702:  ++features;
+        -: 2703:#endif
+        -: 2704:#if DEBUG
+        -: 2705:  printf ("DEBUG ");
+        -: 2706:  ++features;
+        -: 2707:#endif
+        -: 2708:#if DEBUG_STAT
+        -: 2709:  printf ("DEBUG_STAT ");
+        -: 2710:  ++features;
+        -: 2711:#endif
+        -: 2712:#if defined HAVE_STRUCT_DIRENT_D_TYPE
+        1: 2713:  printf ("D_TYPE ");
+        1: 2714:  ++features;
+        -: 2715:#endif
+        -: 2716:#if defined O_NOFOLLOW
+        1: 2717:  printf ("O_NOFOLLOW(%s) ",
+        1: 2718:	  (options.open_nofollow_available ? "enabled" : "disabled"));
+        1: 2719:  ++features;
+        -: 2720:#endif
+        -: 2721:#if defined LEAF_OPTIMISATION
+        1: 2722:  printf ("LEAF_OPTIMISATION ");
+        1: 2723:  ++features;
+        -: 2724:#endif
+        -: 2725:  if (0 < is_selinux_enabled ())
+        -: 2726:    {
+        -: 2727:      printf ("SELINUX ");
+        -: 2728:      ++features;
+        -: 2729:    }
+        -: 2730:
+        1: 2731:  flags = 0;
+        1: 2732:  if (is_fts_enabled (&flags))
+        -: 2733:    {
+        1: 2734:      int nflags = 0;
+        1: 2735:      printf ("FTS(");
+        1: 2736:      ++features;
+        -: 2737:
+        1: 2738:      if (flags & FTS_CWDFD)
+        -: 2739:	{
+        1: 2740:	  if (nflags)
+        -: 2741:	    {
+    #####: 2742:	      printf (",");
+        -: 2743:	    }
+        1: 2744:	  printf ("FTS_CWDFD");
+        1: 2745:	  ++nflags;
+        -: 2746:	}
+        1: 2747:      printf (") ");
+        -: 2748:    }
+        -: 2749:
+        1: 2750:  printf ("CBO(level=%d) ", (int)(options.optimisation_level));
+        1: 2751:  ++features;
+        -: 2752:
+        1: 2753:  if (0 == features)
+        -: 2754:    {
+        -: 2755:      /* For the moment, leave this as English in case someone wants
+        -: 2756:	 to parse these strings. */
+    #####: 2757:      printf ("none");
+        -: 2758:    }
+        1: 2759:  printf ("\n");
+        -: 2760:
+        1: 2761:  exit (EXIT_SUCCESS);
+        -: 2762:}
+        -: 2763:
+        -: 2764:static bool
+    #####: 2765:parse_context (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2766:{
+        -: 2767:  struct predicate *our_pred;
+        -: 2768:
+    #####: 2769:  if ((argv == NULL) || (argv[*arg_ptr] == NULL))
+    #####: 2770:    return false;
+        -: 2771:
+        -: 2772:  if (is_selinux_enabled () <= 0)
+        -: 2773:    {
+    #####: 2774:      error (EXIT_FAILURE, 0,
+        -: 2775:	     _("invalid predicate -context: SELinux is not enabled."));
+    #####: 2776:      return false;
+        -: 2777:    }
+        -: 2778:  our_pred = insert_primary (entry, NULL);
+        -: 2779:  our_pred->est_success_rate = 0.01f;
+        -: 2780:  our_pred->need_stat = false;
+        -: 2781:#ifdef DEBUG
+        -: 2782:  our_pred->p_name = find_pred_name (pred_context);
+        -: 2783:#endif /*DEBUG*/
+        -: 2784:  our_pred->args.scontext = argv[*arg_ptr];
+        -: 2785:
+        -: 2786:  (*arg_ptr)++;
+        -: 2787:  return true;
+        -: 2788:}
+        -: 2789:
+        -: 2790:static bool
+    #####: 2791:parse_xdev (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2792:{
+    #####: 2793:  options.stay_on_filesystem = true;
+    #####: 2794:  return parse_noop (entry, argv, arg_ptr);
+        -: 2795:}
+        -: 2796:
+        -: 2797:static bool
+    #####: 2798:parse_ignore_race (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2799:{
+    #####: 2800:  options.ignore_readdir_race = true;
+    #####: 2801:  return parse_noop (entry, argv, arg_ptr);
+        -: 2802:}
+        -: 2803:
+        -: 2804:static bool
+    #####: 2805:parse_noignore_race (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2806:{
+    #####: 2807:  options.ignore_readdir_race = false;
+    #####: 2808:  return parse_noop (entry, argv, arg_ptr);
+        -: 2809:}
+        -: 2810:
+        -: 2811:static bool
+    #####: 2812:parse_warn (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2813:{
+    #####: 2814:  options.warnings = true;
+    #####: 2815:  return parse_noop (entry, argv, arg_ptr);
+        -: 2816:}
+        -: 2817:
+        -: 2818:static bool
+    #####: 2819:parse_xtype (const struct parser_table* entry, char **argv, int *arg_ptr)
+        -: 2820:{
+    #####: 2821:  return insert_type (argv, arg_ptr, entry, pred_xtype);
+        -: 2822:}
+        -: 2823:
+        -: 2824:static bool
+    #####: 2825:insert_type (char **argv, int *arg_ptr,
+        -: 2826:	     const struct parser_table *entry,
+        -: 2827:	     PRED_FUNC which_pred)
+        -: 2828:{
+        -: 2829:  mode_t type_cell;
+        -: 2830:  struct predicate *our_pred;
+    #####: 2831:  float rate = 0.5;
+        -: 2832:  const char *typeletter;
+        -: 2833:
+    #####: 2834:  if (collect_arg (argv, arg_ptr, &typeletter))
+        -: 2835:    {
+    #####: 2836:      if (strlen (typeletter) != 1u)
+        -: 2837:	{
+    #####: 2838:	  error (EXIT_FAILURE, 0,
+        -: 2839:		 _("Arguments to -type should contain only one letter"));
+        -: 2840:	  /*NOTREACHED*/
+    #####: 2841:	  return false;
+        -: 2842:	}
+        -: 2843:
+    #####: 2844:      switch (typeletter[0])
+        -: 2845:	{
+        -: 2846:	case 'b':			/* block special */
+    #####: 2847:	  type_cell = S_IFBLK;
+    #####: 2848:	  rate = 0.01f;
+    #####: 2849:	  break;
+        -: 2850:	case 'c':			/* character special */
+    #####: 2851:	  type_cell = S_IFCHR;
+    #####: 2852:	  rate = 0.01f;
+    #####: 2853:	  break;
+        -: 2854:	case 'd':			/* directory */
+    #####: 2855:	  type_cell = S_IFDIR;
+    #####: 2856:	  rate = 0.4f;
+    #####: 2857:	  break;
+        -: 2858:	case 'f':			/* regular file */
+    #####: 2859:	  type_cell = S_IFREG;
+    #####: 2860:	  rate = 0.95f;
+    #####: 2861:	  break;
+        -: 2862:#ifdef S_IFLNK
+        -: 2863:	case 'l':			/* symbolic link */
+    #####: 2864:	  type_cell = S_IFLNK;
+    #####: 2865:	  rate = 0.1f;
+    #####: 2866:	  break;
+        -: 2867:#endif
+        -: 2868:#ifdef S_IFIFO
+        -: 2869:	case 'p':			/* pipe */
+    #####: 2870:	  type_cell = S_IFIFO;
+    #####: 2871:	  rate = 0.01f;
+    #####: 2872:	  break;
+        -: 2873:#endif
+        -: 2874:#ifdef S_IFSOCK
+        -: 2875:	case 's':			/* socket */
+    #####: 2876:	  type_cell = S_IFSOCK;
+    #####: 2877:	  rate = 0.01f;
+    #####: 2878:	  break;
+        -: 2879:#endif
+        -: 2880:#ifdef S_IFDOOR
+        -: 2881:	case 'D':			/* Solaris door */
+        -: 2882:	  type_cell = S_IFDOOR;
+        -: 2883:	  rate = 0.01f;
+        -: 2884:	  break;
+        -: 2885:#endif
+        -: 2886:	default:			/* None of the above ... nuke 'em. */
+    #####: 2887:	  error (EXIT_FAILURE, 0,
+    #####: 2888:		 _("Unknown argument to -type: %c"), (*typeletter));
+        -: 2889:	  /*NOTREACHED*/
+    #####: 2890:	  return false;
+        -: 2891:	}
+    #####: 2892:      our_pred = insert_primary_withpred (entry, which_pred, typeletter);
+    #####: 2893:      our_pred->est_success_rate = rate;
+        -: 2894:
+        -: 2895:      /* Figure out if we will need to stat the file, because if we don't
+        -: 2896:       * need to follow symlinks, we can avoid a stat call by using
+        -: 2897:       * struct dirent.d_type.
+        -: 2898:       */
+    #####: 2899:      if (which_pred == pred_xtype)
+        -: 2900:	{
+    #####: 2901:	  our_pred->need_stat = true;
+    #####: 2902:	  our_pred->need_type = false;
+        -: 2903:	}
+        -: 2904:      else
+        -: 2905:	{
+    #####: 2906:	  our_pred->need_stat = false; /* struct dirent is enough */
+    #####: 2907:	  our_pred->need_type = true;
+        -: 2908:	}
+    #####: 2909:      our_pred->args.type = type_cell;
+    #####: 2910:      return true;
+        -: 2911:    }
+    #####: 2912:  return false;
+        -: 2913:}
+        -: 2914:
+        -: 2915:
+        -: 2916:/* Return true if the file accessed via FP is a terminal.
+        -: 2917: */
+        -: 2918:static bool
+    #####: 2919:stream_is_tty (FILE *fp)
+        -: 2920:{
+    #####: 2921:  int fd = fileno (fp);
+    #####: 2922:  if (-1 == fd)
+        -: 2923:    {
+    #####: 2924:      return false; /* not a valid stream */
+        -: 2925:    }
+        -: 2926:  else
+        -: 2927:    {
+    #####: 2928:      return isatty (fd) ? true : false;
+        -: 2929:    }
+        -: 2930:
+        -: 2931:}
+        -: 2932:
+        -: 2933:
+        -: 2934:
+        -: 2935:
+        -: 2936:/* XXX: do we need to pass FUNC to this function? */
+        -: 2937:static bool
+    #####: 2938:insert_fprintf (struct format_val *vec,
+        -: 2939:		const struct parser_table *entry, PRED_FUNC func,
+        -: 2940:		const char *format_const)
+        -: 2941:{
+    #####: 2942:  char *format = (char*)format_const; /* XXX: casting away constness */
+        -: 2943:  register char *scan;		/* Current address in scanning `format'. */
+        -: 2944:  register char *scan2;		/* Address inside of element being scanned. */
+        -: 2945:  struct segment **segmentp;	/* Address of current segment. */
+        -: 2946:  struct predicate *our_pred;
+        -: 2947:
+    #####: 2948:  our_pred = insert_primary_withpred (entry, func, format_const);
+    #####: 2949:  our_pred->side_effects = our_pred->no_default_print = true;
+    #####: 2950:  our_pred->args.printf_vec = *vec;
+    #####: 2951:  our_pred->need_type = false;
+    #####: 2952:  our_pred->need_stat = false;
+    #####: 2953:  our_pred->p_cost    = NeedsNothing;
+        -: 2954:
+    #####: 2955:  segmentp = &our_pred->args.printf_vec.segment;
+    #####: 2956:  *segmentp = NULL;
+        -: 2957:
+    #####: 2958:  for (scan = format; *scan; scan++)
+        -: 2959:    {
+    #####: 2960:      if (*scan == '\\')
+        -: 2961:	{
+    #####: 2962:	  scan2 = scan + 1;
+    #####: 2963:	  if (*scan2 >= '0' && *scan2 <= '7')
+    #####: 2964:	    {
+        -: 2965:	      register int n, i;
+        -: 2966:
+    #####: 2967:	      for (i = n = 0; i < 3 && (*scan2 >= '0' && *scan2 <= '7');
+    #####: 2968:		   i++, scan2++)
+    #####: 2969:		n = 8 * n + *scan2 - '0';
+    #####: 2970:	      scan2--;
+    #####: 2971:	      *scan = n;
+        -: 2972:	    }
+        -: 2973:	  else
+        -: 2974:	    {
+    #####: 2975:	      switch (*scan2)
+        -: 2976:		{
+        -: 2977:		case 'a':
+    #####: 2978:		  *scan = 7;
+    #####: 2979:		  break;
+        -: 2980:		case 'b':
+    #####: 2981:		  *scan = '\b';
+    #####: 2982:		  break;
+        -: 2983:		case 'c':
+    #####: 2984:		  make_segment (segmentp, format, scan - format,
+        -: 2985:				KIND_STOP, 0, 0,
+        -: 2986:				our_pred);
+    #####: 2987:		  if (our_pred->need_stat && (our_pred->p_cost < NeedsStatInfo))
+    #####: 2988:		    our_pred->p_cost = NeedsStatInfo;
+    #####: 2989:		  return true;
+        -: 2990:		case 'f':
+    #####: 2991:		  *scan = '\f';
+    #####: 2992:		  break;
+        -: 2993:		case 'n':
+    #####: 2994:		  *scan = '\n';
+    #####: 2995:		  break;
+        -: 2996:		case 'r':
+    #####: 2997:		  *scan = '\r';
+    #####: 2998:		  break;
+        -: 2999:		case 't':
+    #####: 3000:		  *scan = '\t';
+    #####: 3001:		  break;
+        -: 3002:		case 'v':
+    #####: 3003:		  *scan = '\v';
+    #####: 3004:		  break;
+        -: 3005:		case '\\':
+        -: 3006:		  /* *scan = '\\'; * it already is */
+    #####: 3007:		  break;
+        -: 3008:		default:
+    #####: 3009:		  error (0, 0,
+    #####: 3010:			 _("warning: unrecognized escape `\\%c'"), *scan2);
+    #####: 3011:		  scan++;
+    #####: 3012:		  continue;
+        -: 3013:		}
+        -: 3014:	    }
+    #####: 3015:	  segmentp = make_segment (segmentp, format, scan - format + 1,
+        -: 3016:				   KIND_PLAIN, 0, 0,
+        -: 3017:				   our_pred);
+    #####: 3018:	  format = scan2 + 1;	/* Move past the escape. */
+    #####: 3019:	  scan = scan2;		/* Incremented immediately by `for'. */
+        -: 3020:	}
+    #####: 3021:      else if (*scan == '%')
+        -: 3022:	{
+    #####: 3023:	  if (scan[1] == 0)
+        -: 3024:	    {
+        -: 3025:	      /* Trailing %.  We don't like those. */
+    #####: 3026:	      error (EXIT_FAILURE, 0,
+        -: 3027:		     _("error: %s at end of format string"), scan);
+        -: 3028:	    }
+    #####: 3029:	  else if (scan[1] == '%')
+        -: 3030:	    {
+    #####: 3031:	      segmentp = make_segment (segmentp, format, scan - format + 1,
+        -: 3032:				       KIND_PLAIN, 0, 0,
+        -: 3033:				       our_pred);
+    #####: 3034:	      scan++;
+    #####: 3035:	      format = scan + 1;
+    #####: 3036:	      continue;
+        -: 3037:	    }
+        -: 3038:	  /* Scan past flags, width and precision, to verify kind. */
+    #####: 3039:	  for (scan2 = scan; *++scan2 && strchr ("-+ #", *scan2);)
+        -: 3040:	    /* Do nothing. */ ;
+    #####: 3041:	  while (ISDIGIT (*scan2))
+    #####: 3042:	    scan2++;
+    #####: 3043:	  if (*scan2 == '.')
+    #####: 3044:	    for (scan2++; ISDIGIT (*scan2); scan2++)
+        -: 3045:	      /* Do nothing. */ ;
+    #####: 3046:	  if (strchr ("abcdDfFgGhHiklmMnpPsStuUyYZ", *scan2))
+        -: 3047:	    {
+    #####: 3048:	      segmentp = make_segment (segmentp, format, scan2 - format,
+    #####: 3049:				       KIND_FORMAT, *scan2, 0,
+        -: 3050:				       our_pred);
+    #####: 3051:	      scan = scan2;
+    #####: 3052:	      format = scan + 1;
+        -: 3053:	    }
+    #####: 3054:	  else if (strchr ("ABCT", *scan2) && scan2[1])
+        -: 3055:	    {
+    #####: 3056:	      segmentp = make_segment (segmentp, format, scan2 - format,
+    #####: 3057:				       KIND_FORMAT, scan2[0], scan2[1],
+        -: 3058:				       our_pred);
+    #####: 3059:	      scan = scan2 + 1;
+    #####: 3060:	      format = scan + 1;
+    #####: 3061:	      continue;
+        -: 3062:	    }
+        -: 3063:	  else
+        -: 3064:	    {
+        -: 3065:	      /* An unrecognized % escape.  Print the char after the %. */
+    #####: 3066:	      error (0, 0, _("warning: unrecognized format directive `%%%c'"),
+    #####: 3067:		     *scan2);
+    #####: 3068:	      segmentp = make_segment (segmentp, format, scan - format,
+        -: 3069:				       KIND_PLAIN, 0, 0,
+        -: 3070:				       our_pred);
+    #####: 3071:	      format = scan + 1;
+    #####: 3072:	      continue;
+        -: 3073:	    }
+        -: 3074:	}
+        -: 3075:    }
+        -: 3076:
+    #####: 3077:  if (scan > format)
+    #####: 3078:    make_segment (segmentp, format, scan - format, KIND_PLAIN, 0, 0,
+        -: 3079:		  our_pred);
+    #####: 3080:  return true;
+        -: 3081:}
+        -: 3082:
+        -: 3083:/* Create a new fprintf segment in *SEGMENT, with type KIND,
+        -: 3084:   from the text in FORMAT, which has length LEN.
+        -: 3085:   Return the address of the `next' pointer of the new segment. */
+        -: 3086:
+        -: 3087:static struct segment **
+    #####: 3088:make_segment (struct segment **segment,
+        -: 3089:	      char *format,
+        -: 3090:	      int len,
+        -: 3091:	      int kind,
+        -: 3092:	      char format_char,
+        -: 3093:	      char aux_format_char,
+        -: 3094:	      struct predicate *pred)
+        -: 3095:{
+    #####: 3096:  enum EvaluationCost mycost = NeedsNothing;
+        -: 3097:  char *fmt;
+        -: 3098:
+    #####: 3099:  *segment = xmalloc (sizeof (struct segment));
+        -: 3100:
+    #####: 3101:  (*segment)->segkind = kind;
+    #####: 3102:  (*segment)->format_char[0] = format_char;
+    #####: 3103:  (*segment)->format_char[1] = aux_format_char;
+    #####: 3104:  (*segment)->next = NULL;
+    #####: 3105:  (*segment)->text_len = len;
+        -: 3106:
+    #####: 3107:  fmt = (*segment)->text = xmalloc (len + sizeof "d");
+    #####: 3108:  strncpy (fmt, format, len);
+    #####: 3109:  fmt += len;
+        -: 3110:
+    #####: 3111:  switch (kind)
+        -: 3112:    {
+        -: 3113:    case KIND_PLAIN:		/* Plain text string, no % conversion. */
+        -: 3114:    case KIND_STOP:		/* Terminate argument, no newline. */
+    #####: 3115:      assert (0 == format_char);
+    #####: 3116:      assert (0 == aux_format_char);
+    #####: 3117:      *fmt = '\0';
+    #####: 3118:      if (mycost > pred->p_cost)
+    #####: 3119:	pred->p_cost = NeedsNothing;
+    #####: 3120:      return &(*segment)->next;
+        -: 3121:      break;
+        -: 3122:    }
+        -: 3123:
+    #####: 3124:  assert (kind == KIND_FORMAT);
+    #####: 3125:  switch (format_char)
+        -: 3126:    {
+        -: 3127:    case 'l':			/* object of symlink */
+    #####: 3128:      pred->need_stat = true;
+    #####: 3129:      mycost = NeedsLinkName;
+    #####: 3130:      *fmt++ = 's';
+    #####: 3131:      break;
+        -: 3132:
+        -: 3133:    case 'y':			/* file type */
+    #####: 3134:      pred->need_type = true;
+    #####: 3135:      mycost = NeedsType;
+    #####: 3136:      *fmt++ = 's';
+    #####: 3137:      break;
+        -: 3138:
+        -: 3139:    case 'i':			/* inode number */
+    #####: 3140:      pred->need_inum = true;
+    #####: 3141:      mycost = NeedsInodeNumber;
+    #####: 3142:      *fmt++ = 's';
+    #####: 3143:      break;
+        -: 3144:
+        -: 3145:    case 'a':			/* atime in `ctime' format */
+        -: 3146:    case 'A':			/* atime in user-specified strftime format */
+        -: 3147:    case 'B':			/* birth time in user-specified strftime format */
+        -: 3148:    case 'c':			/* ctime in `ctime' format */
+        -: 3149:    case 'C':			/* ctime in user-specified strftime format */
+        -: 3150:    case 'F':			/* file system type */
+        -: 3151:    case 'g':			/* group name */
+        -: 3152:    case 'M':			/* mode in `ls -l' format (eg., "drwxr-xr-x") */
+        -: 3153:    case 's':			/* size in bytes */
+        -: 3154:    case 't':			/* mtime in `ctime' format */
+        -: 3155:    case 'T':			/* mtime in user-specified strftime format */
+        -: 3156:    case 'u':			/* user name */
+    #####: 3157:      pred->need_stat = true;
+    #####: 3158:      mycost = NeedsStatInfo;
+    #####: 3159:      *fmt++ = 's';
+    #####: 3160:      break;
+        -: 3161:
+        -: 3162:    case 'S':			/* sparseness */
+    #####: 3163:      pred->need_stat = true;
+    #####: 3164:      mycost = NeedsStatInfo;
+    #####: 3165:      *fmt++ = 'g';
+    #####: 3166:      break;
+        -: 3167:
+        -: 3168:    case 'Y':			/* symlink pointed file type */
+    #####: 3169:      pred->need_stat = true;
+    #####: 3170:      mycost = NeedsType;	/* true for amortised effect */
+    #####: 3171:      *fmt++ = 's';
+    #####: 3172:      break;
+        -: 3173:
+        -: 3174:    case 'f':			/* basename of path */
+        -: 3175:    case 'h':			/* leading directories part of path */
+        -: 3176:    case 'p':			/* pathname */
+        -: 3177:    case 'P':			/* pathname with ARGV element stripped */
+    #####: 3178:      *fmt++ = 's';
+    #####: 3179:      break;
+        -: 3180:
+        -: 3181:    case 'Z':			/* SELinux security context */
+    #####: 3182:      mycost = NeedsAccessInfo;
+    #####: 3183:      *fmt++ = 's';
+    #####: 3184:      break;
+        -: 3185:
+        -: 3186:    case 'H':			/* ARGV element file was found under */
+    #####: 3187:      *fmt++ = 's';
+    #####: 3188:      break;
+        -: 3189:
+        -: 3190:      /* Numeric items that one might expect to honour
+        -: 3191:       * #, 0, + flags but which do not.
+        -: 3192:       */
+        -: 3193:    case 'G':			/* GID number */
+        -: 3194:    case 'U':			/* UID number */
+        -: 3195:    case 'b':			/* size in 512-byte blocks (NOT birthtime in ctime fmt)*/
+        -: 3196:    case 'D':                   /* Filesystem device on which the file exits */
+        -: 3197:    case 'k':			/* size in 1K blocks */
+        -: 3198:    case 'n':			/* number of links */
+    #####: 3199:      pred->need_stat = true;
+    #####: 3200:      mycost = NeedsStatInfo;
+    #####: 3201:      *fmt++ = 's';
+    #####: 3202:      break;
+        -: 3203:
+        -: 3204:      /* Numeric items that DO honour #, 0, + flags.
+        -: 3205:       */
+        -: 3206:    case 'd':			/* depth in search tree (0 = ARGV element) */
+    #####: 3207:      *fmt++ = 'd';
+    #####: 3208:      break;
+        -: 3209:
+        -: 3210:    case 'm':			/* mode as octal number (perms only) */
+    #####: 3211:      *fmt++ = 'o';
+    #####: 3212:      pred->need_stat = true;
+    #####: 3213:      mycost = NeedsStatInfo;
+    #####: 3214:      break;
+        -: 3215:
+        -: 3216:    case '{':
+        -: 3217:    case '[':
+        -: 3218:    case '(':
+    #####: 3219:      error (EXIT_FAILURE, 0,
+        -: 3220:	     _("error: the format directive `%%%c' is reserved for future use"),
+        -: 3221:	     (int)kind);
+        -: 3222:      /*NOTREACHED*/
+    #####: 3223:      break;
+        -: 3224:    }
+    #####: 3225:  *fmt = '\0';
+        -: 3226:
+    #####: 3227:  if (mycost > pred->p_cost)
+    #####: 3228:    pred->p_cost = mycost;
+    #####: 3229:  return &(*segment)->next;
+        -: 3230:}
+        -: 3231:
+        -: 3232:static void
+    #####: 3233:check_path_safety (const char *action, char **argv)
+        -: 3234:{
+        -: 3235:  char *s;
+    #####: 3236:  const char *path = getenv ("PATH");
+    #####: 3237:  if (NULL == path)
+        -: 3238:    {
+        -: 3239:      /* $PATH is not set.  Assume the OS default is safe.
+        -: 3240:       * That may not be true on Windows, but I'm not aware
+        -: 3241:       * of a way to get Windows to avoid searching the
+        -: 3242:       * current directory anyway.
+        -: 3243:       */
+    #####: 3244:      return;
+        -: 3245:    }
+        -: 3246:
+        -: 3247:  (void)argv;
+        -: 3248:
+    #####: 3249:  s = next_element (path, 1);
+    #####: 3250:  while ((s = next_element ((char *) NULL, 1)) != NULL)
+        -: 3251:    {
+    #####: 3252:      if (0 == strcmp (s, "."))
+        -: 3253:	{
+    #####: 3254:	  error (EXIT_FAILURE, 0,
+        -: 3255:		 _("The current directory is included in the PATH "
+        -: 3256:		   "environment variable, which is insecure in "
+        -: 3257:		   "combination with the %s action of find.  "
+        -: 3258:		   "Please remove the current directory from your "
+        -: 3259:		   "$PATH (that is, remove \".\" or leading or trailing "
+        -: 3260:		   "colons)"),
+        -: 3261:		 action);
+        -: 3262:	}
+    #####: 3263:      else if ('/' != s[0])
+        -: 3264:	{
+        -: 3265:	  /* Relative paths are also dangerous in $PATH. */
+    #####: 3266:	  error (EXIT_FAILURE, 0,
+        -: 3267:		 _("The relative path %s is included in the PATH "
+        -: 3268:		   "environment variable, which is insecure in "
+        -: 3269:		   "combination with the %s action of find.  "
+        -: 3270:		   "Please remove that entry from $PATH"),
+        -: 3271:		 safely_quote_err_filename (0, s),
+        -: 3272:		 action);
+        -: 3273:	}
+        -: 3274:    }
+        -: 3275:}
+        -: 3276:
+        -: 3277:
+        -: 3278:/* handles both exec and ok predicate */
+        -: 3279:static bool
+    #####: 3280:insert_exec_ok (const char *action,
+        -: 3281:		const struct parser_table *entry,
+        -: 3282:		char **argv,
+        -: 3283:		int *arg_ptr)
+        -: 3284:{
+        -: 3285:  int start, end;		/* Indexes in ARGV of start & end of cmd. */
+        -: 3286:  int i;			/* Index into cmd args */
+        -: 3287:  int saw_braces;		/* True if previous arg was '{}'. */
+        -: 3288:  bool allow_plus;		/* True if + is a valid terminator */
+        -: 3289:  int brace_count;		/* Number of instances of {}. */
+    #####: 3290:  PRED_FUNC func = entry->pred_func;
+        -: 3291:  enum BC_INIT_STATUS bcstatus;
+        -: 3292:
+        -: 3293:  struct predicate *our_pred;
+        -: 3294:  struct exec_val *execp;	/* Pointer for efficiency. */
+        -: 3295:
+    #####: 3296:  if ((argv == NULL) || (argv[*arg_ptr] == NULL))
+    #####: 3297:    return false;
+        -: 3298:
+    #####: 3299:  our_pred = insert_primary_withpred (entry, func, "(some -exec* arguments)");
+    #####: 3300:  our_pred->side_effects = our_pred->no_default_print = true;
+    #####: 3301:  our_pred->need_type = our_pred->need_stat = false;
+        -: 3302:
+    #####: 3303:  execp = &our_pred->args.exec_vec;
+    #####: 3304:  execp->wd_for_exec = NULL;
+        -: 3305:
+    #####: 3306:  if ((func != pred_okdir) && (func != pred_ok))
+        -: 3307:    {
+    #####: 3308:      allow_plus = true;
+    #####: 3309:      execp->close_stdin = false;
+        -: 3310:    }
+        -: 3311:  else
+        -: 3312:    {
+    #####: 3313:      allow_plus = false;
+        -: 3314:      /* If find reads stdin (i.e. for -ok and similar), close stdin
+        -: 3315:       * in the child to prevent some script from consiming the output
+        -: 3316:       * intended for find.
+        -: 3317:       */
+    #####: 3318:      execp->close_stdin = true;
+        -: 3319:    }
+        -: 3320:
+        -: 3321:
+    #####: 3322:  if ((func == pred_execdir) || (func == pred_okdir))
+        -: 3323:    {
+    #####: 3324:      execp->wd_for_exec = NULL;
+    #####: 3325:      options.ignore_readdir_race = false;
+    #####: 3326:      check_path_safety (action, argv);
+        -: 3327:    }
+        -: 3328:  else
+        -: 3329:    {
+    #####: 3330:      assert (NULL != initial_wd);
+    #####: 3331:      execp->wd_for_exec = initial_wd;
+        -: 3332:    }
+        -: 3333:
+    #####: 3334:  our_pred->args.exec_vec.multiple = 0;
+        -: 3335:
+        -: 3336:  /* Count the number of args with path replacements, up until the ';'.
+        -: 3337:   * Also figure out if the command is terminated by ";" or by "+".
+        -: 3338:   */
+    #####: 3339:  start = *arg_ptr;
+    #####: 3340:  for (end = start, saw_braces=0, brace_count=0;
+    #####: 3341:       (argv[end] != NULL)
+    #####: 3342:       && ((argv[end][0] != ';') || (argv[end][1] != '\0'));
+    #####: 3343:       end++)
+        -: 3344:    {
+        -: 3345:      /* For -exec and -execdir, "{} +" can terminate the command. */
+    #####: 3346:      if ( allow_plus
+    #####: 3347:	   && argv[end][0] == '+' && argv[end][1] == 0
+    #####: 3348:	   && saw_braces)
+        -: 3349:	{
+    #####: 3350:	  our_pred->args.exec_vec.multiple = 1;
+    #####: 3351:	  break;
+        -: 3352:	}
+        -: 3353:
+    #####: 3354:      saw_braces = 0;
+    #####: 3355:      if (mbsstr (argv[end], "{}"))
+        -: 3356:	{
+    #####: 3357:	  saw_braces = 1;
+    #####: 3358:	  ++brace_count;
+        -: 3359:
+    #####: 3360:	  if (0 == end && (func == pred_execdir || func == pred_okdir))
+        -: 3361:	    {
+        -: 3362:	      /* The POSIX standard says that {} replacement should
+        -: 3363:	       * occur even in the utility name.  This is insecure
+        -: 3364:	       * since it means we will be executing a command whose
+        -: 3365:	       * name is chosen according to whatever find finds in
+        -: 3366:	       * the file system.  That can be influenced by an
+        -: 3367:	       * attacker.  Hence for -execdir and -okdir this is not
+        -: 3368:	       * allowed.  We can specify this as those options are
+        -: 3369:	       * not defined by POSIX.
+        -: 3370:	       */
+    #####: 3371:	      error (EXIT_FAILURE, 0,
+        -: 3372:		     _("You may not use {} within the utility name for "
+        -: 3373:		       "-execdir and -okdir, because this is a potential "
+        -: 3374:		       "security problem."));
+        -: 3375:	    }
+        -: 3376:	}
+        -: 3377:    }
+        -: 3378:
+        -: 3379:  /* Fail if no command given or no semicolon found. */
+    #####: 3380:  if ((end == start) || (argv[end] == NULL))
+        -: 3381:    {
+    #####: 3382:      *arg_ptr = end;
+    #####: 3383:      free (our_pred);
+    #####: 3384:      return false;
+        -: 3385:    }
+        -: 3386:
+    #####: 3387:  if (our_pred->args.exec_vec.multiple && brace_count > 1)
+        -: 3388:    {
+        -: 3389:
+        -: 3390:      const char *suffix;
+    #####: 3391:      if (func == pred_execdir)
+    #####: 3392:	suffix = "dir";
+        -: 3393:      else
+    #####: 3394:	suffix = "";
+        -: 3395:
+    #####: 3396:      error (EXIT_FAILURE, 0,
+        -: 3397:	     _("Only one instance of {} is supported with -exec%s ... +"),
+        -: 3398:	     suffix);
+        -: 3399:    }
+        -: 3400:
+        -: 3401:  /* We use a switch statement here so that the compiler warns us when
+        -: 3402:   * we forget to handle a newly invented enum value.
+        -: 3403:   *
+        -: 3404:   * Like xargs, we allow 2KiB of headroom for the launched utility to
+        -: 3405:   * export its own environment variables before calling something
+        -: 3406:   * else.
+        -: 3407:   */
+    #####: 3408:  bcstatus = bc_init_controlinfo (&execp->ctl, 2048u);
+    #####: 3409:  switch (bcstatus)
+        -: 3410:    {
+        -: 3411:    case BC_INIT_ENV_TOO_BIG:
+        -: 3412:    case BC_INIT_CANNOT_ACCOMODATE_HEADROOM:
+    #####: 3413:      error (EXIT_FAILURE, 0,
+        -: 3414:	     _("The environment is too large for exec()."));
+    #####: 3415:      break;
+        -: 3416:    case BC_INIT_OK:
+        -: 3417:      /* Good news.  Carry on. */
+    #####: 3418:      break;
+        -: 3419:    }
+    #####: 3420:  bc_use_sensible_arg_max (&execp->ctl);
+        -: 3421:
+        -: 3422:
+    #####: 3423:  execp->ctl.exec_callback = launch;
+        -: 3424:
+    #####: 3425:  if (our_pred->args.exec_vec.multiple)
+        -: 3426:    {
+        -: 3427:      /* "+" terminator, so we can just append our arguments after the
+        -: 3428:       * command and initial arguments.
+        -: 3429:       */
+    #####: 3430:      execp->replace_vec = NULL;
+    #####: 3431:      execp->ctl.replace_pat = NULL;
+    #####: 3432:      execp->ctl.rplen = 0;
+    #####: 3433:      execp->ctl.lines_per_exec = 0; /* no limit */
+    #####: 3434:      execp->ctl.args_per_exec = 0; /* no limit */
+        -: 3435:
+        -: 3436:      /* remember how many arguments there are */
+    #####: 3437:      execp->ctl.initial_argc = (end-start) - 1;
+        -: 3438:
+        -: 3439:      /* execp->state = xmalloc(sizeof struct buildcmd_state); */
+    #####: 3440:      bc_init_state (&execp->ctl, &execp->state, execp);
+        -: 3441:
+        -: 3442:      /* Gather the initial arguments.  Skip the {}. */
+    #####: 3443:      for (i=start; i<end-1; ++i)
+        -: 3444:	{
+    #####: 3445:	  bc_push_arg (&execp->ctl, &execp->state,
+    #####: 3446:		       argv[i], strlen (argv[i])+1,
+        -: 3447:		       NULL, 0,
+        -: 3448:		       1);
+        -: 3449:	}
+        -: 3450:    }
+        -: 3451:  else
+        -: 3452:    {
+        -: 3453:      /* Semicolon terminator - more than one {} is supported, so we
+        -: 3454:       * have to do brace-replacement.
+        -: 3455:       */
+    #####: 3456:      execp->num_args = end - start;
+        -: 3457:
+    #####: 3458:      execp->ctl.replace_pat = "{}";
+    #####: 3459:      execp->ctl.rplen = strlen (execp->ctl.replace_pat);
+    #####: 3460:      execp->ctl.lines_per_exec = 0; /* no limit */
+    #####: 3461:      execp->ctl.args_per_exec = 0; /* no limit */
+    #####: 3462:      execp->replace_vec = xmalloc (sizeof(char*)*execp->num_args);
+        -: 3463:
+        -: 3464:
+        -: 3465:      /* execp->state = xmalloc(sizeof(*(execp->state))); */
+    #####: 3466:      bc_init_state (&execp->ctl, &execp->state, execp);
+        -: 3467:
+        -: 3468:      /* Remember the (pre-replacement) arguments for later. */
+    #####: 3469:      for (i=0; i<execp->num_args; ++i)
+        -: 3470:	{
+    #####: 3471:	  execp->replace_vec[i] = argv[i+start];
+        -: 3472:	}
+        -: 3473:    }
+        -: 3474:
+    #####: 3475:  if (argv[end] == NULL)
+    #####: 3476:    *arg_ptr = end;
+        -: 3477:  else
+    #####: 3478:    *arg_ptr = end + 1;
+        -: 3479:
+    #####: 3480:  return true;
+        -: 3481:}
+        -: 3482:
+        -: 3483:
+        -: 3484:
+        -: 3485:/* Get a timestamp and comparison type.
+        -: 3486:
+        -: 3487:   STR is the ASCII representation.
+        -: 3488:   Set *NUM_DAYS to the number of days/minutes/whatever, taken as being
+        -: 3489:   relative to ORIGIN (usually the current moment or midnight).
+        -: 3490:   Thus the sense of the comparison type appears to be reversed.
+        -: 3491:   Set *COMP_TYPE to the kind of comparison that is requested.
+        -: 3492:   Issue OVERFLOWMESSAGE if overflow occurs.
+        -: 3493:   Return true if all okay, false if input error.
+        -: 3494:
+        -: 3495:   Used by -atime, -ctime and -mtime (parsers) to
+        -: 3496:   get the appropriate information for a time predicate processor. */
+        -: 3497:
+        -: 3498:static bool
+    #####: 3499:get_relative_timestamp (const char *str,
+        -: 3500:			struct time_val *result,
+        -: 3501:			struct timespec origin,
+        -: 3502:			double sec_per_unit,
+        -: 3503:			const char *overflowmessage)
+        -: 3504:{
+        -: 3505:  double offset, seconds, nanosec;
+        -: 3506:  static const long nanosec_per_sec = 1000000000;
+        -: 3507:
+    #####: 3508:  if (get_comp_type (&str, &result->kind))
+        -: 3509:    {
+        -: 3510:      /* Invert the sense of the comparison */
+    #####: 3511:      switch (result->kind)
+        -: 3512:	{
+    #####: 3513:	case COMP_LT: result->kind = COMP_GT; break;
+    #####: 3514:	case COMP_GT: result->kind = COMP_LT; break;
+    #####: 3515:	default: break;
+        -: 3516:	}
+        -: 3517:
+        -: 3518:      /* Convert the ASCII number into floating-point. */
+    #####: 3519:      if (xstrtod (str, NULL, &offset, strtod))
+        -: 3520:	{
+        -: 3521:	  /* Separate the floating point number the user specified
+        -: 3522:	   * (which is a number of days, or minutes, etc) into an
+        -: 3523:	   * integral number of seconds (SECONDS) and a fraction (NANOSEC).
+        -: 3524:	   */
+    #####: 3525:	  nanosec = modf (offset * sec_per_unit, &seconds);
+    #####: 3526:	  nanosec *= 1.0e9;	/* convert from fractional seconds to ns. */
+    #####: 3527:	  assert (nanosec < nanosec_per_sec);
+        -: 3528:
+        -: 3529:	  /* Perform the subtraction, and then check for overflow.
+        -: 3530:	   * On systems where signed aritmetic overflow does not
+        -: 3531:	   * wrap, this check may be unreliable.   The C standard
+        -: 3532:	   * does not require this approach to work, but I am aware
+        -: 3533:	   * of no platforms where it fails.
+        -: 3534:	   */
+    #####: 3535:	  result->ts.tv_sec  = origin.tv_sec - seconds;
+    #####: 3536:	  if ((origin.tv_sec < result->ts.tv_sec) != (seconds < 0))
+        -: 3537:	    {
+        -: 3538:	      /* an overflow has occurred. */
+    #####: 3539:	      error (EXIT_FAILURE, 0, overflowmessage, str);
+        -: 3540:	    }
+        -: 3541:
+    #####: 3542:	  result->ts.tv_nsec = origin.tv_nsec - nanosec;
+    #####: 3543:	  if (origin.tv_nsec < nanosec)
+        -: 3544:	    {
+        -: 3545:	      /* Perform a carry operation */
+    #####: 3546:	      result->ts.tv_nsec += nanosec_per_sec;
+    #####: 3547:	      result->ts.tv_sec  -= 1;
+        -: 3548:	    }
+    #####: 3549:	  return true;
+        -: 3550:	}
+        -: 3551:      else
+        -: 3552:	{
+        -: 3553:	  /* Conversion from ASCII to double failed. */
+    #####: 3554:	  return false;
+        -: 3555:	}
+        -: 3556:    }
+        -: 3557:  else
+        -: 3558:    {
+    #####: 3559:      return false;
+        -: 3560:    }
+        -: 3561:}
+        -: 3562:
+        -: 3563:/* Insert a time predicate based on the information in ENTRY.
+        -: 3564:   ARGV is a pointer to the argument array.
+        -: 3565:   ARG_PTR is a pointer to an index into the array, incremented if
+        -: 3566:   all went well.
+        -: 3567:
+        -: 3568:   Return true if input is valid, false if not.
+        -: 3569:
+        -: 3570:   A new predicate node is assigned, along with an argument node
+        -: 3571:   obtained with malloc.
+        -: 3572:
+        -: 3573:   Used by -atime, -ctime, and -mtime parsers. */
+        -: 3574:
+        -: 3575:static bool
+    #####: 3576:parse_time (const struct parser_table* entry, char *argv[], int *arg_ptr)
+        -: 3577:{
+        -: 3578:  struct predicate *our_pred;
+        -: 3579:  struct time_val tval;
+        -: 3580:  enum comparison_type comp;
+        -: 3581:  const char *timearg, *orig_timearg;
+    #####: 3582:  const char *errmsg = _("arithmetic overflow while converting %s "
+        -: 3583:			 "days to a number of seconds");
+        -: 3584:  struct timespec origin;
+    #####: 3585:  const int saved_argc = *arg_ptr;
+        -: 3586:
+    #####: 3587:  if (!collect_arg (argv, arg_ptr, &timearg))
+    #####: 3588:    return false;
+    #####: 3589:  orig_timearg = timearg;
+        -: 3590:
+        -: 3591:  /* Decide the origin by previewing the comparison type. */
+    #####: 3592:  origin = options.cur_day_start;
+        -: 3593:
+    #####: 3594:  if (get_comp_type (&timearg, &comp))
+        -: 3595:    {
+        -: 3596:      /* Remember, we invert the sense of the comparison, so this tests
+        -: 3597:       * against COMP_LT instead of COMP_GT...
+        -: 3598:       */
+    #####: 3599:      if (COMP_LT == comp)
+        -: 3600:	{
+    #####: 3601:	  uintmax_t expected = origin.tv_sec + (DAYSECS-1);
+    #####: 3602:	  origin.tv_sec += (DAYSECS-1);
+    #####: 3603:	  if (origin.tv_sec != expected)
+        -: 3604:	    {
+    #####: 3605:	      error (EXIT_FAILURE, 0,
+        -: 3606:		     _("arithmetic overflow when trying to calculate the end of today"));
+        -: 3607:	    }
+        -: 3608:	}
+        -: 3609:    }
+        -: 3610:  /* We discard the value of comp here, as get_relative_timestamp
+        -: 3611:   * will set tval.kind.  For that to work, we have to restore
+        -: 3612:   * timearg so that it points to the +/- prefix, if any.  get_comp_type()
+        -: 3613:   * will have advanced timearg, so we restore it.
+        -: 3614:   */
+    #####: 3615:  timearg = orig_timearg;
+        -: 3616:
+    #####: 3617:  if (!get_relative_timestamp (timearg, &tval, origin, DAYSECS, errmsg))
+        -: 3618:    {
+    #####: 3619:      *arg_ptr = saved_argc;	/* don't consume the invalid argument */
+    #####: 3620:      return false;
+        -: 3621:    }
+        -: 3622:
+    #####: 3623:  our_pred = insert_primary (entry, orig_timearg);
+    #####: 3624:  our_pred->args.reftime = tval;
+    #####: 3625:  our_pred->est_success_rate = estimate_timestamp_success_rate (tval.ts.tv_sec);
+        -: 3626:
+    #####: 3627:  if (options.debug_options & DebugExpressionTree)
+        -: 3628:    {
+        -: 3629:      time_t t;
+        -: 3630:
+    #####: 3631:      fprintf (stderr, "inserting %s\n", our_pred->p_name);
+    #####: 3632:      fprintf (stderr, "    type: %s    %s  ",
+    #####: 3633:	       (tval.kind == COMP_GT) ? "gt" :
+    #####: 3634:	       ((tval.kind == COMP_LT) ? "lt" : ((tval.kind == COMP_EQ) ? "eq" : "?")),
+    #####: 3635:	       (tval.kind == COMP_GT) ? " >" :
+    #####: 3636:	       ((tval.kind == COMP_LT) ? " <" : ((tval.kind == COMP_EQ) ? ">=" : " ?")));
+    #####: 3637:      t = our_pred->args.reftime.ts.tv_sec;
+    #####: 3638:      fprintf (stderr, "%ju %s",
+    #####: 3639:	       (uintmax_t) our_pred->args.reftime.ts.tv_sec,
+        -: 3640:	       ctime (&t));
+    #####: 3641:      if (tval.kind == COMP_EQ)
+        -: 3642:	{
+    #####: 3643:	  t = our_pred->args.reftime.ts.tv_sec + DAYSECS;
+    #####: 3644:	  fprintf (stderr, "                 <  %ju %s",
+        -: 3645:		   (uintmax_t) t, ctime (&t));
+        -: 3646:	}
+        -: 3647:    }
+        -: 3648:
+    #####: 3649:  return true;
+        -: 3650:}
+        -: 3651:
+        -: 3652:/* Get the comparison type prefix (if any) from a number argument.
+        -: 3653:   The prefix is at *STR.
+        -: 3654:   Set *COMP_TYPE to the kind of comparison that is requested.
+        -: 3655:   Advance *STR beyond any initial comparison prefix.
+        -: 3656:
+        -: 3657:   Return true if all okay, false if input error.  */
+        -: 3658:static bool
+    #####: 3659:get_comp_type (const char **str, enum comparison_type *comp_type)
+        -: 3660:{
+    #####: 3661:  switch (**str)
+        -: 3662:    {
+        -: 3663:    case '+':
+    #####: 3664:      *comp_type = COMP_GT;
+    #####: 3665:      (*str)++;
+    #####: 3666:      break;
+        -: 3667:    case '-':
+    #####: 3668:      *comp_type = COMP_LT;
+    #####: 3669:      (*str)++;
+    #####: 3670:      break;
+        -: 3671:    default:
+    #####: 3672:      *comp_type = COMP_EQ;
+    #####: 3673:      break;
+        -: 3674:    }
+    #####: 3675:  return true;
+        -: 3676:}
+        -: 3677:
+        -: 3678:
+        -: 3679:
+        -: 3680:
+        -: 3681:
+        -: 3682:/* Get a number with comparison information.
+        -: 3683:   The sense of the comparison information is 'normal'; that is,
+        -: 3684:   '+' looks for a count > than the number and '-' less than.
+        -: 3685:
+        -: 3686:   STR is the ASCII representation of the number.
+        -: 3687:   Set *NUM to the number.
+        -: 3688:   Set *COMP_TYPE to the kind of comparison that is requested.
+        -: 3689:
+        -: 3690:   Return true if all okay, false if input error.  */
+        -: 3691:
+        -: 3692:static bool
+    #####: 3693:get_num (const char *str,
+        -: 3694:	 uintmax_t *num,
+        -: 3695:	 enum comparison_type *comp_type)
+        -: 3696:{
+        -: 3697:  char *pend;
+        -: 3698:
+    #####: 3699:  if (str == NULL)
+    #####: 3700:    return false;
+        -: 3701:
+        -: 3702:  /* Figure out the comparison type if the caller accepts one. */
+    #####: 3703:  if (comp_type)
+        -: 3704:    {
+    #####: 3705:      if (!get_comp_type (&str, comp_type))
+    #####: 3706:	return false;
+        -: 3707:    }
+        -: 3708:
+    #####: 3709:  return xstrtoumax (str, &pend, 10, num, "") == LONGINT_OK;
+        -: 3710:}
+        -: 3711:
+        -: 3712:/* Insert a number predicate.
+        -: 3713:   ARGV is a pointer to the argument array.
+        -: 3714:   *ARG_PTR is an index into ARGV, incremented if all went well.
+        -: 3715:   *PRED is the predicate processor to insert.
+        -: 3716:
+        -: 3717:   Return true if input is valid, false if error.
+        -: 3718:
+        -: 3719:   A new predicate node is assigned, along with an argument node
+        -: 3720:   obtained with malloc.
+        -: 3721:
+        -: 3722:   Used by -inum and -links parsers. */
+        -: 3723:
+        -: 3724:static struct predicate *
+    #####: 3725:insert_num (char **argv, int *arg_ptr, const struct parser_table *entry)
+        -: 3726:{
+        -: 3727:  const char *numstr;
+        -: 3728:
+    #####: 3729:  if (collect_arg (argv, arg_ptr, &numstr))
+        -: 3730:  {
+        -: 3731:    uintmax_t num;
+        -: 3732:    enum comparison_type c_type;
+        -: 3733:
+    #####: 3734:    if (get_num (numstr, &num, &c_type))
+        -: 3735:      {
+    #####: 3736:	struct predicate *our_pred = insert_primary (entry, numstr);
+    #####: 3737:	our_pred->args.numinfo.kind = c_type;
+    #####: 3738:	our_pred->args.numinfo.l_val = num;
+        -: 3739:
+    #####: 3740:	if (options.debug_options & DebugExpressionTree)
+        -: 3741:	  {
+    #####: 3742:	    fprintf (stderr, "inserting %s\n", our_pred->p_name);
+    #####: 3743:	    fprintf (stderr, "    type: %s    %s  ",
+    #####: 3744:		     (c_type == COMP_GT) ? "gt" :
+    #####: 3745:		     ((c_type == COMP_LT) ? "lt" : ((c_type == COMP_EQ) ? "eq" : "?")),
+    #####: 3746:		     (c_type == COMP_GT) ? " >" :
+    #####: 3747:		     ((c_type == COMP_LT) ? " <" : ((c_type == COMP_EQ) ? " =" : " ?")));
+    #####: 3748:	    fprintf (stderr, "%ju\n", our_pred->args.numinfo.l_val);
+        -: 3749:	  }
+    #####: 3750:	return our_pred;
+        -: 3751:      }
+        -: 3752:  }
+    #####: 3753:  return NULL;
+        -: 3754:}
+        -: 3755:
+        -: 3756:static void
+    #####: 3757:open_output_file (const char *path, struct format_val *p)
+        -: 3758:{
+    #####: 3759:  p->segment = NULL;
+    #####: 3760:  p->quote_opts = clone_quoting_options (NULL);
+        -: 3761:
+    #####: 3762:  if (!strcmp (path, "/dev/stderr"))
+        -: 3763:    {
+    #####: 3764:      p->stream = stderr;
+    #####: 3765:      p->filename = _("standard error");
+        -: 3766:    }
+    #####: 3767:  else if (!strcmp (path, "/dev/stdout"))
+        -: 3768:    {
+    #####: 3769:      p->stream = stdout;
+    #####: 3770:      p->filename = _("standard output");
+        -: 3771:    }
+        -: 3772:  else
+        -: 3773:    {
+    #####: 3774:      p->stream = sharefile_fopen (state.shared_files, path);
+    #####: 3775:      p->filename = path;
+        -: 3776:
+    #####: 3777:      if (p->stream == NULL)
+        -: 3778:	{
+    #####: 3779:	  fatal_nontarget_file_error (errno, path);
+        -: 3780:	}
+        -: 3781:    }
+        -: 3782:
+    #####: 3783:  p->dest_is_tty = stream_is_tty (p->stream);
+    #####: 3784:}
+        -: 3785:
+        -: 3786:static void
+    #####: 3787:open_stdout (struct format_val *p)
+        -: 3788:{
+    #####: 3789:  open_output_file ("/dev/stdout", p);
+    #####: 3790:}

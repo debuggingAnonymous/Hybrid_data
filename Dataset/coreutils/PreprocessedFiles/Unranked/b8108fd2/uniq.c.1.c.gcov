@@ -1,0 +1,568 @@
+        -:    0:Source:uniq.c
+        -:    0:Graph:uniq.gcno
+        -:    0:Data:uniq.gcda
+        -:    0:Runs:1
+        -:    0:Programs:1
+        -:    1:/* uniq -- remove duplicate lines from a sorted file
+        -:    2:   Copyright (C) 86, 91, 1995-2007 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by Richard Stallman and David MacKenzie. */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:
+        -:   21:#include <stdio.h>
+        -:   22:#include <getopt.h>
+        -:   23:#include <sys/types.h>
+        -:   24:
+        -:   25:#include "system.h"
+        -:   26:#include "argmatch.h"
+        -:   27:#include "linebuffer.h"
+        -:   28:#include "error.h"
+        -:   29:#include "hard-locale.h"
+        -:   30:#include "posixver.h"
+        -:   31:#include "quote.h"
+        -:   32:#include "xmemcoll.h"
+        -:   33:#include "xstrtol.h"
+        -:   34:#include "memcasecmp.h"
+        -:   35:
+        -:   36:/* The official name of this program (e.g., no `g' prefix).  */
+        -:   37:#define PROGRAM_NAME "uniq"
+        -:   38:
+        -:   39:#define AUTHORS "Richard Stallman", "David MacKenzie"
+        -:   40:
+        -:   41:#define SWAP_LINES(A, B)			\
+        -:   42:  do						\
+        -:   43:    {						\
+        -:   44:      struct linebuffer *_tmp;			\
+        -:   45:      _tmp = (A);				\
+        -:   46:      (A) = (B);				\
+        -:   47:      (B) = _tmp;				\
+        -:   48:    }						\
+        -:   49:  while (0)
+        -:   50:
+        -:   51:/* The name this program was run with. */
+        -:   52:char *program_name;
+        -:   53:
+        -:   54:/* True if the LC_COLLATE locale is hard.  */
+        -:   55:static bool hard_LC_COLLATE;
+        -:   56:
+        -:   57:/* Number of fields to skip on each line when doing comparisons. */
+        -:   58:static size_t skip_fields;
+        -:   59:
+        -:   60:/* Number of chars to skip after skipping any fields. */
+        -:   61:static size_t skip_chars;
+        -:   62:
+        -:   63:/* Number of chars to compare. */
+        -:   64:static size_t check_chars;
+        -:   65:
+        -:   66:enum countmode
+        -:   67:{
+        -:   68:  count_occurrences,		/* -c Print count before output lines. */
+        -:   69:  count_none			/* Default.  Do not print counts. */
+        -:   70:};
+        -:   71:
+        -:   72:/* Whether and how to precede the output lines with a count of the number of
+        -:   73:   times they occurred in the input. */
+        -:   74:static enum countmode countmode;
+        -:   75:
+        -:   76:/* Which lines to output: unique lines, the first of a group of
+        -:   77:   repeated lines, and the second and subsequented of a group of
+        -:   78:   repeated lines.  */
+        -:   79:static bool output_unique;
+        -:   80:static bool output_first_repeated;
+        -:   81:static bool output_later_repeated;
+        -:   82:
+        -:   83:/* If true, ignore case when comparing.  */
+        -:   84:static bool ignore_case;
+        -:   85:
+        -:   86:enum delimit_method
+        -:   87:{
+        -:   88:  /* No delimiters output.  --all-repeated[=none] */
+        -:   89:  DM_NONE,
+        -:   90:
+        -:   91:  /* Delimiter precedes all groups.  --all-repeated=prepend */
+        -:   92:  DM_PREPEND,
+        -:   93:
+        -:   94:  /* Delimit all groups.  --all-repeated=separate */
+        -:   95:  DM_SEPARATE
+        -:   96:};
+        -:   97:
+        -:   98:static char const *const delimit_method_string[] =
+        -:   99:{
+        -:  100:  "none", "prepend", "separate", NULL
+        -:  101:};
+        -:  102:
+        -:  103:static enum delimit_method const delimit_method_map[] =
+        -:  104:{
+        -:  105:  DM_NONE, DM_PREPEND, DM_SEPARATE
+        -:  106:};
+        -:  107:
+        -:  108:/* Select whether/how to delimit groups of duplicate lines.  */
+        -:  109:static enum delimit_method delimit_groups;
+        -:  110:
+        -:  111:static struct option const longopts[] =
+        -:  112:{
+        -:  113:  {"count", no_argument, NULL, 'c'},
+        -:  114:  {"repeated", no_argument, NULL, 'd'},
+        -:  115:  {"all-repeated", optional_argument, NULL, 'D'},
+        -:  116:  {"ignore-case", no_argument, NULL, 'i'},
+        -:  117:  {"unique", no_argument, NULL, 'u'},
+        -:  118:  {"skip-fields", required_argument, NULL, 'f'},
+        -:  119:  {"skip-chars", required_argument, NULL, 's'},
+        -:  120:  {"check-chars", required_argument, NULL, 'w'},
+        -:  121:  {"zero-terminated", no_argument, NULL, 'z'},
+        -:  122:  {GETOPT_HELP_OPTION_DECL},
+        -:  123:  {GETOPT_VERSION_OPTION_DECL},
+        -:  124:  {NULL, 0, NULL, 0}
+        -:  125:};
+        -:  126:
+        -:  127:void
+    #####:  128:usage (int status)
+        -:  129:{
+    #####:  130:  if (status != EXIT_SUCCESS)
+    #####:  131:    fprintf (stderr, _("Try `%s --help' for more information.\n"),
+        -:  132:	     program_name);
+        -:  133:  else
+        -:  134:    {
+    #####:  135:      printf (_("\
+        -:  136:Usage: %s [OPTION]... [INPUT [OUTPUT]]\n\
+        -:  137:"),
+        -:  138:	      program_name);
+    #####:  139:      fputs (_("\
+        -:  140:Discard all but one of successive identical lines from INPUT (or\n\
+        -:  141:standard input), writing to OUTPUT (or standard output).\n\
+        -:  142:\n\
+        -:  143:"), stdout);
+    #####:  144:     fputs (_("\
+        -:  145:Mandatory arguments to long options are mandatory for short options too.\n\
+        -:  146:"), stdout);
+    #####:  147:     fputs (_("\
+        -:  148:  -c, --count           prefix lines by the number of occurrences\n\
+        -:  149:  -d, --repeated        only print duplicate lines\n\
+        -:  150:"), stdout);
+    #####:  151:     fputs (_("\
+        -:  152:  -D, --all-repeated[=delimit-method]  print all duplicate lines\n\
+        -:  153:                        delimit-method={none(default),prepend,separate}\n\
+        -:  154:                        Delimiting is done with blank lines.\n\
+        -:  155:  -f, --skip-fields=N   avoid comparing the first N fields\n\
+        -:  156:  -i, --ignore-case     ignore differences in case when comparing\n\
+        -:  157:  -s, --skip-chars=N    avoid comparing the first N characters\n\
+        -:  158:  -u, --unique          only print unique lines\n\
+        -:  159:  -z, --zero-terminated  end lines with 0 byte, not newline\n\
+        -:  160:"), stdout);
+    #####:  161:     fputs (_("\
+        -:  162:  -w, --check-chars=N   compare no more than N characters in lines\n\
+        -:  163:"), stdout);
+    #####:  164:     fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  165:     fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  166:     fputs (_("\
+        -:  167:\n\
+        -:  168:A field is a run of whitespace, then non-whitespace characters.\n\
+        -:  169:Fields are skipped before chars.\n\
+        -:  170:"), stdout);
+    #####:  171:     fputs (_("\
+        -:  172:\n\
+        -:  173:Note: 'uniq' does not detect repeated lines unless they are adjacent.\n\
+        -:  174:You may want to sort the input first, or use `sort -u' without `uniq'.\n\
+        -:  175:"), stdout);
+    #####:  176:      emit_bug_reporting_address ();
+        -:  177:    }
+    #####:  178:  exit (status);
+        -:  179:}
+        -:  180:
+        -:  181:/* Convert OPT to size_t, reporting an error using MSGID if OPT is
+        -:  182:   invalid.  Silently convert too-large values to SIZE_MAX.  */
+        -:  183:
+        -:  184:static size_t
+    #####:  185:size_opt (char const *opt, char const *msgid)
+        -:  186:{
+        -:  187:  unsigned long int size;
+        -:  188:  verify (SIZE_MAX <= ULONG_MAX);
+        -:  189:
+    #####:  190:  switch (xstrtoul (opt, NULL, 10, &size, ""))
+        -:  191:    {
+        -:  192:    case LONGINT_OK:
+        -:  193:    case LONGINT_OVERFLOW:
+    #####:  194:      break;
+        -:  195:
+        -:  196:    default:
+    #####:  197:      error (EXIT_FAILURE, 0, "%s: %s", opt, _(msgid));
+        -:  198:    }
+        -:  199:
+    #####:  200:  return MIN (size, SIZE_MAX);
+        -:  201:}
+        -:  202:
+        -:  203:/* Given a linebuffer LINE,
+        -:  204:   return a pointer to the beginning of the line's field to be compared. */
+        -:  205:
+        -:  206:static char *
+      101:  207:find_field (const struct linebuffer *line)
+        -:  208:{
+        -:  209:  size_t count;
+      101:  210:  char *lp = line->buffer;
+      101:  211:  size_t size = line->length - 1;
+      101:  212:  size_t i = 0;
+        -:  213:
+      101:  214:  for (count = 0; count < skip_fields && i < size; count++)
+        -:  215:    {
+    #####:  216:      while (i < size && isblank (lp[i]))
+    #####:  217:	i++;
+    #####:  218:      while (i < size && !isblank (lp[i]))
+    #####:  219:	i++;
+        -:  220:    }
+        -:  221:
+      101:  222:  for (count = 0; count < skip_chars && i < size; count++)
+    #####:  223:    i++;
+        -:  224:
+      101:  225:  return lp + i;
+        -:  226:}
+        -:  227:
+        -:  228:/* Return false if two strings OLD and NEW match, true if not.
+        -:  229:   OLD and NEW point not to the beginnings of the lines
+        -:  230:   but rather to the beginnings of the fields to compare.
+        -:  231:   OLDLEN and NEWLEN are their lengths. */
+        -:  232:
+        -:  233:static bool
+      100:  234:different (char *old, char *new, size_t oldlen, size_t newlen)
+        -:  235:{
+      100:  236:  if (check_chars < oldlen)
+    #####:  237:    oldlen = check_chars;
+      100:  238:  if (check_chars < newlen)
+    #####:  239:    newlen = check_chars;
+        -:  240:
+      100:  241:  if (ignore_case)
+        -:  242:    {
+        -:  243:      /* FIXME: This should invoke strcoll somehow.  */
+    #####:  244:      return oldlen != newlen || memcasecmp (old, new, oldlen);
+        -:  245:    }
+      100:  246:  else if (hard_LC_COLLATE)
+    #####:  247:    return xmemcoll (old, oldlen, new, newlen) != 0;
+        -:  248:  else
+      100:  249:    return oldlen != newlen || memcmp (old, new, oldlen);
+        -:  250:}
+        -:  251:
+        -:  252:/* Output the line in linebuffer LINE to standard output
+        -:  253:   provided that the switches say it should be output.
+        -:  254:   MATCH is true if the line matches the previous line.
+        -:  255:   If requested, print the number of times it occurred, as well;
+        -:  256:   LINECOUNT + 1 is the number of times that the line occurred. */
+        -:  257:
+        -:  258:static void
+      101:  259:writeline (struct linebuffer const *line,
+        -:  260:	   bool match, uintmax_t linecount)
+        -:  261:{
+      101:  262:  if (! (linecount == 0 ? output_unique
+    #####:  263:	 : !match ? output_first_repeated
+        -:  264:	 : output_later_repeated))
+      202:  265:    return;
+        -:  266:
+    #####:  267:  if (countmode == count_occurrences)
+    #####:  268:    printf ("%7" PRIuMAX " ", linecount + 1);
+        -:  269:
+    #####:  270:  fwrite (line->buffer, sizeof (char), line->length, stdout);
+        -:  271:}
+        -:  272:
+        -:  273:/* Process input file INFILE with output to OUTFILE.
+        -:  274:   If either is "-", use the standard I/O stream for it instead. */
+        -:  275:
+        -:  276:static void
+        1:  277:check_file (const char *infile, const char *outfile, char delimiter)
+        -:  278:{
+        -:  279:  struct linebuffer lb1, lb2;
+        -:  280:  struct linebuffer *thisline, *prevline;
+        -:  281:
+        1:  282:  if (! (STREQ (infile, "-") || freopen (infile, "r", stdin)))
+    #####:  283:    error (EXIT_FAILURE, errno, "%s", infile);
+        1:  284:  if (! (STREQ (outfile, "-") || freopen (outfile, "w", stdout)))
+    #####:  285:    error (EXIT_FAILURE, errno, "%s", outfile);
+        -:  286:
+        1:  287:  thisline = &lb1;
+        1:  288:  prevline = &lb2;
+        -:  289:
+        1:  290:  initbuffer (thisline);
+        1:  291:  initbuffer (prevline);
+        -:  292:
+        -:  293:  /* The duplication in the following `if' and `else' blocks is an
+        -:  294:     optimization to distinguish the common case (in which none of
+        -:  295:     the following options has been specified: --count, -repeated,
+        -:  296:     --all-repeated, --unique) from the others.  In the common case,
+        -:  297:     this optimization lets uniq output each different line right away,
+        -:  298:     without waiting to see if the next one is different.  */
+        -:  299:
+        1:  300:  if (output_unique && output_first_repeated && countmode == count_none)
+    #####:  301:    {
+        -:  302:      char *prevfield IF_LINT (= NULL);
+        -:  303:      size_t prevlen IF_LINT (= 0);
+        -:  304:
+    #####:  305:      while (!feof (stdin))
+        -:  306:	{
+        -:  307:	  char *thisfield;
+        -:  308:	  size_t thislen;
+    #####:  309:	  if (readlinebuffer_delim (thisline, stdin, delimiter) == 0)
+    #####:  310:	    break;
+    #####:  311:	  thisfield = find_field (thisline);
+    #####:  312:	  thislen = thisline->length - 1 - (thisfield - thisline->buffer);
+    #####:  313:	  if (prevline->length == 0
+    #####:  314:	      || different (thisfield, prevfield, thislen, prevlen))
+        -:  315:	    {
+    #####:  316:	      fwrite (thisline->buffer, sizeof (char),
+        -:  317:		      thisline->length, stdout);
+        -:  318:
+    #####:  319:	      SWAP_LINES (prevline, thisline);
+    #####:  320:	      prevfield = thisfield;
+    #####:  321:	      prevlen = thislen;
+        -:  322:	    }
+        -:  323:	}
+        -:  324:    }
+        -:  325:  else
+        -:  326:    {
+        -:  327:      char *prevfield;
+        -:  328:      size_t prevlen;
+        1:  329:      uintmax_t match_count = 0;
+        1:  330:      bool first_delimiter = true;
+        -:  331:
+        1:  332:      if (readlinebuffer_delim (prevline, stdin, delimiter) == 0)
+    #####:  333:	goto closefiles;
+        1:  334:      prevfield = find_field (prevline);
+        1:  335:      prevlen = prevline->length - 1 - (prevfield - prevline->buffer);
+        -:  336:
+      102:  337:      while (!feof (stdin))
+        -:  338:	{
+        -:  339:	  bool match;
+        -:  340:	  char *thisfield;
+        -:  341:	  size_t thislen;
+      101:  342:	  if (readlinebuffer_delim (thisline, stdin, delimiter) == 0)
+        -:  343:	    {
+        1:  344:	      if (ferror (stdin))
+    #####:  345:		goto closefiles;
+        1:  346:	      break;
+        -:  347:	    }
+      100:  348:	  thisfield = find_field (thisline);
+      100:  349:	  thislen = thisline->length - 1 - (thisfield - thisline->buffer);
+      100:  350:	  match = !different (thisfield, prevfield, thislen, prevlen);
+      100:  351:	  match_count += match;
+        -:  352:
+      100:  353:	  if (match_count == UINTMAX_MAX)
+        -:  354:	    {
+        -:  355:	      if (count_occurrences)
+        -:  356:		error (EXIT_FAILURE, 0, _("too many repeated lines"));
+    #####:  357:	      match_count--;
+        -:  358:	    }
+        -:  359:
+      100:  360:          if (delimit_groups != DM_NONE)
+        -:  361:	    {
+    #####:  362:	      if (!match)
+        -:  363:		{
+    #####:  364:		  if (match_count) /* a previous match */
+    #####:  365:		    first_delimiter = false; /* Only used when DM_SEPARATE */
+        -:  366:		}
+    #####:  367:	      else if (match_count == 1)
+        -:  368:		{
+    #####:  369:		  if ((delimit_groups == DM_PREPEND)
+    #####:  370:		      || (delimit_groups == DM_SEPARATE
+    #####:  371:			  && !first_delimiter))
+    #####:  372:		    putchar (delimiter);
+        -:  373:		}
+        -:  374:	    }
+        -:  375:
+      100:  376:	  if (!match || output_later_repeated)
+        -:  377:	    {
+      100:  378:	      writeline (prevline, match, match_count);
+      100:  379:	      SWAP_LINES (prevline, thisline);
+      100:  380:	      prevfield = thisfield;
+      100:  381:	      prevlen = thislen;
+      100:  382:	      if (!match)
+      100:  383:		match_count = 0;
+        -:  384:	    }
+        -:  385:	}
+        -:  386:
+        1:  387:      writeline (prevline, false, match_count);
+        -:  388:    }
+        -:  389:
+        -:  390: closefiles:
+        1:  391:  if (ferror (stdin) || fclose (stdin) != 0)
+    #####:  392:    error (EXIT_FAILURE, 0, _("error reading %s"), infile);
+        -:  393:
+        -:  394:  /* stdout is handled via the atexit-invoked close_stdout function.  */
+        -:  395:
+        1:  396:  free (lb1.buffer);
+        1:  397:  free (lb2.buffer);
+        1:  398:}
+        -:  399:
+        -:  400:enum Skip_field_option_type
+        -:  401:  {
+        -:  402:    SFO_NONE,
+        -:  403:    SFO_OBSOLETE,
+        -:  404:    SFO_NEW
+        -:  405:  };
+        -:  406:
+        -:  407:int
+        1:  408:main (int argc, char **argv)
+        -:  409:{
+        1:  410:  int optc = 0;
+        1:  411:  bool posixly_correct = (getenv ("POSIXLY_CORRECT") != NULL);
+        1:  412:  enum Skip_field_option_type skip_field_option_type = SFO_NONE;
+        1:  413:  int nfiles = 0;
+        -:  414:  char const *file[2];
+        1:  415:  char delimiter = '\n';	/* change with --zero-terminated, -z */
+        -:  416:
+        1:  417:  file[0] = file[1] = "-";
+        -:  418:  initialize_main (&argc, &argv);
+        1:  419:  program_name = argv[0];
+        1:  420:  setlocale (LC_ALL, "");
+        -:  421:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  422:  textdomain (PACKAGE);
+        1:  423:  hard_LC_COLLATE = hard_locale (LC_COLLATE);
+        -:  424:
+        1:  425:  atexit (close_stdout);
+        -:  426:
+        1:  427:  skip_chars = 0;
+        1:  428:  skip_fields = 0;
+        1:  429:  check_chars = SIZE_MAX;
+        1:  430:  output_unique = output_first_repeated = true;
+        1:  431:  output_later_repeated = false;
+        1:  432:  countmode = count_none;
+        1:  433:  delimit_groups = DM_NONE;
+        -:  434:
+        -:  435:  for (;;)
+        -:  436:    {
+        -:  437:      /* Parse an operand with leading "+" as a file after "--" was
+        -:  438:         seen; or if pedantic and a file was seen; or if not
+        -:  439:         obsolete.  */
+        -:  440:
+        2:  441:      if (optc == -1
+        2:  442:	  || (posixly_correct && nfiles != 0)
+        2:  443:	  || ((optc = getopt_long (argc, argv,
+        -:  444:				   "-0123456789Dcdf:is:uw:z", longopts, NULL))
+        -:  445:	      == -1))
+        -:  446:	{
+        1:  447:	  if (argc <= optind)
+        1:  448:	    break;
+    #####:  449:	  if (nfiles == 2)
+        -:  450:	    {
+    #####:  451:	      error (0, 0, _("extra operand %s"), quote (argv[optind]));
+    #####:  452:	      usage (EXIT_FAILURE);
+        -:  453:	    }
+    #####:  454:	  file[nfiles++] = argv[optind++];
+        -:  455:	}
+        1:  456:      else switch (optc)
+        -:  457:	{
+        -:  458:	case 1:
+        -:  459:	  {
+        -:  460:	    unsigned long int size;
+    #####:  461:	    if (optarg[0] == '+'
+    #####:  462:		&& posix2_version () < 200112
+    #####:  463:		&& xstrtoul (optarg, NULL, 10, &size, "") == LONGINT_OK
+        -:  464:		&& size <= SIZE_MAX)
+    #####:  465:	      skip_chars = size;
+    #####:  466:	    else if (nfiles == 2)
+        -:  467:	      {
+    #####:  468:		error (0, 0, _("extra operand %s"), quote (optarg));
+    #####:  469:		usage (EXIT_FAILURE);
+        -:  470:	      }
+        -:  471:	    else
+    #####:  472:	      file[nfiles++] = optarg;
+        -:  473:	  }
+    #####:  474:	  break;
+        -:  475:
+        -:  476:	case '0':
+        -:  477:	case '1':
+        -:  478:	case '2':
+        -:  479:	case '3':
+        -:  480:	case '4':
+        -:  481:	case '5':
+        -:  482:	case '6':
+        -:  483:	case '7':
+        -:  484:	case '8':
+        -:  485:	case '9':
+        -:  486:	  {
+    #####:  487:	    if (skip_field_option_type == SFO_NEW)
+    #####:  488:	      skip_fields = 0;
+        -:  489:
+    #####:  490:	    if (!DECIMAL_DIGIT_ACCUMULATE (skip_fields, optc - '0', size_t))
+    #####:  491:	      skip_fields = SIZE_MAX;
+        -:  492:
+    #####:  493:	    skip_field_option_type = SFO_OBSOLETE;
+        -:  494:	  }
+    #####:  495:	  break;
+        -:  496:
+        -:  497:	case 'c':
+    #####:  498:	  countmode = count_occurrences;
+    #####:  499:	  break;
+        -:  500:
+        -:  501:	case 'd':
+        1:  502:	  output_unique = false;
+        1:  503:	  break;
+        -:  504:
+        -:  505:	case 'D':
+    #####:  506:	  output_unique = false;
+    #####:  507:	  output_later_repeated = true;
+    #####:  508:	  if (optarg == NULL)
+    #####:  509:	    delimit_groups = DM_NONE;
+        -:  510:	  else
+    #####:  511:	    delimit_groups = XARGMATCH ("--all-repeated", optarg,
+        -:  512:					delimit_method_string,
+        -:  513:					delimit_method_map);
+    #####:  514:	  break;
+        -:  515:
+        -:  516:	case 'f':
+    #####:  517:	  skip_field_option_type = SFO_NEW;
+    #####:  518:	  skip_fields = size_opt (optarg,
+        -:  519:				  N_("invalid number of fields to skip"));
+    #####:  520:	  break;
+        -:  521:
+        -:  522:	case 'i':
+    #####:  523:	  ignore_case = true;
+    #####:  524:	  break;
+        -:  525:
+        -:  526:	case 's':
+    #####:  527:	  skip_chars = size_opt (optarg,
+        -:  528:				 N_("invalid number of bytes to skip"));
+    #####:  529:	  break;
+        -:  530:
+        -:  531:	case 'u':
+    #####:  532:	  output_first_repeated = false;
+    #####:  533:	  break;
+        -:  534:
+        -:  535:	case 'w':
+    #####:  536:	  check_chars = size_opt (optarg,
+        -:  537:				  N_("invalid number of bytes to compare"));
+    #####:  538:	  break;
+        -:  539:
+        -:  540:	case 'z':
+    #####:  541:	  delimiter = '\0';
+    #####:  542:	  break;
+        -:  543:
+    #####:  544:	case_GETOPT_HELP_CHAR;
+        -:  545:
+    #####:  546:	case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  547:
+        -:  548:	default:
+    #####:  549:	  usage (EXIT_FAILURE);
+        -:  550:	}
+        1:  551:    }
+        -:  552:
+        1:  553:  if (countmode == count_occurrences && output_later_repeated)
+        -:  554:    {
+    #####:  555:      error (0, 0,
+        -:  556:	   _("printing all duplicated lines and repeat counts is meaningless"));
+    #####:  557:      usage (EXIT_FAILURE);
+        -:  558:    }
+        -:  559:
+        1:  560:  check_file (file[0], file[1], delimiter);
+        -:  561:
+        1:  562:  exit (EXIT_SUCCESS);
+        -:  563:}

@@ -1,0 +1,366 @@
+        -:    0:Source:src/mktemp.c
+        -:    0:Graph:src/mktemp.gcno
+        -:    0:Data:src/mktemp.gcda
+        -:    0:Runs:1
+        -:    0:Programs:1
+        -:    1:/* Create a temporary file or directory, safely.
+        -:    2:   Copyright (C) 2007-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by Jim Meyering and Eric Blake.  */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <sys/types.h>
+        -:   21:#include <getopt.h>
+        -:   22:
+        -:   23:#include "system.h"
+        -:   24:
+        -:   25:#include "close-stream.h"
+        -:   26:#include "error.h"
+        -:   27:#include "filenamecat.h"
+        -:   28:#include "quote.h"
+        -:   29:#include "stdio--.h"
+        -:   30:#include "tempname.h"
+        -:   31:
+        -:   32:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   33:#define PROGRAM_NAME "mktemp"
+        -:   34:
+        -:   35:#define AUTHORS \
+        -:   36:  proper_name ("Jim Meyering"), \
+        -:   37:  proper_name ("Eric Blake")
+        -:   38:
+        -:   39:static const char *default_template = "tmp.XXXXXXXXXX";
+        -:   40:
+        -:   41:/* For long options that have no equivalent short option, use a
+        -:   42:   non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
+        -:   43:enum
+        -:   44:{
+        -:   45:  SUFFIX_OPTION = CHAR_MAX + 1,
+        -:   46:  TMPDIR_OPTION
+        -:   47:};
+        -:   48:
+        -:   49:static struct option const longopts[] =
+        -:   50:{
+        -:   51:  {"directory", no_argument, NULL, 'd'},
+        -:   52:  {"quiet", no_argument, NULL, 'q'},
+        -:   53:  {"dry-run", no_argument, NULL, 'u'},
+        -:   54:  {"suffix", required_argument, NULL, SUFFIX_OPTION},
+        -:   55:  {"tmpdir", optional_argument, NULL, TMPDIR_OPTION},
+        -:   56:  {GETOPT_HELP_OPTION_DECL},
+        -:   57:  {GETOPT_VERSION_OPTION_DECL},
+        -:   58:  {NULL, 0, NULL, 0}
+        -:   59:};
+        -:   60:
+        -:   61:void
+    #####:   62:usage (int status)
+        -:   63:{
+    #####:   64:  if (status != EXIT_SUCCESS)
+    #####:   65:    emit_try_help ();
+        -:   66:  else
+        -:   67:    {
+    #####:   68:      printf (_("Usage: %s [OPTION]... [TEMPLATE]\n"), program_name);
+    #####:   69:      fputs (_("\
+        -:   70:Create a temporary file or directory, safely, and print its name.\n\
+        -:   71:TEMPLATE must contain at least 3 consecutive 'X's in last component.\n\
+        -:   72:If TEMPLATE is not specified, use tmp.XXXXXXXXXX, and --tmpdir is implied.\n\
+        -:   73:"), stdout);
+    #####:   74:      fputs (_("\
+        -:   75:Files are created u+rw, and directories u+rwx, minus umask restrictions.\n\
+        -:   76:"), stdout);
+    #####:   77:      fputs ("\n", stdout);
+    #####:   78:      fputs (_("\
+        -:   79:  -d, --directory     create a directory, not a file\n\
+        -:   80:  -u, --dry-run       do not create anything; merely print a name (unsafe)\n\
+        -:   81:  -q, --quiet         suppress diagnostics about file/dir-creation failure\n\
+        -:   82:"), stdout);
+    #####:   83:      fputs (_("\
+        -:   84:      --suffix=SUFF   append SUFF to TEMPLATE.  SUFF must not contain slash.\n\
+        -:   85:                        This option is implied if TEMPLATE does not end in X.\n\
+        -:   86:"), stdout);
+    #####:   87:      fputs (_("\
+        -:   88:      --tmpdir[=DIR]  interpret TEMPLATE relative to DIR.  If DIR is not\n\
+        -:   89:                        specified, use $TMPDIR if set, else /tmp.  With\n\
+        -:   90:                        this option, TEMPLATE must not be an absolute name.\n\
+        -:   91:                        Unlike with -t, TEMPLATE may contain slashes, but\n\
+        -:   92:                        mktemp creates only the final component\n\
+        -:   93:"), stdout);
+    #####:   94:      fputs ("\n", stdout);
+    #####:   95:      fputs (_("\
+        -:   96:  -p DIR              use DIR as a prefix; implies -t [deprecated]\n\
+        -:   97:  -t                  interpret TEMPLATE as a single file name component,\n\
+        -:   98:                        relative to a directory: $TMPDIR, if set; else the\n\
+        -:   99:                        directory specified via -p; else /tmp [deprecated]\n\
+        -:  100:"), stdout);
+    #####:  101:      fputs ("\n", stdout);
+    #####:  102:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  103:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  104:      emit_ancillary_info ();
+        -:  105:    }
+        -:  106:
+    #####:  107:  exit (status);
+        -:  108:}
+        -:  109:
+        -:  110:static size_t
+        1:  111:count_consecutive_X_s (const char *s, size_t len)
+        -:  112:{
+        1:  113:  size_t n = 0;
+        5:  114:  for ( ; len && s[len-1] == 'X'; len--)
+        4:  115:    ++n;
+        1:  116:  return n;
+        -:  117:}
+        -:  118:
+        -:  119:static int
+    #####:  120:mkstemp_len (char *tmpl, size_t suff_len, size_t x_len, bool dry_run)
+        -:  121:{
+    #####:  122:  return gen_tempname_len (tmpl, suff_len, 0, dry_run ? GT_NOCREATE : GT_FILE,
+        -:  123:                           x_len);
+        -:  124:}
+        -:  125:
+        -:  126:static int
+        1:  127:mkdtemp_len (char *tmpl, size_t suff_len, size_t x_len, bool dry_run)
+        -:  128:{
+        1:  129:  return gen_tempname_len (tmpl, suff_len, 0, dry_run ? GT_NOCREATE : GT_DIR,
+        -:  130:                           x_len);
+        -:  131:}
+        -:  132:
+        -:  133:/* True if we have already closed standard output.  */
+        -:  134:static bool stdout_closed;
+        -:  135:
+        -:  136:/* Avoid closing stdout twice.  Since we conditionally call
+        -:  137:   close_stream (stdout) in order to decide whether to clean up a
+        -:  138:   temporary file, the exit hook needs to know whether to do all of
+        -:  139:   close_stdout or just the stderr half.  */
+        -:  140:static void
+        1:  141:maybe_close_stdout (void)
+        -:  142:{
+        1:  143:  if (!stdout_closed)
+    #####:  144:    close_stdout ();
+        1:  145:  else if (close_stream (stderr) != 0)
+    #####:  146:    _exit (EXIT_FAILURE);
+        1:  147:}
+        -:  148:
+        -:  149:int
+        1:  150:main (int argc, char **argv)
+        -:  151:{
+        -:  152:  char const *dest_dir;
+        1:  153:  char const *dest_dir_arg = NULL;
+        1:  154:  bool suppress_stderr = false;
+        -:  155:  int c;
+        -:  156:  unsigned int n_args;
+        -:  157:  char *template;
+        1:  158:  char *suffix = NULL;
+        1:  159:  bool use_dest_dir = false;
+        1:  160:  bool deprecated_t_option = false;
+        1:  161:  bool create_directory = false;
+        1:  162:  bool dry_run = false;
+        1:  163:  int status = EXIT_SUCCESS;
+        -:  164:  size_t x_count;
+        -:  165:  size_t suffix_len;
+        -:  166:  char *dest_name;
+        -:  167:
+        -:  168:  initialize_main (&argc, &argv);
+        1:  169:  set_program_name (argv[0]);
+        1:  170:  setlocale (LC_ALL, "");
+        -:  171:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  172:  textdomain (PACKAGE);
+        -:  173:
+        1:  174:  atexit (maybe_close_stdout);
+        -:  175:
+        1:  176:  while ((c = getopt_long (argc, argv, "dp:qtuV", longopts, NULL)) != -1)
+        -:  177:    {
+        3:  178:      switch (c)
+        -:  179:        {
+        -:  180:        case 'd':
+        1:  181:          create_directory = true;
+        1:  182:          break;
+        -:  183:        case 'p':
+        1:  184:          dest_dir_arg = optarg;
+        1:  185:          use_dest_dir = true;
+        1:  186:          break;
+        -:  187:        case 'q':
+    #####:  188:          suppress_stderr = true;
+    #####:  189:          break;
+        -:  190:        case 't':
+        1:  191:          use_dest_dir = true;
+        1:  192:          deprecated_t_option = true;
+        1:  193:          break;
+        -:  194:        case 'u':
+    #####:  195:          dry_run = true;
+    #####:  196:          break;
+        -:  197:
+        -:  198:        case TMPDIR_OPTION:
+    #####:  199:          use_dest_dir = true;
+    #####:  200:          dest_dir_arg = optarg;
+    #####:  201:          break;
+        -:  202:
+        -:  203:        case SUFFIX_OPTION:
+    #####:  204:          suffix = optarg;
+    #####:  205:          break;
+        -:  206:
+    #####:  207:        case_GETOPT_HELP_CHAR;
+        -:  208:
+        -:  209:        case 'V': /* Undocumented alias, for compatibility with the original
+        -:  210:                     mktemp program.  */
+    #####:  211:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  212:        default:
+    #####:  213:          usage (EXIT_FAILURE);
+        -:  214:        }
+        -:  215:    }
+        -:  216:
+        1:  217:  if (suppress_stderr)
+        -:  218:    {
+        -:  219:      /* From here on, redirect stderr to /dev/null.
+        -:  220:         A diagnostic from getopt_long, above, would still go to stderr.  */
+    #####:  221:      if (!freopen ("/dev/null", "wb", stderr))
+    #####:  222:        error (EXIT_FAILURE, errno,
+        -:  223:               _("failed to redirect stderr to /dev/null"));
+        -:  224:    }
+        -:  225:
+        1:  226:  n_args = argc - optind;
+        1:  227:  if (2 <= n_args)
+        -:  228:    {
+    #####:  229:      error (0, 0, _("too many templates"));
+    #####:  230:      usage (EXIT_FAILURE);
+        -:  231:    }
+        -:  232:
+        1:  233:  if (n_args == 0)
+        -:  234:    {
+    #####:  235:      use_dest_dir = true;
+    #####:  236:      template = (char *) default_template;
+        -:  237:    }
+        -:  238:  else
+        -:  239:    {
+        1:  240:      template = argv[optind];
+        -:  241:    }
+        -:  242:
+        1:  243:  if (suffix)
+        -:  244:    {
+    #####:  245:      size_t len = strlen (template);
+    #####:  246:      if (!len || template[len - 1] != 'X')
+        -:  247:        {
+    #####:  248:          error (EXIT_FAILURE, 0,
+        -:  249:                 _("with --suffix, template %s must end in X"),
+        -:  250:                 quote (template));
+        -:  251:        }
+    #####:  252:      suffix_len = strlen (suffix);
+    #####:  253:      dest_name = xcharalloc (len + suffix_len + 1);
+    #####:  254:      memcpy (dest_name, template, len);
+    #####:  255:      memcpy (dest_name + len, suffix, suffix_len + 1);
+    #####:  256:      template = dest_name;
+    #####:  257:      suffix = dest_name + len;
+        -:  258:    }
+        -:  259:  else
+        -:  260:    {
+        1:  261:      template = xstrdup (template);
+        1:  262:      suffix = strrchr (template, 'X');
+        1:  263:      if (!suffix)
+    #####:  264:        suffix = strchr (template, '\0');
+        -:  265:      else
+        1:  266:        suffix++;
+        1:  267:      suffix_len = strlen (suffix);
+        -:  268:    }
+        -:  269:
+        -:  270:  /* At this point, template is malloc'd, and suffix points into template.  */
+        1:  271:  if (suffix_len && last_component (suffix) != suffix)
+        -:  272:    {
+    #####:  273:      error (EXIT_FAILURE, 0,
+        -:  274:             _("invalid suffix %s, contains directory separator"),
+        -:  275:             quote (suffix));
+        -:  276:    }
+        1:  277:  x_count = count_consecutive_X_s (template, suffix - template);
+        1:  278:  if (x_count < 3)
+    #####:  279:    error (EXIT_FAILURE, 0, _("too few X's in template %s"), quote (template));
+        -:  280:
+        1:  281:  if (use_dest_dir)
+        -:  282:    {
+        1:  283:      if (deprecated_t_option)
+        -:  284:        {
+        1:  285:          char *env = getenv ("TMPDIR");
+        1:  286:          dest_dir = (env && *env
+        -:  287:                      ? env
+        2:  288:                      : (dest_dir_arg ? dest_dir_arg : "/tmp"));
+        -:  289:
+        1:  290:          if (last_component (template) != template)
+    #####:  291:            error (EXIT_FAILURE, 0,
+        -:  292:                   _("invalid template, %s, contains directory separator"),
+        -:  293:                   quote (template));
+        -:  294:        }
+        -:  295:      else
+        -:  296:        {
+    #####:  297:          if (dest_dir_arg && *dest_dir_arg)
+    #####:  298:            dest_dir = dest_dir_arg;
+        -:  299:          else
+        -:  300:            {
+    #####:  301:              char *env = getenv ("TMPDIR");
+    #####:  302:              dest_dir = (env && *env ? env : "/tmp");
+        -:  303:            }
+    #####:  304:          if (IS_ABSOLUTE_FILE_NAME (template))
+    #####:  305:            error (EXIT_FAILURE, 0,
+        -:  306:                   _("invalid template, %s; with --tmpdir,"
+        -:  307:                     " it may not be absolute"),
+        -:  308:                   quote (template));
+        -:  309:        }
+        -:  310:
+        1:  311:      dest_name = file_name_concat (dest_dir, template, NULL);
+        1:  312:      free (template);
+        1:  313:      template = dest_name;
+        -:  314:      /* Note that suffix is now invalid.  */
+        -:  315:    }
+        -:  316:
+        -:  317:  /* Make a copy to be used in case of diagnostic, since failing
+        -:  318:     mkstemp may leave the buffer in an undefined state.  */
+        1:  319:  dest_name = xstrdup (template);
+        -:  320:
+        1:  321:  if (create_directory)
+        -:  322:    {
+        1:  323:      int err = mkdtemp_len (dest_name, suffix_len, x_count, dry_run);
+        1:  324:      if (err != 0)
+        -:  325:        {
+    #####:  326:          error (0, errno, _("failed to create directory via template %s"),
+        -:  327:                 quote (template));
+    #####:  328:          status = EXIT_FAILURE;
+        -:  329:        }
+        -:  330:    }
+        -:  331:  else
+        -:  332:    {
+    #####:  333:      int fd = mkstemp_len (dest_name, suffix_len, x_count, dry_run);
+    #####:  334:      if (fd < 0 || (!dry_run && close (fd) != 0))
+        -:  335:        {
+    #####:  336:          error (0, errno, _("failed to create file via template %s"),
+        -:  337:                 quote (template));
+    #####:  338:          status = EXIT_FAILURE;
+        -:  339:        }
+        -:  340:    }
+        -:  341:
+        1:  342:  if (status == EXIT_SUCCESS)
+        -:  343:    {
+        1:  344:      puts (dest_name);
+        -:  345:      /* If we created a file, but then failed to output the file
+        -:  346:         name, we should clean up the mess before failing.  */
+        1:  347:      if (!dry_run && ((stdout_closed = true), close_stream (stdout) != 0))
+        -:  348:        {
+    #####:  349:          int saved_errno = errno;
+    #####:  350:          remove (dest_name);
+    #####:  351:          error (EXIT_FAILURE, saved_errno, _("write error"));
+        -:  352:        }
+        -:  353:    }
+        -:  354:
+        -:  355:#ifdef lint
+        1:  356:  free (dest_name);
+        1:  357:  free (template);
+        -:  358:#endif
+        -:  359:
+        1:  360:  exit (status);
+        -:  361:}

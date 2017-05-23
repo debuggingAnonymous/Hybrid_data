@@ -1,0 +1,323 @@
+        -:    0:Source:fstype.c
+        -:    0:Graph:fstype.gcno
+        -:    0:Data:fstype.gcda
+        -:    0:Runs:10
+        -:    0:Programs:2
+        -:    1:/* fstype.c -- determine type of filesystems that files are on
+        -:    2:   Copyright (C) 1990, 91, 92, 93, 94, 2000, 2004 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software; you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation; either version 2, or (at your option)
+        -:    7:   any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program; if not, write to the Free Software
+        -:   16:   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
+        -:   17:   USA.
+        -:   18:*/
+        -:   19:
+        -:   20:/* Written by David MacKenzie <djm@gnu.org>.
+        -:   21: *
+        -:   22: * Converted to use gnulib's read_file_system_list()
+        -:   23: * by James Youngman <jay@gnu.org> (which saves a lot 
+        -:   24: * of manual hacking of configure.in).
+        -:   25: */
+        -:   26:
+        -:   27:
+        -:   28:#include <config.h>
+        -:   29:#include <errno.h>
+        -:   30:#include <assert.h>
+        -:   31:#include <stdbool.h>
+        -:   32:
+        -:   33:#ifdef HAVE_SYS_TYPES_H
+        -:   34:#include <sys/types.h>
+        -:   35:#endif
+        -:   36:
+        -:   37:/* The presence of unistd.h is assumed by gnulib these days, so we 
+        -:   38: * might as well assume it too. 
+        -:   39: */
+        -:   40:#include <unistd.h>
+        -:   41:
+        -:   42:#ifdef HAVE_SYS_MNTIO_H
+        -:   43:#ifdef HAVE_FCNTL_H
+        -:   44:#include <fcntl.h>
+        -:   45:#endif
+        -:   46:#include <sys/mntio.h>
+        -:   47:#endif
+        -:   48:#ifdef HAVE_SYS_MKDEV_H
+        -:   49:#include <sys/mkdev.h>
+        -:   50:#endif
+        -:   51:
+        -:   52:#ifdef STDC_HEADERS
+        -:   53:#include <stdlib.h>
+        -:   54:#else
+        -:   55:extern int errno;
+        -:   56:#endif
+        -:   57:
+        -:   58:#include "defs.h"
+        -:   59:#include "../gnulib/lib/dirname.h"
+        -:   60:#include "xalloc.h"
+        -:   61:#include "modetype.h"
+        -:   62:
+        -:   63:/* Need declaration of function `xstrtoumax' */
+        -:   64:#include "../gnulib/lib/xstrtol.h"
+        -:   65:
+        -:   66:#include "extendbuf.h"
+        -:   67:#include "mountlist.h"
+        -:   68:#include "error.h"
+        -:   69:
+        -:   70:
+        -:   71:
+        -:   72:#if ENABLE_NLS
+        -:   73:# include <libintl.h>
+        -:   74:# define _(Text) gettext (Text)
+        -:   75:#else
+        -:   76:# define _(Text) Text
+        -:   77:#endif
+        -:   78:#ifdef gettext_noop
+        -:   79:# define N_(String) gettext_noop (String)
+        -:   80:#else
+        -:   81:/* See locate.c for explanation as to why not use (String) */
+        -:   82:# define N_(String) String
+        -:   83:#endif
+        -:   84:
+        -:   85:static char *filesystem_type_uncached PARAMS((const struct stat *statp, const char *path));
+        -:   86:
+        -:   87:
+        -:   88:/* Get MNTTYPE_IGNORE if it is available. */
+        -:   89:#if HAVE_MNTENT_H
+        -:   90:# include <mntent.h>
+        -:   91:#endif
+        -:   92:#if HAVE_SYS_MNTTAB_H
+        -:   93:# include <stdio.h>
+        -:   94:# include <sys/mnttab.h>
+        -:   95:#endif
+        -:   96:
+        -:   97:
+        -:   98:
+        -:   99:
+        -:  100:
+        -:  101:static void
+    #####:  102:free_file_system_list(struct mount_entry *p)
+        -:  103:{
+    #####:  104:  while (p)
+        -:  105:    {
+    #####:  106:      struct mount_entry *pnext = p->me_next;
+        -:  107:      
+    #####:  108:      free(p->me_devname);
+    #####:  109:      free(p->me_mountdir);
+        -:  110:      
+    #####:  111:      if(p->me_type_malloced)
+    #####:  112:	free(p->me_type);
+    #####:  113:      p->me_next = NULL;
+    #####:  114:      free(p);
+    #####:  115:      p = pnext;
+        -:  116:    }
+    #####:  117:}
+        -:  118:
+        -:  119:
+        -:  120:
+        -:  121:
+        -:  122:#ifdef AFS
+        -:  123:#include <netinet/in.h>
+        -:  124:#include <afs/venus.h>
+        -:  125:#if __STDC__
+        -:  126:/* On SunOS 4, afs/vice.h defines this to rely on a pre-ANSI cpp.  */
+        -:  127:#undef _VICEIOCTL
+        -:  128:#define _VICEIOCTL(id)  ((unsigned int ) _IOW('V', id, struct ViceIoctl))
+        -:  129:#endif
+        -:  130:#ifndef _IOW
+        -:  131:/* AFS on Solaris 2.3 doesn't get this definition.  */
+        -:  132:#include <sys/ioccom.h>
+        -:  133:#endif
+        -:  134:
+        -:  135:static int
+        -:  136:in_afs (char *path)
+        -:  137:{
+        -:  138:  static char space[2048];
+        -:  139:  struct ViceIoctl vi;
+        -:  140:
+        -:  141:  vi.in_size = 0;
+        -:  142:  vi.out_size = sizeof (space);
+        -:  143:  vi.out = space;
+        -:  144:
+        -:  145:  if (pioctl (path, VIOC_FILE_CELL_NAME, &vi, 1)
+        -:  146:      && (errno == EINVAL || errno == ENOENT))
+        -:  147:	return 0;
+        -:  148:  return 1;
+        -:  149:}
+        -:  150:#endif /* AFS */
+        -:  151:
+        -:  152:/* Nonzero if the current filesystem's type is known.  */
+        -:  153:static int fstype_known = 0;
+        -:  154:
+        -:  155:/* Return a static string naming the type of filesystem that the file PATH,
+        -:  156:   described by STATP, is on.
+        -:  157:   RELPATH is the file name relative to the current directory.
+        -:  158:   Return "unknown" if its filesystem type is unknown.  */
+        -:  159:
+        -:  160:char *
+    #####:  161:filesystem_type (const struct stat *statp, const char *path)
+        -:  162:{
+        -:  163:  static char *current_fstype = NULL;
+        -:  164:  static dev_t current_dev;
+        -:  165:
+    #####:  166:  if (current_fstype != NULL)
+        -:  167:    {
+    #####:  168:      if (fstype_known && statp->st_dev == current_dev)
+    #####:  169:	return current_fstype;	/* Cached value.  */
+    #####:  170:      free (current_fstype);
+        -:  171:    }
+    #####:  172:  current_dev = statp->st_dev;
+    #####:  173:  current_fstype = filesystem_type_uncached (statp, path);
+    #####:  174:  return current_fstype;
+        -:  175:}
+        -:  176:
+        -:  177:static int
+    #####:  178:set_fstype_devno(struct mount_entry *p)
+        -:  179:{
+        -:  180:  struct stat stbuf;
+        -:  181:  
+    #####:  182:  if (p->me_dev == (dev_t)-1)
+        -:  183:    {
+    #####:  184:      set_stat_placeholders(&stbuf);
+    #####:  185:      if (0 == (options.xstat)(p->me_mountdir, &stbuf))
+        -:  186:	{
+    #####:  187:	  p->me_dev = stbuf.st_dev;
+    #####:  188:	  return 0;
+        -:  189:	}
+        -:  190:      else
+        -:  191:	{
+    #####:  192:	  return -1;
+        -:  193:	}
+        -:  194:    }
+    #####:  195:  return 0;			/* not needed */
+        -:  196:}
+        -:  197:
+        -:  198:static struct mount_entry *
+    #####:  199:must_read_fs_list(bool need_fs_type)
+        -:  200:{
+    #####:  201:  struct mount_entry *entries = read_file_system_list(need_fs_type);
+    #####:  202:  if (NULL == entries)
+        -:  203:    {
+        -:  204:      /* We cannot determine for sure which file we were trying to
+        -:  205:       * use because gnulib has extracted all that stuff away. 
+        -:  206:       * Hence we cannot issue a specific error message here.
+        -:  207:       */
+    #####:  208:      error(1, 0, "Cannot read mounted filesystem list");
+        -:  209:    }
+    #####:  210:  return entries;
+        -:  211:}
+        -:  212:
+        -:  213:
+        -:  214:
+        -:  215:/* Return a newly allocated string naming the type of filesystem that the
+        -:  216:   file PATH, described by STATP, is on.
+        -:  217:   RELPATH is the file name relative to the current directory.
+        -:  218:   Return "unknown" if its filesystem type is unknown.  */
+        -:  219:
+        -:  220:static char *
+    #####:  221:filesystem_type_uncached (const struct stat *statp, const char *path)
+        -:  222:{
+        -:  223:  struct mount_entry *entries, *entry;
+        -:  224:  char *type;
+        -:  225:
+        -:  226:  (void) path;
+        -:  227:  
+        -:  228:#ifdef AFS
+        -:  229:  if (in_afs(path))
+        -:  230:    {
+        -:  231:      fstype_known = 1;
+        -:  232:      return xstrdup("afs");
+        -:  233:    }
+        -:  234:#endif 
+        -:  235:  
+    #####:  236:  entries = must_read_fs_list(true);
+    #####:  237:  for (type=NULL, entry=entries; entry; entry=entry->me_next)
+        -:  238:    {
+        -:  239:#ifdef MNTTYPE_IGNORE
+    #####:  240:      if (!strcmp (entry->me_type, MNTTYPE_IGNORE))
+    #####:  241:	continue;
+        -:  242:#endif
+    #####:  243:      set_fstype_devno(entry);
+    #####:  244:      if (entry->me_dev == statp->st_dev)
+        -:  245:	{
+    #####:  246:	  type = xstrdup(entry->me_type);
+    #####:  247:	  break;
+        -:  248:	}
+        -:  249:    }
+    #####:  250:  free_file_system_list(entries);
+        -:  251:
+        -:  252:  /* Don't cache unknown values. */
+    #####:  253:  fstype_known = (type != NULL);
+        -:  254:  
+    #####:  255:  return type ? type : xstrdup(_("unknown"));
+        -:  256:}
+        -:  257:
+        -:  258:
+        -:  259:char *
+    #####:  260:get_mounted_filesystems (void)
+        -:  261:{
+    #####:  262:  char *result = NULL;
+    #####:  263:  size_t alloc_size = 0u;
+    #####:  264:  size_t used = 0u;
+        -:  265:  struct mount_entry *entries, *entry;
+        -:  266:  
+    #####:  267:  entries = must_read_fs_list(false);
+    #####:  268:  for (entry=entries; entry; entry=entry->me_next)
+        -:  269:    {
+        -:  270:      size_t len;
+        -:  271:      
+        -:  272:#ifdef MNTTYPE_IGNORE
+    #####:  273:      if (!strcmp (entry->me_type, MNTTYPE_IGNORE))
+    #####:  274:	continue;
+        -:  275:#endif
+    #####:  276:      set_fstype_devno(entry);
+        -:  277:
+    #####:  278:      len = strlen(entry->me_mountdir) + 1;
+    #####:  279:      result = extendbuf(result, used+len, &alloc_size);
+    #####:  280:      strcpy(&result[used], entry->me_mountdir);
+    #####:  281:      used += len;		/* len already includes one for the \0 */
+        -:  282:    }
+        -:  283:
+    #####:  284:  free_file_system_list(entries);
+    #####:  285:  return result;
+        -:  286:}
+        -:  287:
+        -:  288:
+        -:  289:dev_t *
+    #####:  290:get_mounted_devices (size_t *n)
+        -:  291:{
+    #####:  292:  size_t alloc_size = 0u;
+    #####:  293:  size_t used = 0u;
+        -:  294:  struct mount_entry *entries, *entry;
+    #####:  295:  dev_t *result = NULL;
+        -:  296:
+        -:  297:  /* Use read_file_system_list() rather than must_read_fs_list()
+        -:  298:   * because on some system this is always called at startup,
+        -:  299:   * and find should only exit fatally if it needs to use the 
+        -:  300:   * result of this operation.   If we can't get the fs list 
+        -:  301:   * but we never need the information, there is no need to fail.
+        -:  302:   */
+    #####:  303:  for (entry = entries = read_file_system_list(false);
+        -:  304:       entry;
+    #####:  305:       entry = entry->me_next)
+        -:  306:    {
+    #####:  307:      result = extendbuf(result, sizeof(dev_t)*(used+1), &alloc_size);
+    #####:  308:      set_fstype_devno(entry);
+    #####:  309:      result[used] = entry->me_dev;
+    #####:  310:      ++used;
+        -:  311:    }
+    #####:  312:  free_file_system_list(entries);
+    #####:  313:  *n = used;
+    #####:  314:  return result;
+        -:  315:}
+        -:  316:
+        -:  317:
+        -:  318:

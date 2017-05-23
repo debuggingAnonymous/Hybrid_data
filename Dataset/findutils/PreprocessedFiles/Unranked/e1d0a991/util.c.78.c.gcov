@@ -1,0 +1,1214 @@
+        -:    0:Source:util.c
+        -:    0:Graph:util.gcno
+        -:    0:Data:util.gcda
+        -:    0:Runs:9
+        -:    0:Programs:2
+        -:    1:/* util.c -- functions for initializing new tree elements, and other things.
+        -:    2:   Copyright (C) 1990, 91, 92, 93, 94, 2000, 2003, 2004, 2005,
+        -:    3:                 2008, 2009, 2010 Free Software Foundation, Inc.
+        -:    4:
+        -:    5:   This program is free software: you can redistribute it and/or modify
+        -:    6:   it under the terms of the GNU General Public License as published by
+        -:    7:   the Free Software Foundation, either version 3 of the License, or
+        -:    8:   (at your option) any later version.
+        -:    9:
+        -:   10:   This program is distributed in the hope that it will be useful,
+        -:   11:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   12:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   13:   GNU General Public License for more details.
+        -:   14:
+        -:   15:   You should have received a copy of the GNU General Public License
+        -:   16:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   17:*/
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include "defs.h"
+        -:   21:
+        -:   22:#include <fcntl.h>
+        -:   23:#ifdef HAVE_SYS_UTSNAME_H
+        -:   24:#include <sys/utsname.h>
+        -:   25:#endif
+        -:   26:#include <sys/time.h>
+        -:   27:#include <sys/stat.h> /* for fstatat() */
+        -:   28:#include <ctype.h>
+        -:   29:#include <string.h>
+        -:   30:#include <limits.h>
+        -:   31:#include <errno.h>
+        -:   32:#include <assert.h>
+        -:   33:
+        -:   34:#include "progname.h"
+        -:   35:#include "quotearg.h"
+        -:   36:#include "timespec.h"
+        -:   37:#include "error.h"
+        -:   38:#include "verify.h"
+        -:   39:#include "fdleak.h"
+        -:   40:#include "dircallback.h"
+        -:   41:#include "xalloc.h"
+        -:   42:#include "save-cwd.h"
+        -:   43:
+        -:   44:
+        -:   45:#if ENABLE_NLS
+        -:   46:# include <libintl.h>
+        -:   47:# define _(Text) gettext (Text)
+        -:   48:#else
+        -:   49:# define _(Text) Text
+        -:   50:#endif
+        -:   51:#ifdef gettext_noop
+        -:   52:# define N_(String) gettext_noop (String)
+        -:   53:#else
+        -:   54:/* See locate.c for explanation as to why not use (String) */
+        -:   55:# define N_(String) String
+        -:   56:#endif
+        -:   57:
+        -:   58:
+        -:   59:struct debug_option_assoc
+        -:   60:{
+        -:   61:  char *name;
+        -:   62:  int    val;
+        -:   63:  char *docstring;
+        -:   64:};
+        -:   65:static struct debug_option_assoc debugassoc[] =
+        -:   66:  {
+        -:   67:    { "help", DebugHelp, "Explain the various -D options" },
+        -:   68:    { "tree", DebugExpressionTree, "Display the expression tree" },
+        -:   69:    { "search",DebugSearch, "Navigate the directory tree verbosely" },
+        -:   70:    { "stat", DebugStat, "Trace calls to stat(2) and lstat(2)" },
+        -:   71:    { "rates", DebugSuccessRates, "Indicate how often each predicate succeeded" },
+        -:   72:    { "opt",  DebugExpressionTree|DebugTreeOpt, "Show diagnostic information relating to optimisation" },
+        -:   73:    { "exec", DebugExec,  "Show diagnostic information relating to -exec, -execdir, -ok and -okdir" }
+        -:   74:  };
+        -:   75:#define N_DEBUGASSOC (sizeof(debugassoc)/sizeof(debugassoc[0]))
+        -:   76:
+        -:   77:
+        -:   78:
+        -:   79:
+        -:   80:/* Add a primary of predicate type PRED_FUNC (described by ENTRY) to the predicate input list.
+        -:   81:
+        -:   82:   Return a pointer to the predicate node just inserted.
+        -:   83:
+        -:   84:   Fills in the following cells of the new predicate node:
+        -:   85:
+        -:   86:   pred_func	    PRED_FUNC
+        -:   87:   args(.str)	    NULL
+        -:   88:   p_type	    PRIMARY_TYPE
+        -:   89:   p_prec	    NO_PREC
+        -:   90:
+        -:   91:   Other cells that need to be filled in are defaulted by
+        -:   92:   get_new_pred_chk_op, which is used to insure that the prior node is
+        -:   93:   either not there at all (we are the very first node) or is an
+        -:   94:   operator. */
+        -:   95:
+        -:   96:struct predicate *
+       32:   97:insert_primary_withpred (const struct parser_table *entry,
+        -:   98:			 PRED_FUNC pred_func,
+        -:   99:			 const char *arg)
+        -:  100:{
+        -:  101:  struct predicate *new_pred;
+        -:  102:
+       32:  103:  new_pred = get_new_pred_chk_op (entry, arg);
+       32:  104:  new_pred->pred_func = pred_func;
+       32:  105:  new_pred->p_name = entry->parser_name;
+       32:  106:  new_pred->args.str = NULL;
+       32:  107:  new_pred->p_type = PRIMARY_TYPE;
+       32:  108:  new_pred->p_prec = NO_PREC;
+       32:  109:  return new_pred;
+        -:  110:}
+        -:  111:
+        -:  112:/* Add a primary described by ENTRY to the predicate input list.
+        -:  113:
+        -:  114:   Return a pointer to the predicate node just inserted.
+        -:  115:
+        -:  116:   Fills in the following cells of the new predicate node:
+        -:  117:
+        -:  118:   pred_func	    PRED_FUNC
+        -:  119:   args(.str)	    NULL
+        -:  120:   p_type	    PRIMARY_TYPE
+        -:  121:   p_prec	    NO_PREC
+        -:  122:
+        -:  123:   Other cells that need to be filled in are defaulted by
+        -:  124:   get_new_pred_chk_op, which is used to insure that the prior node is
+        -:  125:   either not there at all (we are the very first node) or is an
+        -:  126:   operator. */
+        -:  127:struct predicate *
+    #####:  128:insert_primary (const struct parser_table *entry, const char *arg)
+        -:  129:{
+    #####:  130:  assert (entry->pred_func != NULL);
+    #####:  131:  return insert_primary_withpred (entry, entry->pred_func, arg);
+        -:  132:}
+        -:  133:
+        -:  134:struct predicate *
+    #####:  135:insert_primary_noarg (const struct parser_table *entry)
+        -:  136:{
+    #####:  137:  return insert_primary (entry, NULL);
+        -:  138:}
+        -:  139:
+        -:  140:
+        -:  141:
+        -:  142:static void
+    #####:  143:show_valid_debug_options (FILE *fp, int full)
+        -:  144:{
+        -:  145:  int i;
+    #####:  146:  if (full)
+        -:  147:    {
+    #####:  148:      fprintf (fp, "Valid arguments for -D:\n");
+    #####:  149:      for (i=0; i<N_DEBUGASSOC; ++i)
+        -:  150:	{
+    #####:  151:	  fprintf (fp, "%-10s %s\n",
+        -:  152:		   debugassoc[i].name,
+        -:  153:		   debugassoc[i].docstring);
+        -:  154:	}
+        -:  155:    }
+        -:  156:  else
+        -:  157:    {
+    #####:  158:      for (i=0; i<N_DEBUGASSOC; ++i)
+        -:  159:	{
+    #####:  160:	  fprintf (fp, "%s%s", (i>0 ? "|" : ""), debugassoc[i].name);
+        -:  161:	}
+        -:  162:    }
+    #####:  163:}
+        -:  164:
+        -:  165:void
+    #####:  166:usage (FILE *fp, int status, char *msg)
+        -:  167:{
+    #####:  168:  if (msg)
+    #####:  169:    fprintf (fp, "%s: %s\n", program_name, msg);
+        -:  170:
+    #####:  171:  fprintf (fp, _("Usage: %s [-H] [-L] [-P] [-Olevel] [-D "), program_name);
+    #####:  172:  show_valid_debug_options (fp, 0);
+    #####:  173:  fprintf (fp, _("] [path...] [expression]\n"));
+    #####:  174:  if (0 != status)
+    #####:  175:    exit (status);
+    #####:  176:}
+        -:  177:
+        -:  178:void
+      232:  179:set_stat_placeholders (struct stat *p)
+        -:  180:{
+        -:  181:#if HAVE_STRUCT_STAT_ST_BIRTHTIME
+        -:  182:  p->st_birthtime = 0;
+        -:  183:#endif
+        -:  184:#if HAVE_STRUCT_STAT_ST_BIRTHTIMENSEC
+        -:  185:  p->st_birthtimensec = 0;
+        -:  186:#endif
+        -:  187:#if HAVE_STRUCT_STAT_ST_BIRTHTIMESPEC_TV_NSEC
+        -:  188:  p->st_birthtimespec.tv_nsec = -1;
+        -:  189:#endif
+        -:  190:#if HAVE_STRUCT_STAT_ST_BIRTHTIMESPEC_TV_SEC
+        -:  191:  p->st_birthtimespec.tv_sec = 0;
+        -:  192:#endif
+      232:  193:}
+        -:  194:
+        -:  195:
+        -:  196:/* Get the stat information for a file, if it is
+        -:  197: * not already known.  Returns 0 on success.
+        -:  198: */
+        -:  199:int
+      100:  200:get_statinfo (const char *pathname, const char *name, struct stat *p)
+        -:  201:{
+        -:  202:  /* Set markers in fields so we have a good idea if the implementation
+        -:  203:   * didn't bother to set them (e.g., NetBSD st_birthtimespec for MS-DOS
+        -:  204:   * files)
+        -:  205:   */
+      100:  206:  if (!state.have_stat)
+        -:  207:    {
+       28:  208:      set_stat_placeholders (p);
+       28:  209:      if (0 == (*options.xstat) (name, p))
+        -:  210:	{
+       28:  211:	  if (00000 == p->st_mode)
+        -:  212:	    {
+        -:  213:	      /* Savannah bug #16378. */
+    #####:  214:	      error (0, 0, _("WARNING: file %s appears to have mode 0000"),
+        -:  215:		     quotearg_n_style (0, options.err_quoting_style, name));
+    #####:  216:	      error_severity (1);
+        -:  217:	    }
+        -:  218:	}
+        -:  219:      else
+        -:  220:	{
+    #####:  221:	  if (!options.ignore_readdir_race || (errno != ENOENT) )
+        -:  222:	    {
+    #####:  223:	      nonfatal_target_file_error (errno, pathname);
+        -:  224:	    }
+    #####:  225:	  return -1;
+        -:  226:	}
+        -:  227:    }
+      100:  228:  state.have_stat = true;
+      100:  229:  state.have_type = true;
+      100:  230:  state.type = p->st_mode;
+        -:  231:
+      100:  232:  return 0;
+        -:  233:}
+        -:  234:
+        -:  235:/* Get the stat/type/inode information for a file, if it is not
+        -:  236: * already known.   Returns 0 on success (or if we did nothing).
+        -:  237: */
+        -:  238:int
+       80:  239:get_info (const char *pathname,
+        -:  240:	  struct stat *p,
+        -:  241:	  struct predicate *pred_ptr)
+        -:  242:{
+       80:  243:  bool todo = false;
+        -:  244:
+        -:  245:  /* If we need the full stat info, or we need the type info but don't
+        -:  246:   * already have it, stat the file now.
+        -:  247:   */
+       80:  248:  if (pred_ptr->need_stat)
+        -:  249:    {
+       80:  250:      todo = true;		/* need full stat info */
+        -:  251:    }
+    #####:  252:  else if (pred_ptr->need_type && !state.have_type)
+        -:  253:    {
+    #####:  254:      todo = true;		/* need to stat to get the type */
+        -:  255:    }
+    #####:  256:  else if (pred_ptr->need_inum)
+        -:  257:    {
+    #####:  258:      if (!p->st_ino)
+        -:  259:	{
+    #####:  260:	  todo = true;		/* need to stat to get the inode number */
+        -:  261:	}
+    #####:  262:      else if ((!state.have_type) || S_ISDIR(p->st_mode))
+        -:  263:	{
+        -:  264:	  /* For now we decide not to trust struct dirent.d_ino for
+        -:  265:	   * directory entries that are subdirectories, in case this
+        -:  266:	   * subdirectory is a mount point.  We also need to call a
+        -:  267:	   * stat function if we don't have st_ino (i.e. it is zero).
+        -:  268:	   */
+    #####:  269:	  todo = true;
+        -:  270:	}
+        -:  271:    }
+       80:  272:  if (todo)
+        -:  273:    {
+       80:  274:      int result = get_statinfo (pathname, state.rel_pathname, p);
+       80:  275:      if (result != 0)
+        -:  276:	{
+    #####:  277:	  return -1;		/* failure. */
+        -:  278:	}
+        -:  279:      else
+        -:  280:	{
+        -:  281:	  /* Verify some postconditions.  We can't check st_mode for
+        -:  282:	     non-zero-ness because of Savannah bug #16378 (which is
+        -:  283:	     that broken NFS servers can return st_mode==0). */
+       80:  284:	  if (pred_ptr->need_type)
+        -:  285:	    {
+    #####:  286:	      assert (state.have_type);
+        -:  287:	    }
+       80:  288:	  if (pred_ptr->need_inum)
+        -:  289:	    {
+    #####:  290:	      assert (p->st_ino);
+        -:  291:	    }
+       80:  292:	  return 0;		/* success. */
+        -:  293:	}
+        -:  294:    }
+        -:  295:  else
+        -:  296:    {
+    #####:  297:      return 0;			/* success; nothing to do. */
+        -:  298:    }
+        -:  299:}
+        -:  300:
+        -:  301:/* Determine if we can use O_NOFOLLOW.
+        -:  302: */
+        -:  303:#if defined O_NOFOLLOW
+        -:  304:bool
+        9:  305:check_nofollow (void)
+        -:  306:{
+        -:  307:  struct utsname uts;
+        -:  308:  float  release;
+        -:  309:
+        -:  310:  if (0 == O_NOFOLLOW)
+        -:  311:    {
+        -:  312:      return false;
+        -:  313:    }
+        -:  314:
+        9:  315:  if (0 == uname (&uts))
+        -:  316:    {
+        -:  317:      /* POSIX requires that atof ignores "unrecognised suffixes"; we specifically
+        -:  318:       * want that behaviour. */
+        9:  319:      double (*conversion)(const char*) = atof;  /* avoid sc_prohibit_atoi_atof check. */
+        9:  320:      release = conversion (uts.release);
+        -:  321:
+        9:  322:      if (0 == strcmp ("Linux", uts.sysname))
+        -:  323:	{
+        -:  324:	  /* Linux kernels 2.1.126 and earlier ignore the O_NOFOLLOW flag. */
+        9:  325:	  return release >= 2.2; /* close enough */
+        -:  326:	}
+    #####:  327:      else if (0 == strcmp ("FreeBSD", uts.sysname))
+        -:  328:	{
+        -:  329:	  /* FreeBSD 3.0-CURRENT and later support it */
+    #####:  330:	  return release >= 3.1;
+        -:  331:	}
+        -:  332:    }
+        -:  333:
+        -:  334:  /* Well, O_NOFOLLOW was defined, so we'll try to use it. */
+    #####:  335:  return true;
+        -:  336:}
+        -:  337:#endif
+        -:  338:
+        -:  339:
+        -:  340:static int
+    #####:  341:exec_cb (void *context)
+        -:  342:{
+    #####:  343:  struct exec_val *execp = context;
+    #####:  344:  bc_do_exec (&execp->ctl, &execp->state);
+    #####:  345:  return 0;
+        -:  346:}
+        -:  347:
+        -:  348:static void
+    #####:  349:do_exec (struct exec_val *execp)
+        -:  350:{
+    #####:  351:  run_in_dir (execp->wd_for_exec, exec_cb, execp);
+    #####:  352:  if (execp->wd_for_exec != initial_wd)
+        -:  353:    {
+    #####:  354:      free_cwd (execp->wd_for_exec);
+    #####:  355:      free (execp->wd_for_exec);
+    #####:  356:      execp->wd_for_exec = NULL;
+        -:  357:    }
+    #####:  358:}
+        -:  359:
+        -:  360:
+        -:  361:/* Examine the predicate list for instances of -execdir or -okdir
+        -:  362: * which have been terminated with '+' (build argument list) rather
+        -:  363: * than ';' (singles only).  If there are any, run them (this will
+        -:  364: * have no effect if there are no arguments waiting).
+        -:  365: */
+        -:  366:static void
+    #####:  367:do_complete_pending_execdirs (struct predicate *p)
+        -:  368:{
+    #####:  369:  if (NULL == p)
+    #####:  370:    return;
+        -:  371:
+    #####:  372:  assert (state.execdirs_outstanding);
+        -:  373:
+    #####:  374:  do_complete_pending_execdirs (p->pred_left);
+        -:  375:
+    #####:  376:  if (pred_is (p, pred_execdir) || pred_is(p, pred_okdir))
+        -:  377:    {
+        -:  378:      /* It's an exec-family predicate.  p->args.exec_val is valid. */
+    #####:  379:      if (p->args.exec_vec.multiple)
+        -:  380:	{
+    #####:  381:	  struct exec_val *execp = &p->args.exec_vec;
+        -:  382:
+        -:  383:	  /* This one was terminated by '+' and so might have some
+        -:  384:	   * left... Run it if necessary.
+        -:  385:	   */
+    #####:  386:	  if (execp->state.todo)
+        -:  387:	    {
+        -:  388:	      /* There are not-yet-executed arguments. */
+    #####:  389:	      do_exec (execp);
+        -:  390:	    }
+        -:  391:	}
+        -:  392:    }
+        -:  393:
+    #####:  394:  do_complete_pending_execdirs (p->pred_right);
+        -:  395:}
+        -:  396:
+        -:  397:void
+       44:  398:complete_pending_execdirs (void)
+        -:  399:{
+       44:  400:  if (state.execdirs_outstanding)
+        -:  401:    {
+    #####:  402:      do_complete_pending_execdirs (get_eval_tree());
+    #####:  403:      state.execdirs_outstanding = false;
+        -:  404:    }
+       44:  405:}
+        -:  406:
+        -:  407:
+        -:  408:
+        -:  409:/* Examine the predicate list for instances of -exec which have been
+        -:  410: * terminated with '+' (build argument list) rather than ';' (singles
+        -:  411: * only).  If there are any, run them (this will have no effect if
+        -:  412: * there are no arguments waiting).
+        -:  413: */
+        -:  414:void
+      768:  415:complete_pending_execs (struct predicate *p)
+        -:  416:{
+      768:  417:  if (NULL == p)
+     1200:  418:    return;
+        -:  419:
+      336:  420:  complete_pending_execs (p->pred_left);
+        -:  421:
+        -:  422:  /* It's an exec-family predicate then p->args.exec_val is valid
+        -:  423:   * and we can check it.
+        -:  424:   */
+        -:  425:  /* XXX: what about pred_ok() ? */
+      336:  426:  if (pred_is (p, pred_exec) && p->args.exec_vec.multiple)
+        -:  427:    {
+    #####:  428:      struct exec_val *execp = &p->args.exec_vec;
+        -:  429:
+        -:  430:      /* This one was terminated by '+' and so might have some
+        -:  431:       * left... Run it if necessary.  Set state.exit_status if
+        -:  432:       * there are any problems.
+        -:  433:       */
+    #####:  434:      if (execp->state.todo)
+        -:  435:	{
+        -:  436:	  /* There are not-yet-executed arguments. */
+    #####:  437:	  bc_do_exec (&execp->ctl, &execp->state);
+        -:  438:	}
+        -:  439:    }
+        -:  440:
+      336:  441:  complete_pending_execs (p->pred_right);
+        -:  442:}
+        -:  443:
+        -:  444:void
+        9:  445:record_initial_cwd (void)
+        -:  446:{
+        9:  447:  initial_wd = xmalloc (sizeof (*initial_wd));
+        9:  448:  if (0 != save_cwd (initial_wd))
+        -:  449:    {
+    #####:  450:      error (EXIT_FAILURE, errno,
+        -:  451:	     _("failed to save initial working directory"));
+        -:  452:    }
+        9:  453:}
+        -:  454:
+        -:  455:static void
+        8:  456:cleanup_initial_cwd (void)
+        -:  457:{
+        8:  458:  if (0 == restore_cwd (initial_wd))
+        -:  459:    {
+        8:  460:      free_cwd (initial_wd);
+        8:  461:      free (initial_wd);
+        8:  462:      initial_wd = NULL;
+        -:  463:    }
+        -:  464:  else
+        -:  465:    {
+        -:  466:      /* since we may already be in atexit, die with _exit(). */
+    #####:  467:      error (0, errno,
+        -:  468:	     _("failed to restore initial working directory"));
+    #####:  469:      _exit (EXIT_FAILURE);
+        -:  470:    }
+        8:  471:}
+        -:  472:
+        -:  473:
+        -:  474:static void
+      192:  475:traverse_tree (struct predicate *tree,
+        -:  476:			  void (*callback)(struct predicate*))
+        -:  477:{
+      192:  478:  if (tree->pred_left)
+       48:  479:    traverse_tree (tree->pred_left, callback);
+        -:  480:
+      192:  481:  callback (tree);
+        -:  482:
+      192:  483:  if (tree->pred_right)
+      128:  484:    traverse_tree (tree->pred_right, callback);
+      192:  485:}
+        -:  486:
+        -:  487:/* After sharefile_destroy is called, our output file
+        -:  488: * pointers will be dangling (fclose will already have
+        -:  489: * been called on them).  NULL these out.
+        -:  490: */
+        -:  491:static void
+       96:  492:undangle_file_pointers (struct predicate *p)
+        -:  493:{
+       96:  494:  if (pred_is (p, pred_fprint)
+       96:  495:      || pred_is (p, pred_fprintf)
+       80:  496:      || pred_is (p, pred_fls)
+       80:  497:      || pred_is (p, pred_fprint0))
+        -:  498:    {
+        -:  499:      /* The file was already fclose()d by sharefile_destroy. */
+       16:  500:      p->args.printf_vec.stream = NULL;
+        -:  501:    }
+       96:  502:}
+        -:  503:
+        -:  504:/* Return nonzero if file descriptor leak-checking is enabled.
+        -:  505: */
+        -:  506:bool
+       17:  507:fd_leak_check_is_enabled (void)
+        -:  508:{
+       17:  509:  if (getenv ("GNU_FINDUTILS_FD_LEAK_CHECK"))
+       17:  510:    return true;
+        -:  511:  else
+    #####:  512:    return false;
+        -:  513:
+        -:  514:}
+        -:  515:
+        -:  516:/* Complete any outstanding commands.
+        -:  517: * Flush and close any open files.
+        -:  518: */
+        -:  519:void
+        8:  520:cleanup (void)
+        -:  521:{
+        8:  522:  struct predicate *eval_tree = get_eval_tree ();
+        8:  523:  if (eval_tree)
+        -:  524:    {
+        8:  525:      traverse_tree (eval_tree, complete_pending_execs);
+        8:  526:      complete_pending_execdirs ();
+        -:  527:    }
+        -:  528:
+        -:  529:  /* Close ouptut files and NULL out references to them. */
+        8:  530:  sharefile_destroy (state.shared_files);
+        8:  531:  if (eval_tree)
+        8:  532:    traverse_tree (eval_tree, undangle_file_pointers);
+        -:  533:
+        8:  534:  cleanup_initial_cwd ();
+        -:  535:
+        8:  536:  if (fd_leak_check_is_enabled ())
+        -:  537:    {
+        8:  538:      complain_about_leaky_fds ();
+        8:  539:      forget_non_cloexec_fds ();
+        -:  540:    }
+        -:  541:
+        8:  542:  if (fflush (stdout) == EOF)
+    #####:  543:    nonfatal_nontarget_file_error (errno, "standard output");
+        8:  544:}
+        -:  545:
+        -:  546:/* Savannah bug #16378 manifests as an assertion failure in pred_type()
+        -:  547: * when an NFS server returns st_mode with value 0 (of course the stat(2)
+        -:  548: * system call is itself returning 0 in this case).
+        -:  549: */
+        -:  550:#undef DEBUG_SV_BUG_16378
+        -:  551:#if defined DEBUG_SV_BUG_16378
+        -:  552:static int hook_fstatat (int fd, const char *name, struct stat *p, int flags)
+        -:  553:{
+        -:  554:  static int warned = 0;
+        -:  555:
+        -:  556:  if (!warned)
+        -:  557:    {
+        -:  558:      /* No use of _() here; no point asking translators to translate a debug msg */
+        -:  559:      error (0, 0,
+        -:  560:	     "WARNING: some debug code is enabled for Savannah bug #16378; "
+        -:  561:	     "this should not occur in released versions of findutils!");
+        -:  562:      warned = 1;
+        -:  563:    }
+        -:  564:
+        -:  565:  if (0 == strcmp (name, "./mode0file")
+        -:  566:      || 0 == strcmp (name, "mode0file"))
+        -:  567:    {
+        -:  568:      time_t now = time (NULL);
+        -:  569:      long day = 86400;
+        -:  570:
+        -:  571:      p->st_rdev = 0;
+        -:  572:      p->st_dev = 0x300;
+        -:  573:      p->st_ino = 0;
+        -:  574:      p->st_mode = 0;		/* SV bug #16378 */
+        -:  575:      p->st_nlink = 1;
+        -:  576:      p->st_uid = geteuid ();
+        -:  577:      p->st_gid = 0;
+        -:  578:      p->st_size = 42;
+        -:  579:      p->st_blksize = 32768;
+        -:  580:      p->st_atime = now-1*day;
+        -:  581:      p->st_mtime = now-2*day;
+        -:  582:      p->st_ctime = now-3*day;
+        -:  583:
+        -:  584:      return 0;
+        -:  585:    }
+        -:  586:  return fstatat (fd, name, p, flags);
+        -:  587:}
+        -:  588:
+        -:  589:# undef  fstatat
+        -:  590:# define fstatat (fd,name,p,flags) hook_fstatat((fd),(name),(p),(flags))
+        -:  591:#endif
+        -:  592:
+        -:  593:
+        -:  594:static int
+       24:  595:fallback_stat (const char *name, struct stat *p, int prev_rv)
+        -:  596:{
+        -:  597:  /* Our original stat() call failed.  Perhaps we can't follow a
+        -:  598:   * symbolic link.  If that might be the problem, lstat() the link.
+        -:  599:   * Otherwise, admit defeat.
+        -:  600:   */
+       24:  601:  switch (errno)
+        -:  602:    {
+        -:  603:    case ENOENT:
+        -:  604:    case ENOTDIR:
+       24:  605:      if (options.debug_options & DebugStat)
+    #####:  606:	fprintf(stderr, "fallback_stat(): stat(%s) failed; falling back on lstat()\n", name);
+       24:  607:      return fstatat(state.cwd_dir_fd, name, p, AT_SYMLINK_NOFOLLOW);
+        -:  608:
+        -:  609:    case EACCES:
+        -:  610:    case EIO:
+        -:  611:    case ELOOP:
+        -:  612:    case ENAMETOOLONG:
+        -:  613:#ifdef EOVERFLOW
+        -:  614:    case EOVERFLOW:	    /* EOVERFLOW is not #defined on UNICOS. */
+        -:  615:#endif
+        -:  616:    default:
+    #####:  617:      return prev_rv;
+        -:  618:    }
+        -:  619:}
+        -:  620:
+        -:  621:
+        -:  622:/* optionh_stat() implements the stat operation when the -H option is
+        -:  623: * in effect.
+        -:  624: *
+        -:  625: * If the item to be examined is a command-line argument, we follow
+        -:  626: * symbolic links.  If the stat() call fails on the command-line item,
+        -:  627: * we fall back on the properties of the symbolic link.
+        -:  628: *
+        -:  629: * If the item to be examined is not a command-line argument, we
+        -:  630: * examine the link itself.
+        -:  631: */
+        -:  632:int
+       36:  633:optionh_stat (const char *name, struct stat *p)
+        -:  634:{
+       36:  635:  if (AT_FDCWD != state.cwd_dir_fd)
+        8:  636:    assert (state.cwd_dir_fd >= 0);
+       36:  637:  set_stat_placeholders (p);
+       36:  638:  if (0 == state.curdepth)
+        -:  639:    {
+        -:  640:      /* This file is from the command line; deference the link (if it
+        -:  641:       * is a link).
+        -:  642:       */
+        -:  643:      int rv;
+       20:  644:      rv = fstatat (state.cwd_dir_fd, name, p, 0);
+       20:  645:      if (0 == rv)
+       12:  646:	return 0;		/* success */
+        -:  647:      else
+        8:  648:	return fallback_stat (name, p, rv);
+        -:  649:    }
+        -:  650:  else
+        -:  651:    {
+        -:  652:      /* Not a file on the command line; do not dereference the link.
+        -:  653:       */
+       16:  654:      return fstatat (state.cwd_dir_fd, name, p, AT_SYMLINK_NOFOLLOW);
+        -:  655:    }
+        -:  656:}
+        -:  657:
+        -:  658:/* optionl_stat() implements the stat operation when the -L option is
+        -:  659: * in effect.  That option makes us examine the thing the symbolic
+        -:  660: * link points to, not the symbolic link itself.
+        -:  661: */
+        -:  662:int
+       32:  663:optionl_stat(const char *name, struct stat *p)
+        -:  664:{
+        -:  665:  int rv;
+       32:  666:  if (AT_FDCWD != state.cwd_dir_fd)
+       16:  667:    assert (state.cwd_dir_fd >= 0);
+        -:  668:
+       32:  669:  set_stat_placeholders (p);
+       32:  670:  rv = fstatat (state.cwd_dir_fd, name, p, 0);
+       32:  671:  if (0 == rv)
+       16:  672:    return 0;			/* normal case. */
+        -:  673:  else
+       16:  674:    return fallback_stat (name, p, rv);
+        -:  675:}
+        -:  676:
+        -:  677:/* optionp_stat() implements the stat operation when the -P option is
+        -:  678: * in effect (this is also the default).  That option makes us examine
+        -:  679: * the symbolic link itself, not the thing it points to.
+        -:  680: */
+        -:  681:int
+       48:  682:optionp_stat (const char *name, struct stat *p)
+        -:  683:{
+       48:  684:  assert ((state.cwd_dir_fd >= 0) || (state.cwd_dir_fd==AT_FDCWD));
+       48:  685:  set_stat_placeholders (p);
+       48:  686:  return fstatat (state.cwd_dir_fd, name, p, AT_SYMLINK_NOFOLLOW);
+        -:  687:}
+        -:  688:
+        -:  689:
+        -:  690:static uintmax_t stat_count = 0u;
+        -:  691:
+        -:  692:int
+    #####:  693:debug_stat (const char *file, struct stat *bufp)
+        -:  694:{
+    #####:  695:  ++stat_count;
+    #####:  696:  fprintf (stderr, "debug_stat (%s)\n", file);
+        -:  697:
+    #####:  698:  switch (options.symlink_handling)
+        -:  699:    {
+        -:  700:    case SYMLINK_ALWAYS_DEREF:
+    #####:  701:      return optionl_stat (file, bufp);
+        -:  702:    case SYMLINK_DEREF_ARGSONLY:
+    #####:  703:      return optionh_stat (file, bufp);
+        -:  704:    case SYMLINK_NEVER_DEREF:
+    #####:  705:      return optionp_stat (file, bufp);
+        -:  706:    }
+        -:  707:  /*NOTREACHED*/
+    #####:  708:  assert (0);
+        -:  709:  return -1;
+        -:  710:}
+        -:  711:
+        -:  712:
+        -:  713:bool
+      112:  714:following_links(void)
+        -:  715:{
+      112:  716:  switch (options.symlink_handling)
+        -:  717:    {
+        -:  718:    case SYMLINK_ALWAYS_DEREF:
+    #####:  719:      return true;
+        -:  720:    case SYMLINK_DEREF_ARGSONLY:
+      112:  721:      return (state.curdepth == 0);
+        -:  722:    case SYMLINK_NEVER_DEREF:
+        -:  723:    default:
+    #####:  724:      return false;
+        -:  725:    }
+        -:  726:}
+        -:  727:
+        -:  728:
+        -:  729:/* Take a "mode" indicator and fill in the files of 'state'.
+        -:  730: */
+        -:  731:bool
+       44:  732:digest_mode (mode_t *mode,
+        -:  733:	     const char *pathname,
+        -:  734:	     const char *name,
+        -:  735:	     struct stat *pstat,
+        -:  736:	     bool leaf)
+        -:  737:{
+        -:  738:  /* If we know the type of the directory entry, and it is not a
+        -:  739:   * symbolic link, we may be able to avoid a stat() or lstat() call.
+        -:  740:   */
+       44:  741:  if (*mode)
+        -:  742:    {
+       32:  743:      if (S_ISLNK(*mode) && following_links())
+        -:  744:	{
+        -:  745:	  /* mode is wrong because we should have followed the symlink. */
+        4:  746:	  if (get_statinfo (pathname, name, pstat) != 0)
+    #####:  747:	    return false;
+        4:  748:	  *mode = state.type = pstat->st_mode;
+        4:  749:	  state.have_type = true;
+        -:  750:	}
+        -:  751:      else
+        -:  752:	{
+       28:  753:	  state.have_type = true;
+       28:  754:	  pstat->st_mode = state.type = *mode;
+        -:  755:	}
+        -:  756:    }
+        -:  757:  else
+        -:  758:    {
+        -:  759:      /* Mode is not yet known; may have to stat the file unless we
+        -:  760:       * can deduce that it is not a directory (which is all we need to
+        -:  761:       * know at this stage)
+        -:  762:       */
+       12:  763:      if (leaf)
+        -:  764:	{
+    #####:  765:	  state.have_stat = false;
+    #####:  766:	  state.have_type = false;;
+    #####:  767:	  state.type = 0;
+        -:  768:	}
+        -:  769:      else
+        -:  770:	{
+       12:  771:	  if (get_statinfo (pathname, name, pstat) != 0)
+    #####:  772:	    return false;
+        -:  773:
+        -:  774:	  /* If -L is in effect and we are dealing with a symlink,
+        -:  775:	   * st_mode is the mode of the pointed-to file, while mode is
+        -:  776:	   * the mode of the directory entry (S_IFLNK).  Hence now
+        -:  777:	   * that we have the stat information, override "mode".
+        -:  778:	   */
+       12:  779:	  state.type = *mode = pstat->st_mode;
+       12:  780:	  state.have_type = true;
+        -:  781:	}
+        -:  782:    }
+        -:  783:
+        -:  784:  /* success. */
+       44:  785:  return true;
+        -:  786:}
+        -:  787:
+        -:  788:
+        -:  789:/* Return true if there are no predicates with no_default_print in
+        -:  790:   predicate list PRED, false if there are any.
+        -:  791:   Returns true if default print should be performed */
+        -:  792:
+        -:  793:bool
+        8:  794:default_prints (struct predicate *pred)
+        -:  795:{
+       32:  796:  while (pred != NULL)
+        -:  797:    {
+       24:  798:      if (pred->no_default_print)
+        8:  799:	return (false);
+       16:  800:      pred = pred->pred_next;
+        -:  801:    }
+    #####:  802:  return (true);
+        -:  803:}
+        -:  804:
+        -:  805:bool
+      114:  806:looks_like_expression (const char *arg, bool leading)
+        -:  807:{
+      114:  808:  switch (arg[0])
+        -:  809:    {
+        -:  810:    case '-':
+       50:  811:      if (arg[1])		/* "-foo" is an expression.  */
+       50:  812:	return true;
+        -:  813:      else
+    #####:  814:	return false;		/* Just "-" is a filename. */
+        -:  815:      break;
+        -:  816:
+        -:  817:    case ')':
+        -:  818:    case ',':
+        8:  819:      if (arg[1])
+    #####:  820:	return false;		/* )x and ,z are not expressions */
+        -:  821:      else
+        8:  822:	return !leading;	/* A leading ) or , is not either */
+        -:  823:
+        -:  824:      /* ( and ! are part of an expression, but (2 and !foo are
+        -:  825:       * filenames.
+        -:  826:       */
+        -:  827:    case '!':
+        -:  828:    case '(':
+        8:  829:      if (arg[1])
+    #####:  830:	return false;
+        -:  831:      else
+        8:  832:	return true;
+        -:  833:
+        -:  834:    default:
+       48:  835:      return false;
+        -:  836:    }
+        -:  837:}
+        -:  838:
+        -:  839:static void
+    #####:  840:process_debug_options (char *arg)
+        -:  841:{
+        -:  842:  const char *p;
+    #####:  843:  char *token_context = NULL;
+    #####:  844:  const char delimiters[] = ",";
+    #####:  845:  bool empty = true;
+        -:  846:  size_t i;
+        -:  847:
+    #####:  848:  p = strtok_r (arg, delimiters, &token_context);
+    #####:  849:  while (p)
+        -:  850:    {
+    #####:  851:      empty = false;
+        -:  852:
+    #####:  853:      for (i=0; i<N_DEBUGASSOC; ++i)
+        -:  854:	{
+    #####:  855:	  if (0 == strcmp (debugassoc[i].name, p))
+        -:  856:	    {
+    #####:  857:	      options.debug_options |= debugassoc[i].val;
+    #####:  858:	      break;
+        -:  859:	    }
+        -:  860:	}
+    #####:  861:      if (i >= N_DEBUGASSOC)
+        -:  862:	{
+    #####:  863:	  error (0, 0, _("Ignoring unrecognised debug flag %s"),
+        -:  864:		 quotearg_n_style (0, options.err_quoting_style, arg));
+        -:  865:	}
+    #####:  866:      p = strtok_r (NULL, delimiters, &token_context);
+        -:  867:    }
+    #####:  868:  if (empty)
+        -:  869:    {
+    #####:  870:      error(EXIT_FAILURE, 0, _("Empty argument to the -D option."));
+        -:  871:    }
+    #####:  872:  else if (options.debug_options & DebugHelp)
+        -:  873:    {
+    #####:  874:      show_valid_debug_options (stdout, 1);
+    #####:  875:      exit (EXIT_SUCCESS);
+        -:  876:    }
+    #####:  877:}
+        -:  878:
+        -:  879:
+        -:  880:static void
+        8:  881:process_optimisation_option (const char *arg)
+        -:  882:{
+        8:  883:  if (0 == arg[0])
+        -:  884:    {
+    #####:  885:      error (EXIT_FAILURE, 0,
+        -:  886:	     _("The -O option must be immediately followed by a decimal integer"));
+        -:  887:    }
+        -:  888:  else
+        -:  889:    {
+        -:  890:      unsigned long opt_level;
+        -:  891:      char *end;
+        -:  892:
+        8:  893:      if (!isdigit ( (unsigned char) arg[0] ))
+        -:  894:	{
+    #####:  895:	  error (EXIT_FAILURE, 0,
+        -:  896:		 _("Please specify a decimal number immediately after -O"));
+        -:  897:	}
+        -:  898:      else
+        -:  899:	{
+        8:  900:	  int prev_errno = errno;
+        8:  901:	  errno  = 0;
+        -:  902:
+        8:  903:	  opt_level = strtoul (arg, &end, 10);
+        8:  904:	  if ( (0==opt_level) && (end==arg) )
+        -:  905:	    {
+    #####:  906:	      error (EXIT_FAILURE, 0,
+        -:  907:		     _("Please specify a decimal number immediately after -O"));
+        -:  908:	    }
+        8:  909:	  else if (*end)
+        -:  910:	    {
+        -:  911:	      /* unwanted trailing characters. */
+    #####:  912:	      error (EXIT_FAILURE, 0, _("Invalid optimisation level %s"), arg);
+        -:  913:	    }
+        8:  914:	  else if ( (ULONG_MAX==opt_level) && errno)
+        -:  915:	    {
+    #####:  916:	      error (EXIT_FAILURE, errno,
+        -:  917:		     _("Invalid optimisation level %s"), arg);
+        -:  918:	    }
+        8:  919:	  else if (opt_level > USHRT_MAX)
+        -:  920:	    {
+        -:  921:	      /* tricky to test, as on some platforms USHORT_MAX and ULONG_MAX
+        -:  922:	       * can have the same value, though this is unusual.
+        -:  923:	       */
+    #####:  924:	      error (EXIT_FAILURE, 0,
+        -:  925:		     _("Optimisation level %lu is too high.  "
+        -:  926:		       "If you want to find files very quickly, "
+        -:  927:		       "consider using GNU locate."),
+        -:  928:		     opt_level);
+        -:  929:	    }
+        -:  930:	  else
+        -:  931:	    {
+        8:  932:	      options.optimisation_level = opt_level;
+        8:  933:	      errno = prev_errno;
+        -:  934:	    }
+        -:  935:	}
+        -:  936:    }
+        8:  937:}
+        -:  938:
+        -:  939:int
+        9:  940:process_leading_options (int argc, char *argv[])
+        -:  941:{
+        -:  942:  int i, end_of_leading_options;
+        -:  943:
+       25:  944:  for (i=1; (end_of_leading_options = i) < argc; ++i)
+        -:  945:    {
+       25:  946:      if (0 == strcmp ("-H", argv[i]))
+        -:  947:	{
+        -:  948:	  /* Meaning: dereference symbolic links on command line, but nowhere else. */
+        8:  949:	  set_follow_state (SYMLINK_DEREF_ARGSONLY);
+        -:  950:	}
+       17:  951:      else if (0 == strcmp ("-L", argv[i]))
+        -:  952:	{
+        -:  953:	  /* Meaning: dereference all symbolic links. */
+    #####:  954:	  set_follow_state (SYMLINK_ALWAYS_DEREF);
+        -:  955:	}
+       17:  956:      else if (0 == strcmp ("-P", argv[i]))
+        -:  957:	{
+        -:  958:	  /* Meaning: never dereference symbolic links (default). */
+    #####:  959:	  set_follow_state (SYMLINK_NEVER_DEREF);
+        -:  960:	}
+       17:  961:      else if (0 == strcmp ("--", argv[i]))
+        -:  962:	{
+        -:  963:	  /* -- signifies the end of options. */
+    #####:  964:	  end_of_leading_options = i+1;	/* Next time start with the next option */
+    #####:  965:	  break;
+        -:  966:	}
+       17:  967:      else if (0 == strcmp ("-D", argv[i]))
+        -:  968:	{
+    #####:  969:	  process_debug_options (argv[i+1]);
+    #####:  970:	  ++i;			/* skip the argument too. */
+        -:  971:	}
+       17:  972:      else if (0 == strncmp ("-O", argv[i], 2))
+        -:  973:	{
+        8:  974:	  process_optimisation_option (argv[i]+2);
+        -:  975:	}
+        -:  976:      else
+        -:  977:	{
+        -:  978:	  /* Hmm, must be one of
+        -:  979:	   * (a) A path name
+        -:  980:	   * (b) A predicate
+        -:  981:	   */
+        9:  982:	  end_of_leading_options = i; /* Next time start with this option */
+        9:  983:	  break;
+        -:  984:	}
+        -:  985:    }
+        9:  986:  return end_of_leading_options;
+        -:  987:}
+        -:  988:
+        -:  989:static struct timespec
+        9:  990:now(void)
+        -:  991:{
+        -:  992:  struct timespec retval;
+        -:  993:  struct timeval tv;
+        -:  994:  time_t t;
+        -:  995:
+        9:  996:  if (0 == gettimeofday (&tv, NULL))
+        -:  997:    {
+        9:  998:      retval.tv_sec  = tv.tv_sec;
+        9:  999:      retval.tv_nsec = tv.tv_usec * 1000; /* convert unit from microseconds to nanoseconds */
+        9: 1000:      return retval;
+        -: 1001:    }
+    #####: 1002:  t = time (NULL);
+    #####: 1003:  assert (t != (time_t)-1);
+    #####: 1004:  retval.tv_sec = t;
+    #####: 1005:  retval.tv_nsec = 0;
+    #####: 1006:  return retval;
+        -: 1007:}
+        -: 1008:
+        -: 1009:void
+        9: 1010:set_option_defaults (struct options *p)
+        -: 1011:{
+        9: 1012:  if (getenv ("POSIXLY_CORRECT"))
+    #####: 1013:    p->posixly_correct = true;
+        -: 1014:  else
+        9: 1015:    p->posixly_correct = false;
+        -: 1016:
+        -: 1017:  /* We call check_nofollow() before setlocale() because the numbers
+        -: 1018:   * for which we check (in the results of uname) definitiely have "."
+        -: 1019:   * as the decimal point indicator even under locales for which that
+        -: 1020:   * is not normally true.   Hence atof would do the wrong thing
+        -: 1021:   * if we call it after setlocale().
+        -: 1022:   */
+        -: 1023:#ifdef O_NOFOLLOW
+        9: 1024:  p->open_nofollow_available = check_nofollow ();
+        -: 1025:#else
+        -: 1026:  p->open_nofollow_available = false;
+        -: 1027:#endif
+        -: 1028:
+        9: 1029:  p->regex_options = RE_SYNTAX_EMACS;
+        -: 1030:
+        9: 1031:  if (isatty (0))
+        -: 1032:    {
+    #####: 1033:      p->warnings = true;
+    #####: 1034:      p->literal_control_chars = false;
+        -: 1035:    }
+        -: 1036:  else
+        -: 1037:    {
+        9: 1038:      p->warnings = false;
+        9: 1039:      p->literal_control_chars = false; /* may change */
+        -: 1040:    }
+        9: 1041:  if (p->posixly_correct)
+        -: 1042:    {
+    #####: 1043:      p->warnings = false;
+        -: 1044:    }
+        -: 1045:
+        9: 1046:  p->do_dir_first = true;
+        9: 1047:  p->explicit_depth = false;
+        9: 1048:  p->maxdepth = p->mindepth = -1;
+        -: 1049:
+        9: 1050:  p->start_time = now ();
+        9: 1051:  p->cur_day_start.tv_sec = p->start_time.tv_sec - DAYSECS;
+        9: 1052:  p->cur_day_start.tv_nsec = p->start_time.tv_nsec;
+        -: 1053:
+        9: 1054:  p->full_days = false;
+        9: 1055:  p->stay_on_filesystem = false;
+        9: 1056:  p->ignore_readdir_race = false;
+        -: 1057:
+        9: 1058:  if (p->posixly_correct)
+    #####: 1059:    p->output_block_size = 512;
+        -: 1060:  else
+        9: 1061:    p->output_block_size = 1024;
+        -: 1062:
+        9: 1063:  p->debug_options = 0uL;
+        9: 1064:  p->optimisation_level = 2;
+        -: 1065:
+        9: 1066:  if (getenv ("FIND_BLOCK_SIZE"))
+        -: 1067:    {
+    #####: 1068:      error (EXIT_FAILURE, 0,
+        -: 1069:	     _("The environment variable FIND_BLOCK_SIZE is not supported, the only thing that affects the block size is the POSIXLY_CORRECT environment variable"));
+        -: 1070:    }
+        -: 1071:
+        -: 1072:#if LEAF_OPTIMISATION
+        -: 1073:  /* The leaf optimisation is enabled. */
+        9: 1074:  p->no_leaf_check = false;
+        -: 1075:#else
+        -: 1076:  /* The leaf optimisation is disabled. */
+        -: 1077:  p->no_leaf_check = true;
+        -: 1078:#endif
+        -: 1079:
+        9: 1080:  set_follow_state (SYMLINK_NEVER_DEREF); /* The default is equivalent to -P. */
+        -: 1081:
+        9: 1082:  p->err_quoting_style = locale_quoting_style;
+        9: 1083:}
+        -: 1084:
+        -: 1085:
+        -: 1086:/* apply_predicate
+        -: 1087: *
+        -: 1088: */
+        -: 1089:bool
+      440: 1090:apply_predicate(const char *pathname, struct stat *stat_buf, struct predicate *p)
+        -: 1091:{
+      440: 1092:  ++p->perf.visits;
+        -: 1093:
+      440: 1094:  if (p->need_stat || p->need_type || p->need_inum)
+        -: 1095:    {
+        -: 1096:      /* We may need a stat here. */
+       80: 1097:      if (get_info(pathname, stat_buf, p) != 0)
+    #####: 1098:	    return false;
+        -: 1099:    }
+      440: 1100:  if ((p->pred_func)(pathname, stat_buf, p))
+        -: 1101:    {
+      248: 1102:      ++(p->perf.successes);
+      248: 1103:      return true;
+        -: 1104:    }
+        -: 1105:  else
+        -: 1106:    {
+      192: 1107:      return false;
+        -: 1108:    }
+        -: 1109:}
+        -: 1110:
+        -: 1111:
+        -: 1112:/* is_exec_in_local_dir
+        -: 1113: *
+        -: 1114: */
+        -: 1115:bool
+    #####: 1116:is_exec_in_local_dir (const PRED_FUNC pred_func)
+        -: 1117:{
+    #####: 1118:  return pred_execdir == pred_func || pred_okdir == pred_func;
+        -: 1119:}
+        -: 1120:
+        -: 1121:/* safely_quote_err_filename
+        -: 1122: *
+        -: 1123: */
+        -: 1124:const char *
+    #####: 1125:safely_quote_err_filename (int n, char const *arg)
+        -: 1126:{
+    #####: 1127:  return quotearg_n_style (n, options.err_quoting_style, arg);
+        -: 1128:}
+        -: 1129:
+        -: 1130:/* We have encountered an error which should affect the exit status.
+        -: 1131: * This is normally used to change the exit status from 0 to 1.
+        -: 1132: * However, if the exit status is already 2 for example, we don't want to
+        -: 1133: * reduce it to 1.
+        -: 1134: */
+        -: 1135:void
+    #####: 1136:error_severity (int level)
+        -: 1137:{
+    #####: 1138:  if (state.exit_status < level)
+    #####: 1139:    state.exit_status = level;
+    #####: 1140:}
+        -: 1141:
+        -: 1142:
+        -: 1143:/* report_file_err
+        -: 1144: */
+        -: 1145:static void
+    #####: 1146:report_file_err(int exitval, int errno_value,
+        -: 1147:		bool is_target_file, const char *name)
+        -: 1148:{
+        -: 1149:  /* It is important that the errno value is passed in as a function
+        -: 1150:   * argument before we call safely_quote_err_filename(), because otherwise
+        -: 1151:   * we might find that safely_quote_err_filename() changes errno.
+        -: 1152:   */
+    #####: 1153:  if (!is_target_file || !state.already_issued_stat_error_msg)
+        -: 1154:    {
+    #####: 1155:      error (exitval, errno_value, "%s", safely_quote_err_filename (0, name));
+    #####: 1156:      error_severity (1);
+        -: 1157:    }
+    #####: 1158:  if (is_target_file)
+        -: 1159:    {
+    #####: 1160:      state.already_issued_stat_error_msg = true;
+        -: 1161:    }
+    #####: 1162:}
+        -: 1163:
+        -: 1164:/* nonfatal_target_file_error
+        -: 1165: */
+        -: 1166:void
+    #####: 1167:nonfatal_target_file_error (int errno_value, const char *name)
+        -: 1168:{
+    #####: 1169:  report_file_err (0, errno_value, true, name);
+    #####: 1170:}
+        -: 1171:
+        -: 1172:/* fatal_target_file_error
+        -: 1173: *
+        -: 1174: * Report an error on a target file (i.e. a file we are searching).
+        -: 1175: * Such errors are only reported once per searched file.
+        -: 1176: *
+        -: 1177: */
+        -: 1178:void
+    #####: 1179:fatal_target_file_error(int errno_value, const char *name)
+        -: 1180:{
+    #####: 1181:  report_file_err (1, errno_value, true, name);
+        -: 1182:  /*NOTREACHED*/
+    #####: 1183:  abort ();
+        -: 1184:}
+        -: 1185:
+        -: 1186:/* nonfatal_nontarget_file_error
+        -: 1187: *
+        -: 1188: */
+        -: 1189:void
+    #####: 1190:nonfatal_nontarget_file_error (int errno_value, const char *name)
+        -: 1191:{
+    #####: 1192:  report_file_err (0, errno_value, false, name);
+    #####: 1193:}
+        -: 1194:
+        -: 1195:/* fatal_nontarget_file_error
+        -: 1196: *
+        -: 1197: */
+        -: 1198:void
+    #####: 1199:fatal_nontarget_file_error(int errno_value, const char *name)
+        -: 1200:{
+        -: 1201:  /* We're going to exit fatally, so make sure we always isssue the error
+        -: 1202:   * message, even if it will be duplicate.   Motivation: otherwise it may
+        -: 1203:   * not be clear what went wrong.
+        -: 1204:   */
+    #####: 1205:  state.already_issued_stat_error_msg = false;
+    #####: 1206:  report_file_err (1, errno_value, false, name);
+        -: 1207:  /*NOTREACHED*/
+    #####: 1208:  abort ();
+        -: 1209:}

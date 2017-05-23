@@ -1,0 +1,509 @@
+        -:    0:Source:src/timeout.c
+        -:    0:Graph:src/timeout.gcno
+        -:    0:Data:src/timeout.gcda
+        -:    0:Runs:1
+        -:    0:Programs:1
+        -:    1:/* timeout -- run a command with bounded time
+        -:    2:   Copyright (C) 2008-2013 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:
+        -:   18:/* timeout - Start a command, and kill it if the specified timeout expires
+        -:   19:
+        -:   20:   We try to behave like a shell starting a single (foreground) job,
+        -:   21:   and will kill the job if we receive the alarm signal we setup.
+        -:   22:   The exit status of the job is returned, or one of these errors:
+        -:   23:     EXIT_TIMEDOUT      124      job timed out
+        -:   24:     EXIT_CANCELED      125      internal error
+        -:   25:     EXIT_CANNOT_INVOKE 126      error executing job
+        -:   26:     EXIT_ENOENT        127      couldn't find job to exec
+        -:   27:
+        -:   28:   Caveats:
+        -:   29:     If user specifies the KILL (9) signal is to be sent on timeout,
+        -:   30:     the monitor is killed and so exits with 128+9 rather than 124.
+        -:   31:
+        -:   32:     If you start a command in the background, which reads from the tty
+        -:   33:     and so is immediately sent SIGTTIN to stop, then the timeout
+        -:   34:     process will ignore this so it can timeout the command as expected.
+        -:   35:     This can be seen with 'timeout 10 dd&' for example.
+        -:   36:     However if one brings this group to the foreground with the 'fg'
+        -:   37:     command before the timer expires, the command will remain
+        -:   38:     in the stop state as the shell doesn't send a SIGCONT
+        -:   39:     because the timeout process (group leader) is already running.
+        -:   40:     To get the command running again one can Ctrl-Z, and do fg again.
+        -:   41:     Note one can Ctrl-C the whole job when in this state.
+        -:   42:     I think this could be fixed but I'm not sure the extra
+        -:   43:     complication is justified for this scenario.
+        -:   44:
+        -:   45:   Written by Pádraig Brady.  */
+        -:   46:
+        -:   47:#include <config.h>
+        -:   48:#include <getopt.h>
+        -:   49:#include <stdio.h>
+        -:   50:#include <sys/types.h>
+        -:   51:#include <signal.h>
+        -:   52:#if HAVE_PRCTL
+        -:   53:# include <sys/prctl.h>
+        -:   54:#endif
+        -:   55:#include <sys/wait.h>
+        -:   56:
+        -:   57:#include "system.h"
+        -:   58:#include "c-strtod.h"
+        -:   59:#include "xstrtod.h"
+        -:   60:#include "sig2str.h"
+        -:   61:#include "operand2sig.h"
+        -:   62:#include "error.h"
+        -:   63:#include "quote.h"
+        -:   64:
+        -:   65:#if HAVE_SETRLIMIT
+        -:   66:/* FreeBSD 5.0 at least needs <sys/types.h> and <sys/time.h> included
+        -:   67:   before <sys/resource.h>.  Currently "system.h" includes <sys/time.h>.  */
+        -:   68:# include <sys/resource.h>
+        -:   69:#endif
+        -:   70:
+        -:   71:/* NonStop circa 2011 lacks both SA_RESTART and siginterrupt.  */
+        -:   72:#ifndef SA_RESTART
+        -:   73:# define SA_RESTART 0
+        -:   74:#endif
+        -:   75:
+        -:   76:#define PROGRAM_NAME "timeout"
+        -:   77:
+        -:   78:#define AUTHORS proper_name_utf8 ("Padraig Brady", "P\303\241draig Brady")
+        -:   79:
+        -:   80:static int timed_out;
+        -:   81:static int term_signal = SIGTERM;  /* same default as kill command.  */
+        -:   82:static int monitored_pid;
+        -:   83:static double kill_after;
+        -:   84:static bool foreground;      /* whether to use another program group.  */
+        -:   85:static bool preserve_status; /* whether to use a timeout status or not.  */
+        -:   86:
+        -:   87:/* for long options with no corresponding short option, use enum */
+        -:   88:enum
+        -:   89:{
+        -:   90:      FOREGROUND_OPTION = CHAR_MAX + 1,
+        -:   91:      PRESERVE_STATUS_OPTION
+        -:   92:};
+        -:   93:
+        -:   94:static struct option const long_options[] =
+        -:   95:{
+        -:   96:  {"kill-after", required_argument, NULL, 'k'},
+        -:   97:  {"signal", required_argument, NULL, 's'},
+        -:   98:  {"foreground", no_argument, NULL, FOREGROUND_OPTION},
+        -:   99:  {"preserve-status", no_argument, NULL, PRESERVE_STATUS_OPTION},
+        -:  100:  {GETOPT_HELP_OPTION_DECL},
+        -:  101:  {GETOPT_VERSION_OPTION_DECL},
+        -:  102:  {NULL, 0, NULL, 0}
+        -:  103:};
+        -:  104:
+        -:  105:static void
+        1:  106:unblock_signal (int sig)
+        -:  107:{
+        -:  108:  sigset_t unblock_set;
+        1:  109:  sigemptyset (&unblock_set);
+        1:  110:  sigaddset (&unblock_set, sig);
+        1:  111:  if (sigprocmask (SIG_UNBLOCK, &unblock_set, NULL) != 0)
+    #####:  112:    error (0, errno, _("warning: sigprocmask"));
+        1:  113:}
+        -:  114:
+        -:  115:/* Start the timeout after which we'll receive a SIGALRM.
+        -:  116:   Round DURATION up to the next representable value.
+        -:  117:   Treat out-of-range values as if they were maximal,
+        -:  118:   as that's more useful in practice than reporting an error.
+        -:  119:   '0' means don't timeout.  */
+        -:  120:static void
+        1:  121:settimeout (double duration)
+        -:  122:{
+        -:  123:
+        -:  124:  /* We configure timers below so that SIGALRM is sent on expiry.
+        -:  125:     Therefore ensure we don't inherit a mask blocking SIGALRM.  */
+        1:  126:  unblock_signal (SIGALRM);
+        -:  127:
+        -:  128:/* timer_settime() provides potentially nanosecond resolution.
+        -:  129:   setitimer() is more portable (to Darwin for example),
+        -:  130:   but only provides microsecond resolution and thus is
+        -:  131:   a little more awkward to use with timespecs, as well as being
+        -:  132:   deprecated by POSIX.  Instead we fallback to single second
+        -:  133:   resolution provided by alarm().  */
+        -:  134:
+        -:  135:#if HAVE_TIMER_SETTIME
+        1:  136:  struct timespec ts = dtotimespec (duration);
+        1:  137:  struct itimerspec its = { {0, 0}, ts };
+        -:  138:  timer_t timerid;
+        1:  139:  if (timer_create (CLOCK_REALTIME, NULL, &timerid) == 0)
+        -:  140:    {
+        1:  141:      if (timer_settime (timerid, 0, &its, NULL) == 0)
+        2:  142:        return;
+        -:  143:      else
+        -:  144:        {
+    #####:  145:          error (0, errno, _("warning: timer_settime"));
+    #####:  146:          timer_delete (timerid);
+        -:  147:        }
+        -:  148:    }
+    #####:  149:  else if (errno != ENOSYS)
+    #####:  150:    error (0, errno, _("warning: timer_create"));
+        -:  151:#endif
+        -:  152:
+        -:  153:  unsigned int timeint;
+    #####:  154:  if (UINT_MAX <= duration)
+    #####:  155:    timeint = UINT_MAX;
+        -:  156:  else
+        -:  157:    {
+    #####:  158:      unsigned int duration_floor = duration;
+    #####:  159:      timeint = duration_floor + (duration_floor < duration);
+        -:  160:    }
+    #####:  161:  alarm (timeint);
+        -:  162:}
+        -:  163:
+        -:  164:/* send SIG avoiding the current process.  */
+        -:  165:
+        -:  166:static int
+    #####:  167:send_sig (int where, int sig)
+        -:  168:{
+        -:  169:  /* If sending to the group, then ignore the signal,
+        -:  170:     so we don't go into a signal loop.  Note that this will ignore any of the
+        -:  171:     signals registered in install_signal_handlers(), that are sent after we
+        -:  172:     propagate the first one, which hopefully won't be an issue.  Note this
+        -:  173:     process can be implicitly multithreaded due to some timer_settime()
+        -:  174:     implementations, therefore a signal sent to the group, can be sent
+        -:  175:     multiple times to this process.  */
+    #####:  176:  if (where == 0)
+    #####:  177:    signal (sig, SIG_IGN);
+    #####:  178:  return kill (where, sig);
+        -:  179:}
+        -:  180:
+        -:  181:static void
+    #####:  182:cleanup (int sig)
+        -:  183:{
+    #####:  184:  if (sig == SIGALRM)
+        -:  185:    {
+    #####:  186:      timed_out = 1;
+    #####:  187:      sig = term_signal;
+        -:  188:    }
+    #####:  189:  if (monitored_pid)
+        -:  190:    {
+    #####:  191:      if (kill_after)
+        -:  192:        {
+        -:  193:          /* Start a new timeout after which we'll send SIGKILL.  */
+    #####:  194:          term_signal = SIGKILL;
+    #####:  195:          settimeout (kill_after);
+    #####:  196:          kill_after = 0; /* Don't let later signals reset kill alarm.  */
+        -:  197:        }
+        -:  198:
+        -:  199:      /* Send the signal directly to the monitored child,
+        -:  200:         in case it has itself become group leader,
+        -:  201:         or is not running in a separate group.  */
+    #####:  202:      send_sig (monitored_pid, sig);
+        -:  203:      /* The normal case is the job has remained in our
+        -:  204:         newly created process group, so send to all processes in that.  */
+    #####:  205:      if (!foreground)
+    #####:  206:        send_sig (0, sig);
+    #####:  207:      if (sig != SIGKILL && sig != SIGCONT)
+        -:  208:        {
+    #####:  209:          send_sig (monitored_pid, SIGCONT);
+    #####:  210:          if (!foreground)
+    #####:  211:            send_sig (0, SIGCONT);
+        -:  212:        }
+        -:  213:    }
+        -:  214:  else /* we're the child or the child is not exec'd yet.  */
+    #####:  215:    _exit (128 + sig);
+    #####:  216:}
+        -:  217:
+        -:  218:void
+    #####:  219:usage (int status)
+        -:  220:{
+    #####:  221:  if (status != EXIT_SUCCESS)
+    #####:  222:    emit_try_help ();
+        -:  223:  else
+        -:  224:    {
+    #####:  225:      printf (_("\
+        -:  226:Usage: %s [OPTION] DURATION COMMAND [ARG]...\n\
+        -:  227:  or:  %s [OPTION]\n"), program_name, program_name);
+        -:  228:
+    #####:  229:      fputs (_("\
+        -:  230:Start COMMAND, and kill it if still running after DURATION.\n\
+        -:  231:"), stdout);
+        -:  232:
+    #####:  233:      emit_mandatory_arg_note ();
+        -:  234:
+    #####:  235:      fputs (_("\
+        -:  236:      --preserve-status\n\
+        -:  237:                 exit with the same status as COMMAND, even when the\n\
+        -:  238:                 command times out\n\
+        -:  239:      --foreground\n\
+        -:  240:                 When not running timeout directly from a shell prompt,\n\
+        -:  241:                 allow COMMAND to read from the TTY and receive TTY signals.\n\
+        -:  242:                 In this mode, children of COMMAND will not be timed out.\n\
+        -:  243:  -k, --kill-after=DURATION\n\
+        -:  244:                 also send a KILL signal if COMMAND is still running\n\
+        -:  245:                 this long after the initial signal was sent.\n\
+        -:  246:  -s, --signal=SIGNAL\n\
+        -:  247:                 specify the signal to be sent on timeout.\n\
+        -:  248:                 SIGNAL may be a name like 'HUP' or a number.\n\
+        -:  249:                 See 'kill -l' for a list of signals\n"), stdout);
+        -:  250:
+    #####:  251:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  252:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+        -:  253:
+    #####:  254:      fputs (_("\n\
+        -:  255:DURATION is a floating point number with an optional suffix:\n\
+        -:  256:'s' for seconds (the default), 'm' for minutes, 'h' for hours \
+        -:  257:or 'd' for days.\n"), stdout);
+        -:  258:
+    #####:  259:      fputs (_("\n\
+        -:  260:If the command times out, and --preserve-status is not set, then exit with\n\
+        -:  261:status 124.  Otherwise, exit with the status of COMMAND.  If no signal\n\
+        -:  262:is specified, send the TERM signal upon timeout.  The TERM signal kills\n\
+        -:  263:any process that does not block or catch that signal.  It may be necessary\n\
+        -:  264:to use the KILL (9) signal, since this signal cannot be caught, in which\n\
+        -:  265:case the exit status is 128+9 rather than 124.\n"), stdout);
+    #####:  266:      emit_ancillary_info ();
+        -:  267:    }
+    #####:  268:  exit (status);
+        -:  269:}
+        -:  270:
+        -:  271:/* Given a floating point value *X, and a suffix character, SUFFIX_CHAR,
+        -:  272:   scale *X by the multiplier implied by SUFFIX_CHAR.  SUFFIX_CHAR may
+        -:  273:   be the NUL byte or 's' to denote seconds, 'm' for minutes, 'h' for
+        -:  274:   hours, or 'd' for days.  If SUFFIX_CHAR is invalid, don't modify *X
+        -:  275:   and return false.  Otherwise return true.  */
+        -:  276:
+        -:  277:static bool
+        1:  278:apply_time_suffix (double *x, char suffix_char)
+        -:  279:{
+        -:  280:  int multiplier;
+        -:  281:
+        1:  282:  switch (suffix_char)
+        -:  283:    {
+        -:  284:    case 0:
+        -:  285:    case 's':
+        1:  286:      multiplier = 1;
+        1:  287:      break;
+        -:  288:    case 'm':
+    #####:  289:      multiplier = 60;
+    #####:  290:      break;
+        -:  291:    case 'h':
+    #####:  292:      multiplier = 60 * 60;
+    #####:  293:      break;
+        -:  294:    case 'd':
+    #####:  295:      multiplier = 60 * 60 * 24;
+    #####:  296:      break;
+        -:  297:    default:
+    #####:  298:      return false;
+        -:  299:    }
+        -:  300:
+        1:  301:  *x *= multiplier;
+        -:  302:
+        1:  303:  return true;
+        -:  304:}
+        -:  305:
+        -:  306:static double
+        1:  307:parse_duration (const char* str)
+        -:  308:{
+        -:  309:  double duration;
+        -:  310:  const char *ep;
+        -:  311:
+        1:  312:  if (!xstrtod (str, &ep, &duration, c_strtod)
+        -:  313:      /* Nonnegative interval.  */
+        1:  314:      || ! (0 <= duration)
+        -:  315:      /* No extra chars after the number and an optional s,m,h,d char.  */
+        1:  316:      || (*ep && *(ep + 1))
+        -:  317:      /* Check any suffix char and update timeout based on the suffix.  */
+        1:  318:      || !apply_time_suffix (&duration, *ep))
+        -:  319:    {
+    #####:  320:      error (0, 0, _("invalid time interval %s"), quote (str));
+    #####:  321:      usage (EXIT_CANCELED);
+        -:  322:    }
+        -:  323:
+        1:  324:  return duration;
+        -:  325:}
+        -:  326:
+        -:  327:static void
+        1:  328:install_signal_handlers (int sigterm)
+        -:  329:{
+        -:  330:  struct sigaction sa;
+        1:  331:  sigemptyset (&sa.sa_mask);  /* Allow concurrent calls to handler */
+        1:  332:  sa.sa_handler = cleanup;
+        1:  333:  sa.sa_flags = SA_RESTART;   /* Restart syscalls if possible, as that's
+        -:  334:                                 more likely to work cleanly.  */
+        -:  335:
+        1:  336:  sigaction (SIGALRM, &sa, NULL); /* our timeout.  */
+        1:  337:  sigaction (SIGINT, &sa, NULL);  /* Ctrl-C at terminal for example.  */
+        1:  338:  sigaction (SIGQUIT, &sa, NULL); /* Ctrl-\ at terminal for example.  */
+        1:  339:  sigaction (SIGHUP, &sa, NULL);  /* terminal closed for example.  */
+        1:  340:  sigaction (SIGTERM, &sa, NULL); /* if we're killed, stop monitored proc.  */
+        1:  341:  sigaction (sigterm, &sa, NULL); /* user specified termination signal.  */
+        1:  342:}
+        -:  343:
+        -:  344:/* Try to disable core dumps for this process.
+        -:  345:   Return TRUE if successful, FALSE otherwise.  */
+        -:  346:static bool
+    #####:  347:disable_core_dumps (void)
+        -:  348:{
+        -:  349:#if HAVE_PRCTL && defined PR_SET_DUMPABLE
+    #####:  350:  if (prctl (PR_SET_DUMPABLE, 0) == 0)
+    #####:  351:    return true;
+        -:  352:
+        -:  353:#elif HAVE_SETRLIMIT && defined RLIMIT_CORE
+        -:  354:  /* Note this doesn't disable processing by a filter in
+        -:  355:     /proc/sys/kernel/core_pattern on Linux.  */
+        -:  356:  if (setrlimit (RLIMIT_CORE, &(struct rlimit) {0,0}) == 0)
+        -:  357:    return true;
+        -:  358:
+        -:  359:#else
+        -:  360:  return false;
+        -:  361:#endif
+        -:  362:
+    #####:  363:  error (0, errno, _("warning: disabling core dumps failed"));
+    #####:  364:  return false;
+        -:  365:}
+        -:  366:
+        -:  367:int
+        1:  368:main (int argc, char **argv)
+        -:  369:{
+        -:  370:  double timeout;
+        -:  371:  char signame[SIG2STR_MAX];
+        -:  372:  int c;
+        -:  373:
+        -:  374:  initialize_main (&argc, &argv);
+        1:  375:  set_program_name (argv[0]);
+        1:  376:  setlocale (LC_ALL, "");
+        -:  377:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  378:  textdomain (PACKAGE);
+        -:  379:
+        1:  380:  initialize_exit_failure (EXIT_CANCELED);
+        1:  381:  atexit (close_stdout);
+        -:  382:
+        1:  383:  while ((c = getopt_long (argc, argv, "+k:s:", long_options, NULL)) != -1)
+        -:  384:    {
+    #####:  385:      switch (c)
+        -:  386:        {
+        -:  387:        case 'k':
+    #####:  388:          kill_after = parse_duration (optarg);
+    #####:  389:          break;
+        -:  390:
+        -:  391:        case 's':
+    #####:  392:          term_signal = operand2sig (optarg, signame);
+    #####:  393:          if (term_signal == -1)
+    #####:  394:            usage (EXIT_CANCELED);
+    #####:  395:          break;
+        -:  396:
+        -:  397:        case FOREGROUND_OPTION:
+    #####:  398:          foreground = true;
+    #####:  399:          break;
+        -:  400:
+        -:  401:        case PRESERVE_STATUS_OPTION:
+    #####:  402:          preserve_status = true;
+    #####:  403:          break;
+        -:  404:
+    #####:  405:        case_GETOPT_HELP_CHAR;
+        -:  406:
+    #####:  407:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  408:
+        -:  409:        default:
+    #####:  410:          usage (EXIT_CANCELED);
+        -:  411:          break;
+        -:  412:        }
+        -:  413:    }
+        -:  414:
+        1:  415:  if (argc - optind < 2)
+    #####:  416:    usage (EXIT_CANCELED);
+        -:  417:
+        1:  418:  timeout = parse_duration (argv[optind++]);
+        -:  419:
+        1:  420:  argv += optind;
+        -:  421:
+        -:  422:  /* Ensure we're in our own group so all subprocesses can be killed.
+        -:  423:     Note we don't just put the child in a separate group as
+        -:  424:     then we would need to worry about foreground and background groups
+        -:  425:     and propagating signals between them.  */
+        1:  426:  if (!foreground)
+        1:  427:    setpgid (0, 0);
+        -:  428:
+        -:  429:  /* Setup handlers before fork() so that we
+        -:  430:     handle any signals caused by child, without races.  */
+        1:  431:  install_signal_handlers (term_signal);
+        1:  432:  signal (SIGTTIN, SIG_IGN);   /* Don't stop if background child needs tty.  */
+        1:  433:  signal (SIGTTOU, SIG_IGN);   /* Don't stop if background child needs tty.  */
+        1:  434:  signal (SIGCHLD, SIG_DFL);   /* Don't inherit CHLD handling from parent.   */
+        -:  435:
+        1:  436:  monitored_pid = fork ();
+        1:  437:  if (monitored_pid == -1)
+        -:  438:    {
+    #####:  439:      error (0, errno, _("fork system call failed"));
+    #####:  440:      return EXIT_CANCELED;
+        -:  441:    }
+        1:  442:  else if (monitored_pid == 0)
+        -:  443:    {                           /* child */
+        -:  444:      int exit_status;
+        -:  445:
+        -:  446:      /* exec doesn't reset SIG_IGN -> SIG_DFL.  */
+    #####:  447:      signal (SIGTTIN, SIG_DFL);
+    #####:  448:      signal (SIGTTOU, SIG_DFL);
+        -:  449:
+    #####:  450:      execvp (argv[0], argv);   /* FIXME: should we use "sh -c" ... here?  */
+        -:  451:
+        -:  452:      /* exit like sh, env, nohup, ...  */
+    #####:  453:      exit_status = (errno == ENOENT ? EXIT_ENOENT : EXIT_CANNOT_INVOKE);
+    #####:  454:      error (0, errno, _("failed to run command %s"), quote (argv[0]));
+    #####:  455:      return exit_status;
+        -:  456:    }
+        -:  457:  else
+        -:  458:    {
+        -:  459:      pid_t wait_result;
+        -:  460:      int status;
+        -:  461:
+        1:  462:      settimeout (timeout);
+        -:  463:
+        2:  464:      while ((wait_result = waitpid (monitored_pid, &status, 0)) < 0
+    #####:  465:             && errno == EINTR)
+    #####:  466:        continue;
+        -:  467:
+        1:  468:      if (wait_result < 0)
+        -:  469:        {
+        -:  470:          /* shouldn't happen.  */
+    #####:  471:          error (0, errno, _("error waiting for command"));
+    #####:  472:          status = EXIT_CANCELED;
+        -:  473:        }
+        -:  474:      else
+        -:  475:        {
+        1:  476:          if (WIFEXITED (status))
+        1:  477:            status = WEXITSTATUS (status);
+    #####:  478:          else if (WIFSIGNALED (status))
+        -:  479:            {
+    #####:  480:              int sig = WTERMSIG (status);
+    #####:  481:              if (WCOREDUMP (status))
+    #####:  482:                error (0, 0, _("the monitored command dumped core"));
+    #####:  483:              if (!timed_out && disable_core_dumps ())
+        -:  484:                {
+        -:  485:                  /* exit with the signal flag set.  */
+    #####:  486:                  signal (sig, SIG_DFL);
+    #####:  487:                  raise (sig);
+        -:  488:                }
+    #####:  489:              status = sig + 128; /* what sh returns for signaled processes.  */
+        -:  490:            }
+        -:  491:          else
+        -:  492:            {
+        -:  493:              /* shouldn't happen.  */
+    #####:  494:              error (0, 0, _("unknown status from command (0x%X)"), status);
+    #####:  495:              status = EXIT_FAILURE;
+        -:  496:            }
+        -:  497:        }
+        -:  498:
+        1:  499:      if (timed_out && !preserve_status)
+    #####:  500:        return EXIT_TIMEDOUT;
+        -:  501:      else
+        1:  502:        return status;
+        -:  503:    }
+        -:  504:}

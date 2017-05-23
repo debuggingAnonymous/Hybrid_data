@@ -1,0 +1,1090 @@
+        -:    0:Source:src/head.c
+        -:    0:Graph:src/head.gcno
+        -:    0:Data:src/head.gcda
+        -:    0:Runs:11
+        -:    0:Programs:1
+        -:    1:/* head -- output first part of file(s)
+        -:    2:   Copyright (C) 1989-2013 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Options: (see usage)
+        -:   18:   Reads from standard input if no files are given or when a filename of
+        -:   19:   ''-'' is encountered.
+        -:   20:   By default, filename headers are printed only if more than one file
+        -:   21:   is given.
+        -:   22:   By default, prints the first 10 lines (head -n 10).
+        -:   23:
+        -:   24:   David MacKenzie <djm@gnu.ai.mit.edu> */
+        -:   25:
+        -:   26:#include <config.h>
+        -:   27:
+        -:   28:#include <stdio.h>
+        -:   29:#include <getopt.h>
+        -:   30:#include <sys/types.h>
+        -:   31:
+        -:   32:#include "system.h"
+        -:   33:
+        -:   34:#include "error.h"
+        -:   35:#include "full-read.h"
+        -:   36:#include "quote.h"
+        -:   37:#include "safe-read.h"
+        -:   38:#include "xfreopen.h"
+        -:   39:#include "xstrtol.h"
+        -:   40:
+        -:   41:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   42:#define PROGRAM_NAME "head"
+        -:   43:
+        -:   44:#define AUTHORS \
+        -:   45:  proper_name ("David MacKenzie"), \
+        -:   46:  proper_name ("Jim Meyering")
+        -:   47:
+        -:   48:/* Number of lines/chars/blocks to head. */
+        -:   49:#define DEFAULT_NUMBER 10
+        -:   50:
+        -:   51:/* Useful only when eliding tail bytes or lines.
+        -:   52:   If true, skip the is-regular-file test used to determine whether
+        -:   53:   to use the lseek optimization.  Instead, use the more general (and
+        -:   54:   more expensive) code unconditionally. Intended solely for testing.  */
+        -:   55:static bool presume_input_pipe;
+        -:   56:
+        -:   57:/* If true, print filename headers. */
+        -:   58:static bool print_headers;
+        -:   59:
+        -:   60:/* When to print the filename banners. */
+        -:   61:enum header_mode
+        -:   62:{
+        -:   63:  multiple_files, always, never
+        -:   64:};
+        -:   65:
+        -:   66:/* Have we ever read standard input?  */
+        -:   67:static bool have_read_stdin;
+        -:   68:
+        -:   69:enum Copy_fd_status
+        -:   70:  {
+        -:   71:    COPY_FD_OK = 0,
+        -:   72:    COPY_FD_READ_ERROR,
+        -:   73:    COPY_FD_WRITE_ERROR,
+        -:   74:    COPY_FD_UNEXPECTED_EOF
+        -:   75:  };
+        -:   76:
+        -:   77:/* For long options that have no equivalent short option, use a
+        -:   78:   non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
+        -:   79:enum
+        -:   80:{
+        -:   81:  PRESUME_INPUT_PIPE_OPTION = CHAR_MAX + 1
+        -:   82:};
+        -:   83:
+        -:   84:static struct option const long_options[] =
+        -:   85:{
+        -:   86:  {"bytes", required_argument, NULL, 'c'},
+        -:   87:  {"lines", required_argument, NULL, 'n'},
+        -:   88:  {"-presume-input-pipe", no_argument, NULL,
+        -:   89:   PRESUME_INPUT_PIPE_OPTION}, /* do not document */
+        -:   90:  {"quiet", no_argument, NULL, 'q'},
+        -:   91:  {"silent", no_argument, NULL, 'q'},
+        -:   92:  {"verbose", no_argument, NULL, 'v'},
+        -:   93:  {GETOPT_HELP_OPTION_DECL},
+        -:   94:  {GETOPT_VERSION_OPTION_DECL},
+        -:   95:  {NULL, 0, NULL, 0}
+        -:   96:};
+        -:   97:
+        -:   98:void
+    #####:   99:usage (int status)
+        -:  100:{
+    #####:  101:  if (status != EXIT_SUCCESS)
+    #####:  102:    emit_try_help ();
+        -:  103:  else
+        -:  104:    {
+    #####:  105:      printf (_("\
+        -:  106:Usage: %s [OPTION]... [FILE]...\n\
+        -:  107:"),
+        -:  108:              program_name);
+    #####:  109:      fputs (_("\
+        -:  110:Print the first 10 lines of each FILE to standard output.\n\
+        -:  111:With more than one FILE, precede each with a header giving the file name.\n\
+        -:  112:With no FILE, or when FILE is -, read standard input.\n\
+        -:  113:"), stdout);
+        -:  114:
+    #####:  115:      emit_mandatory_arg_note ();
+        -:  116:
+    #####:  117:      fputs (_("\
+        -:  118:  -c, --bytes=[-]K         print the first K bytes of each file;\n\
+        -:  119:                             with the leading '-', print all but the last\n\
+        -:  120:                             K bytes of each file\n\
+        -:  121:  -n, --lines=[-]K         print the first K lines instead of the first 10;\n\
+        -:  122:                             with the leading '-', print all but the last\n\
+        -:  123:                             K lines of each file\n\
+        -:  124:"), stdout);
+    #####:  125:      fputs (_("\
+        -:  126:  -q, --quiet, --silent    never print headers giving file names\n\
+        -:  127:  -v, --verbose            always print headers giving file names\n\
+        -:  128:"), stdout);
+    #####:  129:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  130:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  131:      fputs (_("\
+        -:  132:\n\
+        -:  133:K may have a multiplier suffix:\n\
+        -:  134:b 512, kB 1000, K 1024, MB 1000*1000, M 1024*1024,\n\
+        -:  135:GB 1000*1000*1000, G 1024*1024*1024, and so on for T, P, E, Z, Y.\n\
+        -:  136:"), stdout);
+    #####:  137:      emit_ancillary_info ();
+        -:  138:    }
+    #####:  139:  exit (status);
+        -:  140:}
+        -:  141:
+        -:  142:static void
+    #####:  143:diagnose_copy_fd_failure (enum Copy_fd_status err, char const *filename)
+        -:  144:{
+    #####:  145:  switch (err)
+        -:  146:    {
+        -:  147:    case COPY_FD_READ_ERROR:
+    #####:  148:      error (0, errno, _("error reading %s"), quote (filename));
+    #####:  149:      break;
+        -:  150:    case COPY_FD_WRITE_ERROR:
+    #####:  151:      error (0, errno, _("error writing %s"), quote (filename));
+    #####:  152:      break;
+        -:  153:    case COPY_FD_UNEXPECTED_EOF:
+    #####:  154:      error (0, errno, _("%s: file has shrunk too much"), quote (filename));
+    #####:  155:      break;
+        -:  156:    default:
+    #####:  157:      abort ();
+        -:  158:    }
+    #####:  159:}
+        -:  160:
+        -:  161:static void
+    #####:  162:write_header (const char *filename)
+        -:  163:{
+        -:  164:  static bool first_file = true;
+        -:  165:
+    #####:  166:  printf ("%s==> %s <==\n", (first_file ? "" : "\n"), filename);
+    #####:  167:  first_file = false;
+    #####:  168:}
+        -:  169:
+        -:  170:/* Copy no more than N_BYTES from file descriptor SRC_FD to O_STREAM.
+        -:  171:   Return an appropriate indication of success or failure. */
+        -:  172:
+        -:  173:static enum Copy_fd_status
+        3:  174:copy_fd (int src_fd, FILE *o_stream, uintmax_t n_bytes)
+        -:  175:{
+        -:  176:  char buf[BUFSIZ];
+        3:  177:  const size_t buf_size = sizeof (buf);
+        -:  178:
+        -:  179:  /* Copy the file contents.  */
+       10:  180:  while (0 < n_bytes)
+        -:  181:    {
+        4:  182:      size_t n_to_read = MIN (buf_size, n_bytes);
+        4:  183:      size_t n_read = safe_read (src_fd, buf, n_to_read);
+        4:  184:      if (n_read == SAFE_READ_ERROR)
+    #####:  185:        return COPY_FD_READ_ERROR;
+        -:  186:
+        4:  187:      n_bytes -= n_read;
+        -:  188:
+        4:  189:      if (n_read == 0 && n_bytes != 0)
+    #####:  190:        return COPY_FD_UNEXPECTED_EOF;
+        -:  191:
+        4:  192:      if (fwrite (buf, 1, n_read, o_stream) < n_read)
+    #####:  193:        return COPY_FD_WRITE_ERROR;
+        -:  194:    }
+        -:  195:
+        3:  196:  return COPY_FD_OK;
+        -:  197:}
+        -:  198:
+        -:  199:/* Print all but the last N_ELIDE bytes from the input available via
+        -:  200:   the non-seekable file descriptor FD.  Return true upon success.
+        -:  201:   Give a diagnostic and return false upon error.  */
+        -:  202:static bool
+    #####:  203:elide_tail_bytes_pipe (const char *filename, int fd, uintmax_t n_elide_0)
+        -:  204:{
+    #####:  205:  size_t n_elide = n_elide_0;
+        -:  206:
+        -:  207:#ifndef HEAD_TAIL_PIPE_READ_BUFSIZE
+        -:  208:# define HEAD_TAIL_PIPE_READ_BUFSIZE BUFSIZ
+        -:  209:#endif
+        -:  210:#define READ_BUFSIZE HEAD_TAIL_PIPE_READ_BUFSIZE
+        -:  211:
+        -:  212:  /* If we're eliding no more than this many bytes, then it's ok to allocate
+        -:  213:     more memory in order to use a more time-efficient algorithm.
+        -:  214:     FIXME: use a fraction of available memory instead, as in sort.
+        -:  215:     FIXME: is this even worthwhile?  */
+        -:  216:#ifndef HEAD_TAIL_PIPE_BYTECOUNT_THRESHOLD
+        -:  217:# define HEAD_TAIL_PIPE_BYTECOUNT_THRESHOLD 1024 * 1024
+        -:  218:#endif
+        -:  219:
+        -:  220:#if HEAD_TAIL_PIPE_BYTECOUNT_THRESHOLD < 2 * READ_BUFSIZE
+        -:  221:  "HEAD_TAIL_PIPE_BYTECOUNT_THRESHOLD must be at least 2 * READ_BUFSIZE"
+        -:  222:#endif
+        -:  223:
+        -:  224:  if (SIZE_MAX < n_elide_0 + READ_BUFSIZE)
+        -:  225:    {
+        -:  226:      char umax_buf[INT_BUFSIZE_BOUND (n_elide_0)];
+        -:  227:      error (EXIT_FAILURE, 0, _("%s: number of bytes is too large"),
+        -:  228:             umaxtostr (n_elide_0, umax_buf));
+        -:  229:    }
+        -:  230:
+        -:  231:  /* Two cases to consider...
+        -:  232:     1) n_elide is small enough that we can afford to double-buffer:
+        -:  233:        allocate 2 * (READ_BUFSIZE + n_elide) bytes
+        -:  234:     2) n_elide is too big for that, so we allocate only
+        -:  235:        (READ_BUFSIZE + n_elide) bytes
+        -:  236:
+        -:  237:     FIXME: profile, to see if double-buffering is worthwhile
+        -:  238:
+        -:  239:     CAUTION: do not fail (out of memory) when asked to elide
+        -:  240:     a ridiculous amount, but when given only a small input.  */
+        -:  241:
+    #####:  242:  if (n_elide <= HEAD_TAIL_PIPE_BYTECOUNT_THRESHOLD)
+        -:  243:    {
+    #####:  244:      bool ok = true;
+    #####:  245:      bool first = true;
+    #####:  246:      bool eof = false;
+    #####:  247:      size_t n_to_read = READ_BUFSIZE + n_elide;
+        -:  248:      bool i;
+        -:  249:      char *b[2];
+    #####:  250:      b[0] = xnmalloc (2, n_to_read);
+    #####:  251:      b[1] = b[0] + n_to_read;
+        -:  252:
+    #####:  253:      for (i = false; ! eof ; i = !i)
+        -:  254:        {
+    #####:  255:          size_t n_read = full_read (fd, b[i], n_to_read);
+    #####:  256:          size_t delta = 0;
+    #####:  257:          if (n_read < n_to_read)
+        -:  258:            {
+    #####:  259:              if (errno != 0)
+        -:  260:                {
+    #####:  261:                  error (0, errno, _("error reading %s"), quote (filename));
+    #####:  262:                  ok = false;
+    #####:  263:                  break;
+        -:  264:                }
+        -:  265:
+        -:  266:              /* reached EOF */
+    #####:  267:              if (n_read <= n_elide)
+        -:  268:                {
+    #####:  269:                  if (first)
+        -:  270:                    {
+        -:  271:                      /* The input is no larger than the number of bytes
+        -:  272:                         to elide.  So there's nothing to output, and
+        -:  273:                         we're done.  */
+        -:  274:                    }
+        -:  275:                  else
+        -:  276:                    {
+    #####:  277:                      delta = n_elide - n_read;
+        -:  278:                    }
+        -:  279:                }
+    #####:  280:              eof = true;
+        -:  281:            }
+        -:  282:
+        -:  283:          /* Output any (but maybe just part of the) elided data from
+        -:  284:             the previous round.  */
+    #####:  285:          if ( ! first)
+        -:  286:            {
+        -:  287:              /* Don't bother checking for errors here.
+        -:  288:                 If there's a failure, the test of the following
+        -:  289:                 fwrite or in close_stdout will catch it.  */
+    #####:  290:              fwrite (b[!i] + READ_BUFSIZE, 1, n_elide - delta, stdout);
+        -:  291:            }
+    #####:  292:          first = false;
+        -:  293:
+    #####:  294:          if (n_elide < n_read
+    #####:  295:              && fwrite (b[i], 1, n_read - n_elide, stdout) < n_read - n_elide)
+        -:  296:            {
+    #####:  297:              error (0, errno, _("write error"));
+    #####:  298:              ok = false;
+    #####:  299:              break;
+        -:  300:            }
+        -:  301:        }
+        -:  302:
+    #####:  303:      free (b[0]);
+    #####:  304:      return ok;
+        -:  305:    }
+        -:  306:  else
+        -:  307:    {
+        -:  308:      /* Read blocks of size READ_BUFSIZE, until we've read at least n_elide
+        -:  309:         bytes.  Then, for each new buffer we read, also write an old one.  */
+        -:  310:
+    #####:  311:      bool ok = true;
+    #####:  312:      bool eof = false;
+        -:  313:      size_t n_read;
+        -:  314:      bool buffered_enough;
+        -:  315:      size_t i, i_next;
+    #####:  316:      char **b = NULL;
+        -:  317:      /* Round n_elide up to a multiple of READ_BUFSIZE.  */
+    #####:  318:      size_t rem = READ_BUFSIZE - (n_elide % READ_BUFSIZE);
+    #####:  319:      size_t n_elide_round = n_elide + rem;
+    #####:  320:      size_t n_bufs = n_elide_round / READ_BUFSIZE + 1;
+    #####:  321:      size_t n_alloc = 0;
+    #####:  322:      size_t n_array_alloc = 0;
+        -:  323:
+    #####:  324:      buffered_enough = false;
+    #####:  325:      for (i = 0, i_next = 1; !eof; i = i_next, i_next = (i_next + 1) % n_bufs)
+        -:  326:        {
+    #####:  327:          if (n_array_alloc == i)
+        -:  328:            {
+        -:  329:              /* reallocate between 16 and n_bufs entries.  */
+    #####:  330:              if (n_array_alloc == 0)
+    #####:  331:                n_array_alloc = MIN (n_bufs, 16);
+    #####:  332:              else if (n_array_alloc <= n_bufs / 2)
+    #####:  333:                n_array_alloc *= 2;
+        -:  334:              else
+    #####:  335:                n_array_alloc = n_bufs;
+    #####:  336:              b = xnrealloc (b, n_array_alloc, sizeof *b);
+        -:  337:            }
+        -:  338:
+    #####:  339:          if (! buffered_enough)
+        -:  340:            {
+    #####:  341:              b[i] = xmalloc (READ_BUFSIZE);
+    #####:  342:              n_alloc = i + 1;
+        -:  343:            }
+    #####:  344:          n_read = full_read (fd, b[i], READ_BUFSIZE);
+    #####:  345:          if (n_read < READ_BUFSIZE)
+        -:  346:            {
+    #####:  347:              if (errno != 0)
+        -:  348:                {
+    #####:  349:                  error (0, errno, _("error reading %s"), quote (filename));
+    #####:  350:                  ok = false;
+    #####:  351:                  goto free_mem;
+        -:  352:                }
+    #####:  353:              eof = true;
+        -:  354:            }
+        -:  355:
+    #####:  356:          if (i + 1 == n_bufs)
+    #####:  357:            buffered_enough = true;
+        -:  358:
+    #####:  359:          if (buffered_enough)
+        -:  360:            {
+    #####:  361:              if (fwrite (b[i_next], 1, n_read, stdout) < n_read)
+        -:  362:                {
+    #####:  363:                  error (0, errno, _("write error"));
+    #####:  364:                  ok = false;
+    #####:  365:                  goto free_mem;
+        -:  366:                }
+        -:  367:            }
+        -:  368:        }
+        -:  369:
+        -:  370:      /* Output any remainder: rem bytes from b[i] + n_read.  */
+    #####:  371:      if (rem)
+        -:  372:        {
+    #####:  373:          if (buffered_enough)
+        -:  374:            {
+    #####:  375:              size_t n_bytes_left_in_b_i = READ_BUFSIZE - n_read;
+    #####:  376:              if (rem < n_bytes_left_in_b_i)
+        -:  377:                {
+    #####:  378:                  fwrite (b[i] + n_read, 1, rem, stdout);
+        -:  379:                }
+        -:  380:              else
+        -:  381:                {
+    #####:  382:                  fwrite (b[i] + n_read, 1, n_bytes_left_in_b_i, stdout);
+    #####:  383:                  fwrite (b[i_next], 1, rem - n_bytes_left_in_b_i, stdout);
+        -:  384:                }
+        -:  385:            }
+    #####:  386:          else if (i + 1 == n_bufs)
+        -:  387:            {
+        -:  388:              /* This happens when n_elide < file_size < n_elide_round.
+        -:  389:
+        -:  390:                 |READ_BUF.|
+        -:  391:                 |                      |  rem |
+        -:  392:                 |---------!---------!---------!---------|
+        -:  393:                 |---- n_elide ---------|
+        -:  394:                 |                      | x |
+        -:  395:                 |                   |y |
+        -:  396:                 |---- file size -----------|
+        -:  397:                 |                   |n_read|
+        -:  398:                 |---- n_elide_round ----------|
+        -:  399:               */
+    #####:  400:              size_t y = READ_BUFSIZE - rem;
+    #####:  401:              size_t x = n_read - y;
+    #####:  402:              fwrite (b[i_next], 1, x, stdout);
+        -:  403:            }
+        -:  404:        }
+        -:  405:
+        -:  406:    free_mem:
+    #####:  407:      for (i = 0; i < n_alloc; i++)
+    #####:  408:        free (b[i]);
+    #####:  409:      free (b);
+        -:  410:
+    #####:  411:      return ok;
+        -:  412:    }
+        -:  413:}
+        -:  414:
+        -:  415:/* Print all but the last N_ELIDE lines from the input available
+        -:  416:   via file descriptor FD.  Return true upon success.
+        -:  417:   Give a diagnostic and return false upon error.  */
+        -:  418:
+        -:  419:/* NOTE: if the input file shrinks by more than N_ELIDE bytes between
+        -:  420:   the length determination and the actual reading, then head fails.  */
+        -:  421:
+        -:  422:static bool
+        5:  423:elide_tail_bytes_file (const char *filename, int fd, uintmax_t n_elide)
+        -:  424:{
+        -:  425:  struct stat stats;
+        -:  426:
+        5:  427:  if (presume_input_pipe || fstat (fd, &stats) || ! S_ISREG (stats.st_mode))
+        -:  428:    {
+    #####:  429:      return elide_tail_bytes_pipe (filename, fd, n_elide);
+        -:  430:    }
+        -:  431:  else
+        -:  432:    {
+        -:  433:      off_t current_pos, end_pos;
+        -:  434:      uintmax_t bytes_remaining;
+        -:  435:      off_t diff;
+        -:  436:      enum Copy_fd_status err;
+        -:  437:
+        5:  438:      if ((current_pos = lseek (fd, 0, SEEK_CUR)) == -1
+        5:  439:          || (end_pos = lseek (fd, 0, SEEK_END)) == -1)
+        -:  440:        {
+    #####:  441:          error (0, errno, _("cannot lseek %s"), quote (filename));
+    #####:  442:          return false;
+        -:  443:        }
+        -:  444:
+        -:  445:      /* Be careful here.  The current position may actually be
+        -:  446:         beyond the end of the file.  */
+        5:  447:      bytes_remaining = (diff = end_pos - current_pos) < 0 ? 0 : diff;
+        -:  448:
+        5:  449:      if (bytes_remaining <= n_elide)
+        2:  450:        return true;
+        -:  451:
+        -:  452:      /* Seek back to 'current' position, then copy the required
+        -:  453:         number of bytes from fd.  */
+        3:  454:      if (lseek (fd, 0, current_pos) == -1)
+        -:  455:        {
+    #####:  456:          error (0, errno, _("%s: cannot lseek back to original position"),
+        -:  457:                 quote (filename));
+    #####:  458:          return false;
+        -:  459:        }
+        -:  460:
+        3:  461:      err = copy_fd (fd, stdout, bytes_remaining - n_elide);
+        3:  462:      if (err == COPY_FD_OK)
+        3:  463:        return true;
+        -:  464:
+    #####:  465:      diagnose_copy_fd_failure (err, filename);
+    #####:  466:      return false;
+        -:  467:    }
+        -:  468:}
+        -:  469:
+        -:  470:/* Print all but the last N_ELIDE lines from the input stream
+        -:  471:   open for reading via file descriptor FD.
+        -:  472:   Buffer the specified number of lines as a linked list of LBUFFERs,
+        -:  473:   adding them as needed.  Return true if successful.  */
+        -:  474:
+        -:  475:static bool
+        1:  476:elide_tail_lines_pipe (const char *filename, int fd, uintmax_t n_elide)
+        -:  477:{
+        -:  478:  struct linebuffer
+        -:  479:  {
+        -:  480:    char buffer[BUFSIZ];
+        -:  481:    size_t nbytes;
+        -:  482:    size_t nlines;
+        -:  483:    struct linebuffer *next;
+        -:  484:  };
+        -:  485:  typedef struct linebuffer LBUFFER;
+        -:  486:  LBUFFER *first, *last, *tmp;
+        1:  487:  size_t total_lines = 0;	/* Total number of newlines in all buffers.  */
+        1:  488:  bool ok = true;
+        -:  489:  size_t n_read;		/* Size in bytes of most recent read */
+        -:  490:
+        1:  491:  first = last = xmalloc (sizeof (LBUFFER));
+        1:  492:  first->nbytes = first->nlines = 0;
+        1:  493:  first->next = NULL;
+        1:  494:  tmp = xmalloc (sizeof (LBUFFER));
+        -:  495:
+        -:  496:  /* Always read into a fresh buffer.
+        -:  497:     Read, (producing no output) until we've accumulated at least
+        -:  498:     n_elide newlines, or until EOF, whichever comes first.  */
+        -:  499:  while (1)
+        -:  500:    {
+        1:  501:      n_read = safe_read (fd, tmp->buffer, BUFSIZ);
+        1:  502:      if (n_read == 0 || n_read == SAFE_READ_ERROR)
+        -:  503:        break;
+    #####:  504:      tmp->nbytes = n_read;
+    #####:  505:      tmp->nlines = 0;
+    #####:  506:      tmp->next = NULL;
+        -:  507:
+        -:  508:      /* Count the number of newlines just read.  */
+        -:  509:      {
+    #####:  510:        char const *buffer_end = tmp->buffer + n_read;
+    #####:  511:        char const *p = tmp->buffer;
+    #####:  512:        while ((p = memchr (p, '\n', buffer_end - p)))
+        -:  513:          {
+    #####:  514:            ++p;
+    #####:  515:            ++tmp->nlines;
+        -:  516:          }
+        -:  517:      }
+    #####:  518:      total_lines += tmp->nlines;
+        -:  519:
+        -:  520:      /* If there is enough room in the last buffer read, just append the new
+        -:  521:         one to it.  This is because when reading from a pipe, 'n_read' can
+        -:  522:         often be very small.  */
+    #####:  523:      if (tmp->nbytes + last->nbytes < BUFSIZ)
+        -:  524:        {
+    #####:  525:          memcpy (&last->buffer[last->nbytes], tmp->buffer, tmp->nbytes);
+    #####:  526:          last->nbytes += tmp->nbytes;
+    #####:  527:          last->nlines += tmp->nlines;
+        -:  528:        }
+        -:  529:      else
+        -:  530:        {
+        -:  531:          /* If there's not enough room, link the new buffer onto the end of
+        -:  532:             the list, then either free up the oldest buffer for the next
+        -:  533:             read if that would leave enough lines, or else malloc a new one.
+        -:  534:             Some compaction mechanism is possible but probably not
+        -:  535:             worthwhile.  */
+    #####:  536:          last = last->next = tmp;
+    #####:  537:          if (n_elide < total_lines - first->nlines)
+        -:  538:            {
+    #####:  539:              fwrite (first->buffer, 1, first->nbytes, stdout);
+    #####:  540:              tmp = first;
+    #####:  541:              total_lines -= first->nlines;
+    #####:  542:              first = first->next;
+        -:  543:            }
+        -:  544:          else
+    #####:  545:            tmp = xmalloc (sizeof (LBUFFER));
+        -:  546:        }
+    #####:  547:    }
+        -:  548:
+        1:  549:  free (tmp);
+        -:  550:
+        1:  551:  if (n_read == SAFE_READ_ERROR)
+        -:  552:    {
+    #####:  553:      error (0, errno, _("error reading %s"), quote (filename));
+    #####:  554:      ok = false;
+    #####:  555:      goto free_lbuffers;
+        -:  556:    }
+        -:  557:
+        -:  558:  /* If we read any bytes at all, count the incomplete line
+        -:  559:     on files that don't end with a newline.  */
+        1:  560:  if (last->nbytes && last->buffer[last->nbytes - 1] != '\n')
+        -:  561:    {
+    #####:  562:      ++last->nlines;
+    #####:  563:      ++total_lines;
+        -:  564:    }
+        -:  565:
+        1:  566:  for (tmp = first; n_elide < total_lines - tmp->nlines; tmp = tmp->next)
+        -:  567:    {
+    #####:  568:      fwrite (tmp->buffer, 1, tmp->nbytes, stdout);
+    #####:  569:      total_lines -= tmp->nlines;
+        -:  570:    }
+        -:  571:
+        -:  572:  /* Print the first 'total_lines - n_elide' lines of tmp->buffer.  */
+        1:  573:  if (n_elide < total_lines)
+        -:  574:    {
+    #####:  575:      size_t n = total_lines - n_elide;
+    #####:  576:      char const *buffer_end = tmp->buffer + tmp->nbytes;
+    #####:  577:      char const *p = tmp->buffer;
+    #####:  578:      while (n && (p = memchr (p, '\n', buffer_end - p)))
+        -:  579:        {
+    #####:  580:          ++p;
+    #####:  581:          ++tmp->nlines;
+    #####:  582:          --n;
+        -:  583:        }
+    #####:  584:      fwrite (tmp->buffer, 1, p - tmp->buffer, stdout);
+        -:  585:    }
+        -:  586:
+        -:  587:free_lbuffers:
+        3:  588:  while (first)
+        -:  589:    {
+        1:  590:      tmp = first->next;
+        1:  591:      free (first);
+        1:  592:      first = tmp;
+        -:  593:    }
+        1:  594:  return ok;
+        -:  595:}
+        -:  596:
+        -:  597:/* Output all but the last N_LINES lines of the input stream defined by
+        -:  598:   FD, START_POS, and END_POS.
+        -:  599:   START_POS is the starting position of the read pointer for the file
+        -:  600:   associated with FD (may be nonzero).
+        -:  601:   END_POS is the file offset of EOF (one larger than offset of last byte).
+        -:  602:   Return true upon success.
+        -:  603:   Give a diagnostic and return false upon error.
+        -:  604:
+        -:  605:   NOTE: this code is very similar to that of tail.c's file_lines function.
+        -:  606:   Unfortunately, factoring out some common core looks like it'd result
+        -:  607:   in a less efficient implementation or a messy interface.  */
+        -:  608:static bool
+        4:  609:elide_tail_lines_seekable (const char *pretty_filename, int fd,
+        -:  610:                           uintmax_t n_lines,
+        -:  611:                           off_t start_pos, off_t end_pos)
+        -:  612:{
+        -:  613:  char buffer[BUFSIZ];
+        -:  614:  size_t bytes_read;
+        4:  615:  off_t pos = end_pos;
+        -:  616:
+        -:  617:  /* Set 'bytes_read' to the size of the last, probably partial, buffer;
+        -:  618:     0 < 'bytes_read' <= 'BUFSIZ'.  */
+        4:  619:  bytes_read = (pos - start_pos) % BUFSIZ;
+        4:  620:  if (bytes_read == 0)
+    #####:  621:    bytes_read = BUFSIZ;
+        -:  622:  /* Make 'pos' a multiple of 'BUFSIZ' (0 if the file is short), so that all
+        -:  623:     reads will be on block boundaries, which might increase efficiency.  */
+        4:  624:  pos -= bytes_read;
+        4:  625:  if (lseek (fd, pos, SEEK_SET) < 0)
+        -:  626:    {
+        -:  627:      char offset_buf[INT_BUFSIZE_BOUND (pos)];
+    #####:  628:      error (0, errno, _("%s: cannot seek to offset %s"),
+        -:  629:             pretty_filename, offtostr (pos, offset_buf));
+    #####:  630:      return false;
+        -:  631:    }
+        4:  632:  bytes_read = safe_read (fd, buffer, bytes_read);
+        4:  633:  if (bytes_read == SAFE_READ_ERROR)
+        -:  634:    {
+    #####:  635:      error (0, errno, _("error reading %s"), quote (pretty_filename));
+    #####:  636:      return false;
+        -:  637:    }
+        -:  638:
+        -:  639:  /* Count the incomplete line on files that don't end with a newline.  */
+        4:  640:  if (bytes_read && buffer[bytes_read - 1] != '\n')
+        2:  641:    --n_lines;
+        -:  642:
+        -:  643:  while (1)
+        -:  644:    {
+        -:  645:      /* Scan backward, counting the newlines in this bufferfull.  */
+        -:  646:
+        4:  647:      size_t n = bytes_read;
+       10:  648:      while (n)
+        -:  649:        {
+        -:  650:          char const *nl;
+        6:  651:          nl = memrchr (buffer, '\n', n);
+        6:  652:          if (nl == NULL)
+        2:  653:            break;
+        4:  654:          n = nl - buffer;
+        4:  655:          if (n_lines-- == 0)
+        -:  656:            {
+        -:  657:              /* Found it.  */
+        -:  658:              /* If necessary, restore the file pointer and copy
+        -:  659:                 input to output up to position, POS.  */
+        2:  660:              if (start_pos < pos)
+        -:  661:                {
+        -:  662:                  enum Copy_fd_status err;
+    #####:  663:                  if (lseek (fd, start_pos, SEEK_SET) < 0)
+        -:  664:                    {
+        -:  665:                      /* Failed to reposition file pointer.  */
+    #####:  666:                      error (0, errno,
+        -:  667:                         "%s: unable to restore file pointer to initial offset",
+        -:  668:                             quote (pretty_filename));
+    #####:  669:                      return false;
+        -:  670:                    }
+        -:  671:
+    #####:  672:                  err = copy_fd (fd, stdout, pos - start_pos);
+    #####:  673:                  if (err != COPY_FD_OK)
+        -:  674:                    {
+    #####:  675:                      diagnose_copy_fd_failure (err, pretty_filename);
+    #####:  676:                      return false;
+        -:  677:                    }
+        -:  678:                }
+        -:  679:
+        -:  680:              /* Output the initial portion of the buffer
+        -:  681:                 in which we found the desired newline byte.
+        -:  682:                 Don't bother testing for failure for such a small amount.
+        -:  683:                 Any failure will be detected upon close.  */
+        2:  684:              fwrite (buffer, 1, n + 1, stdout);
+        -:  685:
+        -:  686:              /* Set file pointer to the byte after what we've output.  */
+        2:  687:              if (lseek (fd, pos + n + 1, SEEK_SET) < 0)
+        -:  688:                {
+    #####:  689:                  error (0, errno, _("%s: failed to reset file pointer"),
+        -:  690:                         quote (pretty_filename));
+    #####:  691:                  return false;
+        -:  692:                }
+        2:  693:              return true;
+        -:  694:            }
+        -:  695:        }
+        -:  696:
+        -:  697:      /* Not enough newlines in that bufferfull.  */
+        2:  698:      if (pos == start_pos)
+        -:  699:        {
+        -:  700:          /* Not enough lines in the file.  */
+        2:  701:          return true;
+        -:  702:        }
+    #####:  703:      pos -= BUFSIZ;
+    #####:  704:      if (lseek (fd, pos, SEEK_SET) < 0)
+        -:  705:        {
+        -:  706:          char offset_buf[INT_BUFSIZE_BOUND (pos)];
+    #####:  707:          error (0, errno, _("%s: cannot seek to offset %s"),
+        -:  708:                 pretty_filename, offtostr (pos, offset_buf));
+    #####:  709:          return false;
+        -:  710:        }
+        -:  711:
+    #####:  712:      bytes_read = safe_read (fd, buffer, BUFSIZ);
+    #####:  713:      if (bytes_read == SAFE_READ_ERROR)
+        -:  714:        {
+    #####:  715:          error (0, errno, _("error reading %s"), quote (pretty_filename));
+    #####:  716:          return false;
+        -:  717:        }
+        -:  718:
+        -:  719:      /* FIXME: is this dead code?
+        -:  720:         Consider the test, pos == start_pos, above. */
+    #####:  721:      if (bytes_read == 0)
+    #####:  722:        return true;
+    #####:  723:    }
+        -:  724:}
+        -:  725:
+        -:  726:/* Print all but the last N_ELIDE lines from the input available
+        -:  727:   via file descriptor FD.  Return true upon success.
+        -:  728:   Give a diagnostic and return nonzero upon error.  */
+        -:  729:
+        -:  730:static bool
+        5:  731:elide_tail_lines_file (const char *filename, int fd, uintmax_t n_elide)
+        -:  732:{
+        5:  733:  if (!presume_input_pipe)
+        -:  734:    {
+        -:  735:      /* Find the offset, OFF, of the Nth newline from the end,
+        -:  736:         but not counting the last byte of the file.
+        -:  737:         If found, write from current position to OFF, inclusive.
+        -:  738:         Otherwise, just return true.  */
+        -:  739:
+        5:  740:      off_t start_pos = lseek (fd, 0, SEEK_CUR);
+        5:  741:      off_t end_pos = lseek (fd, 0, SEEK_END);
+        5:  742:      if (0 <= start_pos && start_pos < end_pos)
+        -:  743:        {
+        -:  744:          /* If the file is empty, we're done.  */
+        4:  745:          if (end_pos == 0)
+    #####:  746:            return true;
+        -:  747:
+        4:  748:          return elide_tail_lines_seekable (filename, fd, n_elide,
+        -:  749:                                            start_pos, end_pos);
+        -:  750:        }
+        -:  751:
+        -:  752:      /* lseek failed or the end offset precedes start.
+        -:  753:         Fall through.  */
+        -:  754:    }
+        -:  755:
+        1:  756:  return elide_tail_lines_pipe (filename, fd, n_elide);
+        -:  757:}
+        -:  758:
+        -:  759:static bool
+    #####:  760:head_bytes (const char *filename, int fd, uintmax_t bytes_to_write)
+        -:  761:{
+        -:  762:  char buffer[BUFSIZ];
+    #####:  763:  size_t bytes_to_read = BUFSIZ;
+        -:  764:
+    #####:  765:  while (bytes_to_write)
+        -:  766:    {
+        -:  767:      size_t bytes_read;
+    #####:  768:      if (bytes_to_write < bytes_to_read)
+    #####:  769:        bytes_to_read = bytes_to_write;
+    #####:  770:      bytes_read = safe_read (fd, buffer, bytes_to_read);
+    #####:  771:      if (bytes_read == SAFE_READ_ERROR)
+        -:  772:        {
+    #####:  773:          error (0, errno, _("error reading %s"), quote (filename));
+    #####:  774:          return false;
+        -:  775:        }
+    #####:  776:      if (bytes_read == 0)
+    #####:  777:        break;
+    #####:  778:      if (fwrite (buffer, 1, bytes_read, stdout) < bytes_read)
+    #####:  779:        error (EXIT_FAILURE, errno, _("write error"));
+    #####:  780:      bytes_to_write -= bytes_read;
+        -:  781:    }
+    #####:  782:  return true;
+        -:  783:}
+        -:  784:
+        -:  785:static bool
+    #####:  786:head_lines (const char *filename, int fd, uintmax_t lines_to_write)
+        -:  787:{
+        -:  788:  char buffer[BUFSIZ];
+        -:  789:
+    #####:  790:  while (lines_to_write)
+        -:  791:    {
+    #####:  792:      size_t bytes_read = safe_read (fd, buffer, BUFSIZ);
+    #####:  793:      size_t bytes_to_write = 0;
+        -:  794:
+    #####:  795:      if (bytes_read == SAFE_READ_ERROR)
+        -:  796:        {
+    #####:  797:          error (0, errno, _("error reading %s"), quote (filename));
+    #####:  798:          return false;
+        -:  799:        }
+    #####:  800:      if (bytes_read == 0)
+    #####:  801:        break;
+    #####:  802:      while (bytes_to_write < bytes_read)
+    #####:  803:        if (buffer[bytes_to_write++] == '\n' && --lines_to_write == 0)
+        -:  804:          {
+    #####:  805:            off_t n_bytes_past_EOL = bytes_read - bytes_to_write;
+        -:  806:            /* If we have read more data than that on the specified number
+        -:  807:               of lines, try to seek back to the position we would have
+        -:  808:               gotten to had we been reading one byte at a time.  */
+    #####:  809:            if (lseek (fd, -n_bytes_past_EOL, SEEK_CUR) < 0)
+        -:  810:              {
+    #####:  811:                int e = errno;
+        -:  812:                struct stat st;
+    #####:  813:                if (fstat (fd, &st) != 0 || S_ISREG (st.st_mode))
+    #####:  814:                  error (0, e, _("cannot reposition file pointer for %s"),
+        -:  815:                         quote (filename));
+        -:  816:              }
+    #####:  817:            break;
+        -:  818:          }
+    #####:  819:      if (fwrite (buffer, 1, bytes_to_write, stdout) < bytes_to_write)
+    #####:  820:        error (EXIT_FAILURE, errno, _("write error"));
+        -:  821:    }
+    #####:  822:  return true;
+        -:  823:}
+        -:  824:
+        -:  825:static bool
+       10:  826:head (const char *filename, int fd, uintmax_t n_units, bool count_lines,
+        -:  827:      bool elide_from_end)
+        -:  828:{
+       10:  829:  if (print_headers)
+    #####:  830:    write_header (filename);
+        -:  831:
+       10:  832:  if (elide_from_end)
+        -:  833:    {
+       10:  834:      if (count_lines)
+        -:  835:        {
+        5:  836:          return elide_tail_lines_file (filename, fd, n_units);
+        -:  837:        }
+        -:  838:      else
+        -:  839:        {
+        5:  840:          return elide_tail_bytes_file (filename, fd, n_units);
+        -:  841:        }
+        -:  842:    }
+    #####:  843:  if (count_lines)
+    #####:  844:    return head_lines (filename, fd, n_units);
+        -:  845:  else
+    #####:  846:    return head_bytes (filename, fd, n_units);
+        -:  847:}
+        -:  848:
+        -:  849:static bool
+       10:  850:head_file (const char *filename, uintmax_t n_units, bool count_lines,
+        -:  851:           bool elide_from_end)
+        -:  852:{
+        -:  853:  int fd;
+        -:  854:  bool ok;
+       10:  855:  bool is_stdin = STREQ (filename, "-");
+        -:  856:
+       10:  857:  if (is_stdin)
+        -:  858:    {
+    #####:  859:      have_read_stdin = true;
+    #####:  860:      fd = STDIN_FILENO;
+    #####:  861:      filename = _("standard input");
+        -:  862:      if (O_BINARY && ! isatty (STDIN_FILENO))
+        -:  863:        xfreopen (NULL, "rb", stdin);
+        -:  864:    }
+        -:  865:  else
+        -:  866:    {
+       10:  867:      fd = open (filename, O_RDONLY | O_BINARY);
+       10:  868:      if (fd < 0)
+        -:  869:        {
+    #####:  870:          error (0, errno, _("cannot open %s for reading"), quote (filename));
+    #####:  871:          return false;
+        -:  872:        }
+        -:  873:    }
+        -:  874:
+       10:  875:  ok = head (filename, fd, n_units, count_lines, elide_from_end);
+       10:  876:  if (!is_stdin && close (fd) != 0)
+        -:  877:    {
+    #####:  878:      error (0, errno, _("failed to close %s"), quote (filename));
+    #####:  879:      return false;
+        -:  880:    }
+       10:  881:  return ok;
+        -:  882:}
+        -:  883:
+        -:  884:/* Convert a string of decimal digits, N_STRING, with an optional suffinx
+        -:  885:   to an integral value.  Upon successful conversion,
+        -:  886:   return that value.  If it cannot be converted, give a diagnostic and exit.
+        -:  887:   COUNT_LINES indicates whether N_STRING is a number of bytes or a number
+        -:  888:   of lines.  It is used solely to give a more specific diagnostic.  */
+        -:  889:
+        -:  890:static uintmax_t
+       10:  891:string_to_integer (bool count_lines, const char *n_string)
+        -:  892:{
+        -:  893:  strtol_error s_err;
+        -:  894:  uintmax_t n;
+        -:  895:
+       10:  896:  s_err = xstrtoumax (n_string, NULL, 10, &n, "bkKmMGTPEZY0");
+        -:  897:
+       10:  898:  if (s_err == LONGINT_OVERFLOW)
+        -:  899:    {
+    #####:  900:      error (EXIT_FAILURE, 0,
+        -:  901:             _("%s: %s is so large that it is not representable"), n_string,
+        -:  902:             count_lines ? _("number of lines") : _("number of bytes"));
+        -:  903:    }
+        -:  904:
+       10:  905:  if (s_err != LONGINT_OK)
+        -:  906:    {
+    #####:  907:      error (EXIT_FAILURE, 0, "%s: %s", n_string,
+        -:  908:             (count_lines
+        -:  909:              ? _("invalid number of lines")
+        -:  910:              : _("invalid number of bytes")));
+        -:  911:    }
+        -:  912:
+       10:  913:  return n;
+        -:  914:}
+        -:  915:
+        -:  916:int
+       11:  917:main (int argc, char **argv)
+        -:  918:{
+       11:  919:  enum header_mode header_mode = multiple_files;
+       11:  920:  bool ok = true;
+        -:  921:  int c;
+        -:  922:  size_t i;
+        -:  923:
+        -:  924:  /* Number of items to print. */
+       11:  925:  uintmax_t n_units = DEFAULT_NUMBER;
+        -:  926:
+        -:  927:  /* If true, interpret the numeric argument as the number of lines.
+        -:  928:     Otherwise, interpret it as the number of bytes.  */
+       11:  929:  bool count_lines = true;
+        -:  930:
+        -:  931:  /* Elide the specified number of lines or bytes, counting from
+        -:  932:     the end of the file.  */
+       11:  933:  bool elide_from_end = false;
+        -:  934:
+        -:  935:  /* Initializer for file_list if no file-arguments
+        -:  936:     were specified on the command line.  */
+        -:  937:  static char const *const default_file_list[] = {"-", NULL};
+        -:  938:  char const *const *file_list;
+        -:  939:
+        -:  940:  initialize_main (&argc, &argv);
+       11:  941:  set_program_name (argv[0]);
+       11:  942:  setlocale (LC_ALL, "");
+        -:  943:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  944:  textdomain (PACKAGE);
+        -:  945:
+       11:  946:  atexit (close_stdout);
+        -:  947:
+       11:  948:  have_read_stdin = false;
+        -:  949:
+       11:  950:  print_headers = false;
+        -:  951:
+       11:  952:  if (1 < argc && argv[1][0] == '-' && ISDIGIT (argv[1][1]))
+        -:  953:    {
+    #####:  954:      char *a = argv[1];
+    #####:  955:      char *n_string = ++a;
+        -:  956:      char *end_n_string;
+    #####:  957:      char multiplier_char = 0;
+        -:  958:
+        -:  959:      /* Old option syntax; a dash, one or more digits, and one or
+        -:  960:         more option letters.  Move past the number. */
+    #####:  961:      do ++a;
+    #####:  962:      while (ISDIGIT (*a));
+        -:  963:
+        -:  964:      /* Pointer to the byte after the last digit.  */
+    #####:  965:      end_n_string = a;
+        -:  966:
+        -:  967:      /* Parse any appended option letters. */
+    #####:  968:      for (; *a; a++)
+        -:  969:        {
+    #####:  970:          switch (*a)
+        -:  971:            {
+        -:  972:            case 'c':
+    #####:  973:              count_lines = false;
+    #####:  974:              multiplier_char = 0;
+    #####:  975:              break;
+        -:  976:
+        -:  977:            case 'b':
+        -:  978:            case 'k':
+        -:  979:            case 'm':
+    #####:  980:              count_lines = false;
+    #####:  981:              multiplier_char = *a;
+    #####:  982:              break;
+        -:  983:
+        -:  984:            case 'l':
+    #####:  985:              count_lines = true;
+    #####:  986:              break;
+        -:  987:
+        -:  988:            case 'q':
+    #####:  989:              header_mode = never;
+    #####:  990:              break;
+        -:  991:
+        -:  992:            case 'v':
+    #####:  993:              header_mode = always;
+    #####:  994:              break;
+        -:  995:
+        -:  996:            default:
+    #####:  997:              error (0, 0, _("invalid trailing option -- %c"), *a);
+    #####:  998:              usage (EXIT_FAILURE);
+        -:  999:            }
+        -: 1000:        }
+        -: 1001:
+        -: 1002:      /* Append the multiplier character (if any) onto the end of
+        -: 1003:         the digit string.  Then add NUL byte if necessary.  */
+    #####: 1004:      *end_n_string = multiplier_char;
+    #####: 1005:      if (multiplier_char)
+    #####: 1006:        *(++end_n_string) = 0;
+        -: 1007:
+    #####: 1008:      n_units = string_to_integer (count_lines, n_string);
+        -: 1009:
+        -: 1010:      /* Make the options we just parsed invisible to getopt. */
+    #####: 1011:      argv[1] = argv[0];
+    #####: 1012:      argv++;
+    #####: 1013:      argc--;
+        -: 1014:    }
+        -: 1015:
+       32: 1016:  while ((c = getopt_long (argc, argv, "c:n:qv0123456789", long_options, NULL))
+        -: 1017:         != -1)
+        -: 1018:    {
+       11: 1019:      switch (c)
+        -: 1020:        {
+        -: 1021:        case PRESUME_INPUT_PIPE_OPTION:
+    #####: 1022:          presume_input_pipe = true;
+    #####: 1023:          break;
+        -: 1024:
+        -: 1025:        case 'c':
+        5: 1026:          count_lines = false;
+        5: 1027:          elide_from_end = (*optarg == '-');
+        5: 1028:          if (elide_from_end)
+        5: 1029:            ++optarg;
+        5: 1030:          n_units = string_to_integer (count_lines, optarg);
+        5: 1031:          break;
+        -: 1032:
+        -: 1033:        case 'n':
+        5: 1034:          count_lines = true;
+        5: 1035:          elide_from_end = (*optarg == '-');
+        5: 1036:          if (elide_from_end)
+        5: 1037:            ++optarg;
+        5: 1038:          n_units = string_to_integer (count_lines, optarg);
+        5: 1039:          break;
+        -: 1040:
+        -: 1041:        case 'q':
+    #####: 1042:          header_mode = never;
+    #####: 1043:          break;
+        -: 1044:
+        -: 1045:        case 'v':
+    #####: 1046:          header_mode = always;
+    #####: 1047:          break;
+        -: 1048:
+    #####: 1049:        case_GETOPT_HELP_CHAR;
+        -: 1050:
+        1: 1051:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -: 1052:
+        -: 1053:        default:
+    #####: 1054:          if (ISDIGIT (c))
+    #####: 1055:            error (0, 0, _("invalid trailing option -- %c"), c);
+    #####: 1056:          usage (EXIT_FAILURE);
+        -: 1057:        }
+        -: 1058:    }
+        -: 1059:
+       10: 1060:  if (header_mode == always
+       10: 1061:      || (header_mode == multiple_files && optind < argc - 1))
+    #####: 1062:    print_headers = true;
+        -: 1063:
+       10: 1064:  if ( ! count_lines && elide_from_end && OFF_T_MAX < n_units)
+        -: 1065:    {
+        -: 1066:      char umax_buf[INT_BUFSIZE_BOUND (n_units)];
+    #####: 1067:      error (EXIT_FAILURE, 0, _("%s: number of bytes is too large"),
+        -: 1068:             umaxtostr (n_units, umax_buf));
+        -: 1069:    }
+        -: 1070:
+       20: 1071:  file_list = (optind < argc
+       10: 1072:               ? (char const *const *) &argv[optind]
+       20: 1073:               : default_file_list);
+        -: 1074:
+        -: 1075:  if (O_BINARY && ! isatty (STDOUT_FILENO))
+        -: 1076:    xfreopen (NULL, "wb", stdout);
+        -: 1077:
+       20: 1078:  for (i = 0; file_list[i]; ++i)
+       10: 1079:    ok &= head_file (file_list[i], n_units, count_lines, elide_from_end);
+        -: 1080:
+       10: 1081:  if (have_read_stdin && close (STDIN_FILENO) < 0)
+    #####: 1082:    error (EXIT_FAILURE, errno, "-");
+        -: 1083:
+       10: 1084:  exit (ok ? EXIT_SUCCESS : EXIT_FAILURE);
+        -: 1085:}

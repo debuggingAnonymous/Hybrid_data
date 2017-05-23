@@ -1,0 +1,575 @@
+        -:    0:Source:src/date.c
+        -:    0:Graph:src/date.gcno
+        -:    0:Data:src/date.gcda
+        -:    0:Runs:1
+        -:    0:Programs:1
+        -:    1:/* date - print or set the system date and time
+        -:    2:   Copyright (C) 1989-2013 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   16:
+        -:   17:   David MacKenzie <djm@gnu.ai.mit.edu> */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <stdio.h>
+        -:   21:#include <getopt.h>
+        -:   22:#include <sys/types.h>
+        -:   23:#if HAVE_LANGINFO_CODESET
+        -:   24:# include <langinfo.h>
+        -:   25:#endif
+        -:   26:
+        -:   27:#include "system.h"
+        -:   28:#include "argmatch.h"
+        -:   29:#include "error.h"
+        -:   30:#include "parse-datetime.h"
+        -:   31:#include "posixtm.h"
+        -:   32:#include "quote.h"
+        -:   33:#include "stat-time.h"
+        -:   34:#include "fprintftime.h"
+        -:   35:
+        -:   36:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   37:#define PROGRAM_NAME "date"
+        -:   38:
+        -:   39:#define AUTHORS proper_name ("David MacKenzie")
+        -:   40:
+        -:   41:static bool show_date (const char *format, struct timespec when);
+        -:   42:
+        -:   43:enum Time_spec
+        -:   44:{
+        -:   45:  /* Display only the date.  */
+        -:   46:  TIME_SPEC_DATE,
+        -:   47:  /* Display date, hours, minutes, and seconds.  */
+        -:   48:  TIME_SPEC_SECONDS,
+        -:   49:  /* Similar, but display nanoseconds. */
+        -:   50:  TIME_SPEC_NS,
+        -:   51:
+        -:   52:  /* Put these last, since they aren't valid for --rfc-3339.  */
+        -:   53:
+        -:   54:  /* Display date and hour.  */
+        -:   55:  TIME_SPEC_HOURS,
+        -:   56:  /* Display date, hours, and minutes.  */
+        -:   57:  TIME_SPEC_MINUTES
+        -:   58:};
+        -:   59:
+        -:   60:static char const *const time_spec_string[] =
+        -:   61:{
+        -:   62:  /* Put "hours" and "minutes" first, since they aren't valid for
+        -:   63:     --rfc-3339.  */
+        -:   64:  "hours", "minutes",
+        -:   65:  "date", "seconds", "ns", NULL
+        -:   66:};
+        -:   67:static enum Time_spec const time_spec[] =
+        -:   68:{
+        -:   69:  TIME_SPEC_HOURS, TIME_SPEC_MINUTES,
+        -:   70:  TIME_SPEC_DATE, TIME_SPEC_SECONDS, TIME_SPEC_NS
+        -:   71:};
+        -:   72:ARGMATCH_VERIFY (time_spec_string, time_spec);
+        -:   73:
+        -:   74:/* A format suitable for Internet RFC 2822.  */
+        -:   75:static char const rfc_2822_format[] = "%a, %d %b %Y %H:%M:%S %z";
+        -:   76:
+        -:   77:/* For long options that have no equivalent short option, use a
+        -:   78:   non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
+        -:   79:enum
+        -:   80:{
+        -:   81:  RFC_3339_OPTION = CHAR_MAX + 1
+        -:   82:};
+        -:   83:
+        -:   84:static char const short_options[] = "d:f:I::r:Rs:u";
+        -:   85:
+        -:   86:static struct option const long_options[] =
+        -:   87:{
+        -:   88:  {"date", required_argument, NULL, 'd'},
+        -:   89:  {"file", required_argument, NULL, 'f'},
+        -:   90:  {"iso-8601", optional_argument, NULL, 'I'},
+        -:   91:  {"reference", required_argument, NULL, 'r'},
+        -:   92:  {"rfc-822", no_argument, NULL, 'R'},
+        -:   93:  {"rfc-2822", no_argument, NULL, 'R'},
+        -:   94:  {"rfc-3339", required_argument, NULL, RFC_3339_OPTION},
+        -:   95:  {"set", required_argument, NULL, 's'},
+        -:   96:  {"uct", no_argument, NULL, 'u'},
+        -:   97:  {"utc", no_argument, NULL, 'u'},
+        -:   98:  {"universal", no_argument, NULL, 'u'},
+        -:   99:  {GETOPT_HELP_OPTION_DECL},
+        -:  100:  {GETOPT_VERSION_OPTION_DECL},
+        -:  101:  {NULL, 0, NULL, 0}
+        -:  102:};
+        -:  103:
+        -:  104:#if LOCALTIME_CACHE
+        -:  105:# define TZSET tzset ()
+        -:  106:#else
+        -:  107:# define TZSET /* empty */
+        -:  108:#endif
+        -:  109:
+        -:  110:#ifdef _DATE_FMT
+        -:  111:# define DATE_FMT_LANGINFO() nl_langinfo (_DATE_FMT)
+        -:  112:#else
+        -:  113:# define DATE_FMT_LANGINFO() ""
+        -:  114:#endif
+        -:  115:
+        -:  116:void
+    #####:  117:usage (int status)
+        -:  118:{
+    #####:  119:  if (status != EXIT_SUCCESS)
+    #####:  120:    emit_try_help ();
+        -:  121:  else
+        -:  122:    {
+    #####:  123:      printf (_("\
+        -:  124:Usage: %s [OPTION]... [+FORMAT]\n\
+        -:  125:  or:  %s [-u|--utc|--universal] [MMDDhhmm[[CC]YY][.ss]]\n\
+        -:  126:"),
+        -:  127:              program_name, program_name);
+    #####:  128:      fputs (_("\
+        -:  129:Display the current time in the given FORMAT, or set the system date.\n\
+        -:  130:"), stdout);
+        -:  131:
+    #####:  132:      emit_mandatory_arg_note ();
+        -:  133:
+    #####:  134:      fputs (_("\
+        -:  135:  -d, --date=STRING         display time described by STRING, not 'now'\n\
+        -:  136:  -f, --file=DATEFILE       like --date once for each line of DATEFILE\n\
+        -:  137:  -I[TIMESPEC], --iso-8601[=TIMESPEC]  output date/time in ISO 8601 format.\n\
+        -:  138:                            TIMESPEC='date' for date only (the default),\n\
+        -:  139:                            'hours', 'minutes', 'seconds', or 'ns' for date\n\
+        -:  140:                            and time to the indicated precision.\n\
+        -:  141:"), stdout);
+    #####:  142:      fputs (_("\
+        -:  143:  -r, --reference=FILE      display the last modification time of FILE\n\
+        -:  144:  -R, --rfc-2822            output date and time in RFC 2822 format.\n\
+        -:  145:                            Example: Mon, 07 Aug 2006 12:34:56 -0600\n\
+        -:  146:"), stdout);
+    #####:  147:      fputs (_("\
+        -:  148:      --rfc-3339=TIMESPEC   output date and time in RFC 3339 format.\n\
+        -:  149:                            TIMESPEC='date', 'seconds', or 'ns' for\n\
+        -:  150:                            date and time to the indicated precision.\n\
+        -:  151:                            Date and time components are separated by\n\
+        -:  152:                            a single space: 2006-08-07 12:34:56-06:00\n\
+        -:  153:  -s, --set=STRING          set time described by STRING\n\
+        -:  154:  -u, --utc, --universal    print or set Coordinated Universal Time\n\
+        -:  155:"), stdout);
+    #####:  156:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  157:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  158:      fputs (_("\
+        -:  159:\n\
+        -:  160:FORMAT controls the output.  Interpreted sequences are:\n\
+        -:  161:\n\
+        -:  162:  %%   a literal %\n\
+        -:  163:  %a   locale's abbreviated weekday name (e.g., Sun)\n\
+        -:  164:"), stdout);
+    #####:  165:      fputs (_("\
+        -:  166:  %A   locale's full weekday name (e.g., Sunday)\n\
+        -:  167:  %b   locale's abbreviated month name (e.g., Jan)\n\
+        -:  168:  %B   locale's full month name (e.g., January)\n\
+        -:  169:  %c   locale's date and time (e.g., Thu Mar  3 23:05:25 2005)\n\
+        -:  170:"), stdout);
+    #####:  171:      fputs (_("\
+        -:  172:  %C   century; like %Y, except omit last two digits (e.g., 20)\n\
+        -:  173:  %d   day of month (e.g., 01)\n\
+        -:  174:  %D   date; same as %m/%d/%y\n\
+        -:  175:  %e   day of month, space padded; same as %_d\n\
+        -:  176:"), stdout);
+    #####:  177:      fputs (_("\
+        -:  178:  %F   full date; same as %Y-%m-%d\n\
+        -:  179:  %g   last two digits of year of ISO week number (see %G)\n\
+        -:  180:  %G   year of ISO week number (see %V); normally useful only with %V\n\
+        -:  181:"), stdout);
+    #####:  182:      fputs (_("\
+        -:  183:  %h   same as %b\n\
+        -:  184:  %H   hour (00..23)\n\
+        -:  185:  %I   hour (01..12)\n\
+        -:  186:  %j   day of year (001..366)\n\
+        -:  187:"), stdout);
+    #####:  188:      fputs (_("\
+        -:  189:  %k   hour, space padded ( 0..23); same as %_H\n\
+        -:  190:  %l   hour, space padded ( 1..12); same as %_I\n\
+        -:  191:  %m   month (01..12)\n\
+        -:  192:  %M   minute (00..59)\n\
+        -:  193:"), stdout);
+    #####:  194:      fputs (_("\
+        -:  195:  %n   a newline\n\
+        -:  196:  %N   nanoseconds (000000000..999999999)\n\
+        -:  197:  %p   locale's equivalent of either AM or PM; blank if not known\n\
+        -:  198:  %P   like %p, but lower case\n\
+        -:  199:  %r   locale's 12-hour clock time (e.g., 11:11:04 PM)\n\
+        -:  200:  %R   24-hour hour and minute; same as %H:%M\n\
+        -:  201:  %s   seconds since 1970-01-01 00:00:00 UTC\n\
+        -:  202:"), stdout);
+    #####:  203:      fputs (_("\
+        -:  204:  %S   second (00..60)\n\
+        -:  205:  %t   a tab\n\
+        -:  206:  %T   time; same as %H:%M:%S\n\
+        -:  207:  %u   day of week (1..7); 1 is Monday\n\
+        -:  208:"), stdout);
+    #####:  209:      fputs (_("\
+        -:  210:  %U   week number of year, with Sunday as first day of week (00..53)\n\
+        -:  211:  %V   ISO week number, with Monday as first day of week (01..53)\n\
+        -:  212:  %w   day of week (0..6); 0 is Sunday\n\
+        -:  213:  %W   week number of year, with Monday as first day of week (00..53)\n\
+        -:  214:"), stdout);
+    #####:  215:      fputs (_("\
+        -:  216:  %x   locale's date representation (e.g., 12/31/99)\n\
+        -:  217:  %X   locale's time representation (e.g., 23:13:48)\n\
+        -:  218:  %y   last two digits of year (00..99)\n\
+        -:  219:  %Y   year\n\
+        -:  220:"), stdout);
+    #####:  221:      fputs (_("\
+        -:  222:  %z   +hhmm numeric time zone (e.g., -0400)\n\
+        -:  223:  %:z  +hh:mm numeric time zone (e.g., -04:00)\n\
+        -:  224:  %::z  +hh:mm:ss numeric time zone (e.g., -04:00:00)\n\
+        -:  225:  %:::z  numeric time zone with : to necessary precision (e.g., -04, +05:30)\n\
+        -:  226:  %Z   alphabetic time zone abbreviation (e.g., EDT)\n\
+        -:  227:\n\
+        -:  228:By default, date pads numeric fields with zeroes.\n\
+        -:  229:"), stdout);
+    #####:  230:      fputs (_("\
+        -:  231:The following optional flags may follow '%':\n\
+        -:  232:\n\
+        -:  233:  -  (hyphen) do not pad the field\n\
+        -:  234:  _  (underscore) pad with spaces\n\
+        -:  235:  0  (zero) pad with zeros\n\
+        -:  236:  ^  use upper case if possible\n\
+        -:  237:  #  use opposite case if possible\n\
+        -:  238:"), stdout);
+    #####:  239:      fputs (_("\
+        -:  240:\n\
+        -:  241:After any flags comes an optional field width, as a decimal number;\n\
+        -:  242:then an optional modifier, which is either\n\
+        -:  243:E to use the locale's alternate representations if available, or\n\
+        -:  244:O to use the locale's alternate numeric symbols if available.\n\
+        -:  245:"), stdout);
+    #####:  246:      fputs (_("\
+        -:  247:\n\
+        -:  248:Examples:\n\
+        -:  249:Convert seconds since the epoch (1970-01-01 UTC) to a date\n\
+        -:  250:  $ date --date='@2147483647'\n\
+        -:  251:\n\
+        -:  252:Show the time on the west coast of the US (use tzselect(1) to find TZ)\n\
+        -:  253:  $ TZ='America/Los_Angeles' date\n\
+        -:  254:\n\
+        -:  255:Show the local time for 9AM next Friday on the west coast of the US\n\
+        -:  256:  $ date --date='TZ=\"America/Los_Angeles\" 09:00 next Fri'\n\
+        -:  257:"), stdout);
+    #####:  258:      emit_ancillary_info ();
+        -:  259:    }
+    #####:  260:  exit (status);
+        -:  261:}
+        -:  262:
+        -:  263:/* Parse each line in INPUT_FILENAME as with --date and display each
+        -:  264:   resulting time and date.  If the file cannot be opened, tell why
+        -:  265:   then exit.  Issue a diagnostic for any lines that cannot be parsed.
+        -:  266:   Return true if successful.  */
+        -:  267:
+        -:  268:static bool
+    #####:  269:batch_convert (const char *input_filename, const char *format)
+        -:  270:{
+        -:  271:  bool ok;
+        -:  272:  FILE *in_stream;
+        -:  273:  char *line;
+        -:  274:  size_t buflen;
+        -:  275:  struct timespec when;
+        -:  276:
+    #####:  277:  if (STREQ (input_filename, "-"))
+        -:  278:    {
+    #####:  279:      input_filename = _("standard input");
+    #####:  280:      in_stream = stdin;
+        -:  281:    }
+        -:  282:  else
+        -:  283:    {
+    #####:  284:      in_stream = fopen (input_filename, "r");
+    #####:  285:      if (in_stream == NULL)
+        -:  286:        {
+    #####:  287:          error (EXIT_FAILURE, errno, "%s", quote (input_filename));
+        -:  288:        }
+        -:  289:    }
+        -:  290:
+    #####:  291:  line = NULL;
+    #####:  292:  buflen = 0;
+    #####:  293:  ok = true;
+        -:  294:  while (1)
+        -:  295:    {
+    #####:  296:      ssize_t line_length = getline (&line, &buflen, in_stream);
+    #####:  297:      if (line_length < 0)
+        -:  298:        {
+        -:  299:          /* FIXME: detect/handle error here.  */
+    #####:  300:          break;
+        -:  301:        }
+        -:  302:
+    #####:  303:      if (! parse_datetime (&when, line, NULL))
+        -:  304:        {
+    #####:  305:          if (line[line_length - 1] == '\n')
+    #####:  306:            line[line_length - 1] = '\0';
+    #####:  307:          error (0, 0, _("invalid date %s"), quote (line));
+    #####:  308:          ok = false;
+        -:  309:        }
+        -:  310:      else
+        -:  311:        {
+    #####:  312:          ok &= show_date (format, when);
+        -:  313:        }
+    #####:  314:    }
+        -:  315:
+    #####:  316:  if (fclose (in_stream) == EOF)
+    #####:  317:    error (EXIT_FAILURE, errno, "%s", quote (input_filename));
+        -:  318:
+    #####:  319:  free (line);
+        -:  320:
+    #####:  321:  return ok;
+        -:  322:}
+        -:  323:
+        -:  324:int
+        1:  325:main (int argc, char **argv)
+        -:  326:{
+        -:  327:  int optc;
+        1:  328:  const char *datestr = NULL;
+        1:  329:  const char *set_datestr = NULL;
+        -:  330:  struct timespec when;
+        1:  331:  bool set_date = false;
+        1:  332:  char const *format = NULL;
+        1:  333:  char *batch_file = NULL;
+        1:  334:  char *reference = NULL;
+        -:  335:  struct stat refstats;
+        -:  336:  bool ok;
+        -:  337:  int option_specified_date;
+        -:  338:
+        -:  339:  initialize_main (&argc, &argv);
+        1:  340:  set_program_name (argv[0]);
+        1:  341:  setlocale (LC_ALL, "");
+        -:  342:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  343:  textdomain (PACKAGE);
+        -:  344:
+        1:  345:  atexit (close_stdout);
+        -:  346:
+        2:  347:  while ((optc = getopt_long (argc, argv, short_options, long_options, NULL))
+        -:  348:         != -1)
+        -:  349:    {
+    #####:  350:      char const *new_format = NULL;
+        -:  351:
+    #####:  352:      switch (optc)
+        -:  353:        {
+        -:  354:        case 'd':
+    #####:  355:          datestr = optarg;
+    #####:  356:          break;
+        -:  357:        case 'f':
+    #####:  358:          batch_file = optarg;
+    #####:  359:          break;
+        -:  360:        case RFC_3339_OPTION:
+        -:  361:          {
+        -:  362:            static char const rfc_3339_format[][32] =
+        -:  363:              {
+        -:  364:                "%Y-%m-%d",
+        -:  365:                "%Y-%m-%d %H:%M:%S%:z",
+        -:  366:                "%Y-%m-%d %H:%M:%S.%N%:z"
+        -:  367:              };
+    #####:  368:            enum Time_spec i =
+    #####:  369:              XARGMATCH ("--rfc-3339", optarg,
+        -:  370:                         time_spec_string + 2, time_spec + 2);
+    #####:  371:            new_format = rfc_3339_format[i];
+    #####:  372:            break;
+        -:  373:          }
+        -:  374:        case 'I':
+        -:  375:          {
+        -:  376:            static char const iso_8601_format[][32] =
+        -:  377:              {
+        -:  378:                "%Y-%m-%d",
+        -:  379:                "%Y-%m-%dT%H:%M:%S%z",
+        -:  380:                "%Y-%m-%dT%H:%M:%S,%N%z",
+        -:  381:                "%Y-%m-%dT%H%z",
+        -:  382:                "%Y-%m-%dT%H:%M%z"
+        -:  383:              };
+    #####:  384:            enum Time_spec i =
+        -:  385:              (optarg
+    #####:  386:               ? XARGMATCH ("--iso-8601", optarg, time_spec_string, time_spec)
+    #####:  387:               : TIME_SPEC_DATE);
+    #####:  388:            new_format = iso_8601_format[i];
+    #####:  389:            break;
+        -:  390:          }
+        -:  391:        case 'r':
+    #####:  392:          reference = optarg;
+    #####:  393:          break;
+        -:  394:        case 'R':
+    #####:  395:          new_format = rfc_2822_format;
+    #####:  396:          break;
+        -:  397:        case 's':
+    #####:  398:          set_datestr = optarg;
+    #####:  399:          set_date = true;
+    #####:  400:          break;
+        -:  401:        case 'u':
+        -:  402:          /* POSIX says that 'date -u' is equivalent to setting the TZ
+        -:  403:             environment variable, so this option should do nothing other
+        -:  404:             than setting TZ.  */
+    #####:  405:          if (putenv (bad_cast ("TZ=UTC0")) != 0)
+    #####:  406:            xalloc_die ();
+        -:  407:          TZSET;
+    #####:  408:          break;
+    #####:  409:        case_GETOPT_HELP_CHAR;
+    #####:  410:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  411:        default:
+    #####:  412:          usage (EXIT_FAILURE);
+        -:  413:        }
+        -:  414:
+    #####:  415:      if (new_format)
+        -:  416:        {
+    #####:  417:          if (format)
+    #####:  418:            error (EXIT_FAILURE, 0, _("multiple output formats specified"));
+    #####:  419:          format = new_format;
+        -:  420:        }
+        -:  421:    }
+        -:  422:
+        2:  423:  option_specified_date = ((datestr ? 1 : 0)
+        1:  424:                           + (batch_file ? 1 : 0)
+        1:  425:                           + (reference ? 1 : 0));
+        -:  426:
+        1:  427:  if (option_specified_date > 1)
+        -:  428:    {
+    #####:  429:      error (0, 0,
+        -:  430:        _("the options to specify dates for printing are mutually exclusive"));
+    #####:  431:      usage (EXIT_FAILURE);
+        -:  432:    }
+        -:  433:
+        1:  434:  if (set_date && option_specified_date)
+        -:  435:    {
+    #####:  436:      error (0, 0,
+        -:  437:          _("the options to print and set the time may not be used together"));
+    #####:  438:      usage (EXIT_FAILURE);
+        -:  439:    }
+        -:  440:
+        1:  441:  if (optind < argc)
+        -:  442:    {
+    #####:  443:      if (optind + 1 < argc)
+        -:  444:        {
+    #####:  445:          error (0, 0, _("extra operand %s"), quote (argv[optind + 1]));
+    #####:  446:          usage (EXIT_FAILURE);
+        -:  447:        }
+        -:  448:
+    #####:  449:      if (argv[optind][0] == '+')
+        -:  450:        {
+    #####:  451:          if (format)
+    #####:  452:            error (EXIT_FAILURE, 0, _("multiple output formats specified"));
+    #####:  453:          format = argv[optind++] + 1;
+        -:  454:        }
+    #####:  455:      else if (set_date || option_specified_date)
+        -:  456:        {
+    #####:  457:          error (0, 0,
+        -:  458:                 _("the argument %s lacks a leading '+';\n"
+        -:  459:                   "when using an option to specify date(s), any non-option\n"
+        -:  460:                   "argument must be a format string beginning with '+'"),
+    #####:  461:                 quote (argv[optind]));
+    #####:  462:          usage (EXIT_FAILURE);
+        -:  463:        }
+        -:  464:    }
+        -:  465:
+        1:  466:  if (!format)
+        -:  467:    {
+        1:  468:      format = DATE_FMT_LANGINFO ();
+        1:  469:      if (! *format)
+        -:  470:        {
+        -:  471:          /* Do not wrap the following literal format string with _(...).
+        -:  472:             For example, suppose LC_ALL is unset, LC_TIME=POSIX,
+        -:  473:             and LANG="ko_KR".  In that case, POSIX says that LC_TIME
+        -:  474:             determines the format and contents of date and time strings
+        -:  475:             written by date, which means "date" must generate output
+        -:  476:             using the POSIX locale; but adding _() would cause "date"
+        -:  477:             to use a Korean translation of the format.  */
+    #####:  478:          format = "%a %b %e %H:%M:%S %Z %Y";
+        -:  479:        }
+        -:  480:    }
+        -:  481:
+        1:  482:  if (batch_file != NULL)
+    #####:  483:    ok = batch_convert (batch_file, format);
+        -:  484:  else
+        -:  485:    {
+        1:  486:      bool valid_date = true;
+        1:  487:      ok = true;
+        -:  488:
+        1:  489:      if (!option_specified_date && !set_date)
+        -:  490:        {
+        2:  491:          if (optind < argc)
+        -:  492:            {
+        -:  493:              /* Prepare to set system clock to the specified date/time
+        -:  494:                 given in the POSIX-format.  */
+    #####:  495:              set_date = true;
+    #####:  496:              datestr = argv[optind];
+    #####:  497:              valid_date = posixtime (&when.tv_sec,
+        -:  498:                                      datestr,
+        -:  499:                                      (PDS_TRAILING_YEAR
+        -:  500:                                       | PDS_CENTURY | PDS_SECONDS));
+    #####:  501:              when.tv_nsec = 0; /* FIXME: posixtime should set this.  */
+        -:  502:            }
+        -:  503:          else
+        -:  504:            {
+        -:  505:              /* Prepare to print the current date/time.  */
+        1:  506:              gettime (&when);
+        -:  507:            }
+        -:  508:        }
+        -:  509:      else
+        -:  510:        {
+        -:  511:          /* (option_specified_date || set_date) */
+    #####:  512:          if (reference != NULL)
+        -:  513:            {
+    #####:  514:              if (stat (reference, &refstats) != 0)
+    #####:  515:                error (EXIT_FAILURE, errno, "%s", reference);
+    #####:  516:              when = get_stat_mtime (&refstats);
+        -:  517:            }
+        -:  518:          else
+        -:  519:            {
+    #####:  520:              if (set_datestr)
+    #####:  521:                datestr = set_datestr;
+    #####:  522:              valid_date = parse_datetime (&when, datestr, NULL);
+        -:  523:            }
+        -:  524:        }
+        -:  525:
+        1:  526:      if (! valid_date)
+    #####:  527:        error (EXIT_FAILURE, 0, _("invalid date %s"), quote (datestr));
+        -:  528:
+        1:  529:      if (set_date)
+        -:  530:        {
+        -:  531:          /* Set the system clock to the specified date, then regardless of
+        -:  532:             the success of that operation, format and print that date.  */
+    #####:  533:          if (settime (&when) != 0)
+        -:  534:            {
+    #####:  535:              error (0, errno, _("cannot set date"));
+    #####:  536:              ok = false;
+        -:  537:            }
+        -:  538:        }
+        -:  539:
+        1:  540:      ok &= show_date (format, when);
+        -:  541:    }
+        -:  542:
+        1:  543:  exit (ok ? EXIT_SUCCESS : EXIT_FAILURE);
+        -:  544:}
+        -:  545:
+        -:  546:/* Display the date and/or time in WHEN according to the format specified
+        -:  547:   in FORMAT, followed by a newline.  Return true if successful.  */
+        -:  548:
+        -:  549:static bool
+        1:  550:show_date (const char *format, struct timespec when)
+        -:  551:{
+        -:  552:  struct tm *tm;
+        -:  553:
+        1:  554:  tm = localtime (&when.tv_sec);
+        1:  555:  if (! tm)
+        -:  556:    {
+        -:  557:      char buf[INT_BUFSIZE_BOUND (intmax_t)];
+    #####:  558:      error (0, 0, _("time %s is out of range"), timetostr (when.tv_sec, buf));
+    #####:  559:      return false;
+        -:  560:    }
+        -:  561:
+        1:  562:  if (format == rfc_2822_format)
+    #####:  563:    setlocale (LC_TIME, "C");
+        1:  564:  fprintftime (stdout, format, tm, 0, when.tv_nsec);
+        1:  565:  fputc ('\n', stdout);
+        1:  566:  if (format == rfc_2822_format)
+    #####:  567:    setlocale (LC_TIME, "");
+        -:  568:
+        1:  569:  return true;
+        -:  570:}

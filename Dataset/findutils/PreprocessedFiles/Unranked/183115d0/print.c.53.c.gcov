@@ -1,0 +1,1321 @@
+        -:    0:Source:print.c
+        -:    0:Graph:print.gcno
+        -:    0:Data:print.gcda
+        -:    0:Runs:9
+        -:    0:Programs:2
+        -:    1:/* print.c -- print/printf-related code.
+        -:    2:   Copyright (C) 1990, 1991, 1992, 1993, 1994, 2000, 2001, 2003, 2004,
+        -:    3:   2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012 Free Software Foundation,
+        -:    4:   Inc.
+        -:    5:
+        -:    6:   This program is free software: you can redistribute it and/or modify
+        -:    7:   it under the terms of the GNU General Public License as published by
+        -:    8:   the Free Software Foundation, either version 3 of the License, or
+        -:    9:   (at your option) any later version.
+        -:   10:
+        -:   11:   This program is distributed in the hope that it will be useful,
+        -:   12:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   13:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   14:   GNU General Public License for more details.
+        -:   15:
+        -:   16:   You should have received a copy of the GNU General Public License
+        -:   17:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   18:*/
+        -:   19:
+        -:   20:/* We always include config.h first. */
+        -:   21:#include <config.h>
+        -:   22:
+        -:   23:/* system headers go here. */
+        -:   24:#include <assert.h>
+        -:   25:#include <ctype.h>
+        -:   26:#include <errno.h>
+        -:   27:#include <grp.h>
+        -:   28:#include <locale.h>
+        -:   29:#include <math.h>
+        -:   30:#include <pwd.h>
+        -:   31:#include <stdarg.h>
+        -:   32:#include <sys/stat.h>
+        -:   33:#include <sys/types.h>
+        -:   34:
+        -:   35:/* gnulib headers. */
+        -:   36:#include "areadlink.h"
+        -:   37:#include "dirname.h"
+        -:   38:#include "error.h"
+        -:   39:#include "filemode.h"
+        -:   40:#include "gettext.h"
+        -:   41:#include "human.h"
+        -:   42:#include "printquoted.h"
+        -:   43:#include "stat-size.h"
+        -:   44:#include "stat-time.h"
+        -:   45:#include "verify.h"
+        -:   46:#include "xalloc.h"
+        -:   47:
+        -:   48:/* find-specific headers. */
+        -:   49:#include "defs.h"
+        -:   50:#include "print.h"
+        -:   51:
+        -:   52:#if ENABLE_NLS
+        -:   53:# include <libintl.h>
+        -:   54:# define _(Text) gettext (Text)
+        -:   55:#else
+        -:   56:# define _(Text) Text
+        -:   57:#endif
+        -:   58:#ifdef gettext_noop
+        -:   59:# define N_(String) gettext_noop (String)
+        -:   60:#else
+        -:   61:/* See locate.c for explanation as to why not use (String) */
+        -:   62:# define N_(String) String
+        -:   63:#endif
+        -:   64:
+        -:   65:#if defined STDC_HEADERS
+        -:   66:# define ISDIGIT(c) isdigit ((unsigned char)c)
+        -:   67:#else
+        -:   68:# define ISDIGIT(c) (isascii ((unsigned char)c) && isdigit ((unsigned char)c))
+        -:   69:#endif
+        -:   70:#undef MAX
+        -:   71:#define MAX(a, b) ((a) > (b) ? (a) : (b))
+        -:   72:
+        -:   73:
+        -:   74:/* Create a new fprintf segment in *SEGMENT, with type KIND,
+        -:   75:   from the text in FORMAT, which has length LEN.
+        -:   76:   Return the address of the `next' pointer of the new segment. */
+        -:   77:struct segment **
+       32:   78:make_segment (struct segment **segment,
+        -:   79:	      char *format,
+        -:   80:	      int len,
+        -:   81:	      int kind,
+        -:   82:	      char format_char,
+        -:   83:	      char aux_format_char,
+        -:   84:	      struct predicate *pred)
+        -:   85:{
+       32:   86:  enum EvaluationCost mycost = NeedsNothing;
+        -:   87:  char *fmt;
+        -:   88:
+       32:   89:  assert (format_char != '{');
+       32:   90:  assert (format_char != '[');
+       32:   91:  assert (format_char != '(');
+        -:   92:
+       32:   93:  *segment = xmalloc (sizeof (struct segment));
+        -:   94:
+       32:   95:  (*segment)->segkind = kind;
+       32:   96:  (*segment)->format_char[0] = format_char;
+       32:   97:  (*segment)->format_char[1] = aux_format_char;
+       32:   98:  (*segment)->next = NULL;
+       32:   99:  (*segment)->text_len = len;
+        -:  100:
+       32:  101:  fmt = (*segment)->text = xmalloc (len + sizeof "d");
+       32:  102:  strncpy (fmt, format, len);
+       32:  103:  fmt += len;
+        -:  104:
+       32:  105:  if (kind == KIND_PLAIN     /* Plain text string, no % conversion. */
+       24:  106:      || kind == KIND_STOP)  /* Terminate argument, no newline. */
+        -:  107:    {
+        8:  108:      assert (0 == format_char);
+        8:  109:      assert (0 == aux_format_char);
+        8:  110:      *fmt = '\0';
+        8:  111:      if (mycost > pred->p_cost)
+    #####:  112:	pred->p_cost = NeedsNothing;
+        8:  113:      return &(*segment)->next;
+        -:  114:    }
+        -:  115:
+       24:  116:  assert (kind == KIND_FORMAT);
+       24:  117:  switch (format_char)
+        -:  118:    {
+        -:  119:    case '%':			/* literal % */
+    #####:  120:      *fmt++ = '%';
+    #####:  121:      break;
+        -:  122:
+        -:  123:    case 'l':			/* object of symlink */
+    #####:  124:      pred->need_stat = true;
+    #####:  125:      mycost = NeedsLinkName;
+    #####:  126:      *fmt++ = 's';
+    #####:  127:      break;
+        -:  128:
+        -:  129:    case 'y':			/* file type */
+        8:  130:      pred->need_type = true;
+        8:  131:      mycost = NeedsType;
+        8:  132:      *fmt++ = 's';
+        8:  133:      break;
+        -:  134:
+        -:  135:    case 'i':			/* inode number */
+    #####:  136:      pred->need_inum = true;
+    #####:  137:      mycost = NeedsInodeNumber;
+    #####:  138:      *fmt++ = 's';
+    #####:  139:      break;
+        -:  140:
+        -:  141:    case 'a':			/* atime in `ctime' format */
+        -:  142:    case 'A':			/* atime in user-specified strftime format */
+        -:  143:    case 'B':			/* birth time in user-specified strftime format */
+        -:  144:    case 'c':			/* ctime in `ctime' format */
+        -:  145:    case 'C':			/* ctime in user-specified strftime format */
+        -:  146:    case 'F':			/* file system type */
+        -:  147:    case 'g':			/* group name */
+        -:  148:    case 'M':			/* mode in `ls -l' format (eg., "drwxr-xr-x") */
+        -:  149:    case 's':			/* size in bytes */
+        -:  150:    case 't':			/* mtime in `ctime' format */
+        -:  151:    case 'T':			/* mtime in user-specified strftime format */
+        -:  152:    case 'u':			/* user name */
+    #####:  153:      pred->need_stat = true;
+    #####:  154:      mycost = NeedsStatInfo;
+    #####:  155:      *fmt++ = 's';
+    #####:  156:      break;
+        -:  157:
+        -:  158:    case 'S':			/* sparseness */
+    #####:  159:      pred->need_stat = true;
+    #####:  160:      mycost = NeedsStatInfo;
+    #####:  161:      *fmt++ = 'g';
+    #####:  162:      break;
+        -:  163:
+        -:  164:    case 'Y':			/* symlink pointed file type */
+        8:  165:      pred->need_stat = true;
+        8:  166:      mycost = NeedsType;	/* true for amortised effect */
+        8:  167:      *fmt++ = 's';
+        8:  168:      break;
+        -:  169:
+        -:  170:    case 'f':			/* basename of path */
+        -:  171:    case 'h':			/* leading directories part of path */
+        -:  172:    case 'p':			/* pathname */
+        -:  173:    case 'P':			/* pathname with ARGV element stripped */
+        8:  174:      *fmt++ = 's';
+        8:  175:      break;
+        -:  176:
+        -:  177:    case 'Z':			/* SELinux security context */
+    #####:  178:      mycost = NeedsAccessInfo;
+    #####:  179:      *fmt++ = 's';
+    #####:  180:      break;
+        -:  181:
+        -:  182:    case 'H':			/* ARGV element file was found under */
+    #####:  183:      *fmt++ = 's';
+    #####:  184:      break;
+        -:  185:
+        -:  186:      /* Numeric items that one might expect to honour
+        -:  187:       * #, 0, + flags but which do not.
+        -:  188:       */
+        -:  189:    case 'G':			/* GID number */
+        -:  190:    case 'U':			/* UID number */
+        -:  191:    case 'b':			/* size in 512-byte blocks (NOT birthtime in ctime fmt)*/
+        -:  192:    case 'D':                   /* Filesystem device on which the file exits */
+        -:  193:    case 'k':			/* size in 1K blocks */
+        -:  194:    case 'n':			/* number of links */
+    #####:  195:      pred->need_stat = true;
+    #####:  196:      mycost = NeedsStatInfo;
+    #####:  197:      *fmt++ = 's';
+    #####:  198:      break;
+        -:  199:
+        -:  200:      /* Numeric items that DO honour #, 0, + flags.
+        -:  201:       */
+        -:  202:    case 'd':			/* depth in search tree (0 = ARGV element) */
+    #####:  203:      *fmt++ = 'd';
+    #####:  204:      break;
+        -:  205:
+        -:  206:    case 'm':			/* mode as octal number (perms only) */
+    #####:  207:      *fmt++ = 'o';
+    #####:  208:      pred->need_stat = true;
+    #####:  209:      mycost = NeedsStatInfo;
+    #####:  210:      break;
+        -:  211:    }
+       24:  212:  *fmt = '\0';
+        -:  213:
+       24:  214:  if (mycost > pred->p_cost)
+        8:  215:    pred->p_cost = mycost;
+       24:  216:  return &(*segment)->next;
+        -:  217:}
+        -:  218:
+        -:  219:static bool
+    #####:  220:is_octal_char (char ch)
+        -:  221:{
+    #####:  222:  return ch >= '0' && ch <= '7';
+        -:  223:}
+        -:  224:
+        -:  225:static char
+    #####:  226:parse_octal_escape(const char *p, size_t *consumed)
+        -:  227:{
+        -:  228:  register int n, i;
+    #####:  229:  size_t pos = 0;
+        -:  230:
+    #####:  231:  for (i = n = 0; i < 3 && is_octal_char(p[pos]); i++, pos++)
+        -:  232:    {
+    #####:  233:      n = 8 * n + p[pos] - '0';
+        -:  234:    }
+    #####:  235:  --pos;
+    #####:  236:  *consumed = pos;
+    #####:  237:  return n;
+        -:  238:}
+        -:  239:
+        -:  240:static int
+    #####:  241:parse_escape_char(const char ch)
+        -:  242:{
+    #####:  243:  char value = 0;
+    #####:  244:  switch (ch)
+        -:  245:    {
+        -:  246:    case 'a':
+    #####:  247:      value = '\a';
+    #####:  248:      break;
+        -:  249:    case 'b':
+    #####:  250:      value = '\b';
+    #####:  251:      break;
+        -:  252:    case 'f':
+    #####:  253:      value = '\f';
+    #####:  254:      break;
+        -:  255:    case 'n':
+    #####:  256:      value = '\n';
+    #####:  257:      break;
+        -:  258:    case 'r':
+    #####:  259:      value = '\r';
+    #####:  260:      break;
+        -:  261:    case 't':
+    #####:  262:      value = '\t';
+    #####:  263:      break;
+        -:  264:    case 'v':
+    #####:  265:      value = '\v';
+    #####:  266:      break;
+        -:  267:    case '\\':
+    #####:  268:      value = '\\';
+    #####:  269:      break;
+        -:  270:    }
+    #####:  271:  return value;
+        -:  272:}
+        -:  273:
+        -:  274:
+        -:  275:static size_t
+       24:  276:get_format_flags_length(const char *p)
+        -:  277:{
+       24:  278:  size_t n = 0;
+        -:  279:  /* Scan past flags, width and precision, to verify kind. */
+       24:  280:  for (; p[++n] && strchr ("-+ #", p[n]);)
+        -:  281:    {
+        -:  282:      /* Do nothing. */
+        -:  283:    }
+       48:  284:  while (ISDIGIT (p[n]))
+    #####:  285:    n++;
+       24:  286:  if (p[n] == '.')
+    #####:  287:    for (n++; ISDIGIT (p[n]); n++)
+        -:  288:      /* Do nothing. */ ;
+       24:  289:  return n;
+        -:  290:}
+        -:  291:
+        -:  292:static size_t
+       24:  293:get_format_specifer_length(char ch)
+        -:  294:{
+       24:  295:  if (strchr ("abcdDfFgGhHiklmMnpPsStuUyYZ%", ch))
+        -:  296:    {
+       24:  297:      return 1;
+        -:  298:    }
+    #####:  299:  else if (strchr ("ABCT", ch))
+        -:  300:    {
+    #####:  301:      return 2;
+        -:  302:    }
+        -:  303:  else
+        -:  304:    {
+    #####:  305:      return 0;
+        -:  306:    }
+        -:  307:}
+        -:  308:
+        -:  309:
+        -:  310:bool
+        8:  311:insert_fprintf (struct format_val *vec,
+        -:  312:		const struct parser_table *entry,
+        -:  313:		char *format)
+        -:  314:{
+        8:  315:  char *segstart = format;
+        -:  316:  char *fmt_editpos;	   /* Current address in scanning `format'. */
+        -:  317:  struct segment **segmentp;	  /* Address of current segment. */
+        -:  318:  struct predicate *our_pred;
+        -:  319:
+        8:  320:  our_pred = insert_primary_withpred (entry, pred_fprintf, format);
+        8:  321:  our_pred->side_effects = our_pred->no_default_print = true;
+        8:  322:  our_pred->args.printf_vec = *vec;
+        8:  323:  our_pred->need_type = false;
+        8:  324:  our_pred->need_stat = false;
+        8:  325:  our_pred->p_cost    = NeedsNothing;
+        -:  326:
+        8:  327:  segmentp = &our_pred->args.printf_vec.segment;
+        8:  328:  *segmentp = NULL;
+        -:  329:
+       64:  330:  for (fmt_editpos = segstart; *fmt_editpos; fmt_editpos++)
+        -:  331:    {
+       56:  332:      if (fmt_editpos[0] == '\\' && fmt_editpos[1] == 'c')
+        -:  333:	{
+    #####:  334:	  make_segment (segmentp, segstart, fmt_editpos - segstart,
+        -:  335:			KIND_STOP, 0, 0,
+        -:  336:			our_pred);
+    #####:  337:	  if (our_pred->need_stat && (our_pred->p_cost < NeedsStatInfo))
+    #####:  338:	    our_pred->p_cost = NeedsStatInfo;
+    #####:  339:	  return true;
+        -:  340:	}
+       56:  341:      else if (*fmt_editpos == '\\')
+        -:  342:	{
+    #####:  343:	  size_t readpos = 1;
+    #####:  344:	  if (is_octal_char(fmt_editpos[readpos]))
+        -:  345:	    {
+    #####:  346:	      size_t consumed = 0;
+    #####:  347:	      *fmt_editpos = parse_octal_escape(fmt_editpos + readpos, &consumed);
+    #####:  348:	      readpos += consumed;
+        -:  349:	    }
+        -:  350:	  else
+        -:  351:	    {
+    #####:  352:	      const char val = parse_escape_char(fmt_editpos[readpos]);
+    #####:  353:	      if (val)
+        -:  354:		{
+    #####:  355:		  fmt_editpos[0] = val;
+        -:  356:		}
+        -:  357:	      else
+        -:  358:		{
+    #####:  359:		  error (0, 0, _("warning: unrecognized escape `\\%c'"),
+    #####:  360:			 fmt_editpos[readpos]);
+    #####:  361:		  fmt_editpos += readpos;
+    #####:  362:		  continue;
+        -:  363:		}
+        -:  364:	    }
+    #####:  365:	  segmentp = make_segment (segmentp,
+    #####:  366:				   segstart, fmt_editpos - segstart + 1,
+        -:  367:				   KIND_PLAIN, 0, 0,
+        -:  368:				   our_pred);
+    #####:  369:	  segstart = fmt_editpos + readpos + 1; /* Move past the escape. */
+    #####:  370:	  fmt_editpos += readpos;  /* Incremented immediately by `for'. */
+        -:  371:	}
+       56:  372:      else if (fmt_editpos[0] == '%')
+        -:  373:	{
+        -:  374:	  size_t len;
+       24:  375:	  if (fmt_editpos[1] == 0)
+        -:  376:	    {
+        -:  377:	      /* Trailing %.  We don't like those. */
+    #####:  378:	      error (EXIT_FAILURE, 0,
+        -:  379:		     _("error: %s at end of format string"), fmt_editpos);
+        -:  380:	    }
+        -:  381:
+       24:  382:	  if (fmt_editpos[1] == '%') /* %% produces just %. */
+    #####:  383:	    len = 1;
+        -:  384:	  else
+       24:  385:	    len = get_format_flags_length(fmt_editpos);
+       24:  386:	  fmt_editpos += len;
+        -:  387:
+       24:  388:	  len = get_format_specifer_length (fmt_editpos[0]);
+       24:  389:	  if (len && (fmt_editpos[len-1]))
+       24:  390:	    {
+       24:  391:	      const char fmt2 = (len == 2) ? fmt_editpos[1] : 0;
+       72:  392:	      segmentp = make_segment (segmentp, segstart,
+       24:  393:				       fmt_editpos - segstart,
+       24:  394:				       KIND_FORMAT, fmt_editpos[0], fmt2,
+        -:  395:				       our_pred);
+       24:  396:	      fmt_editpos += (len - 1);
+        -:  397:	    }
+        -:  398:	  else
+        -:  399:	    {
+    #####:  400:	      if (strchr ("{[(", fmt_editpos[0]))
+        -:  401:		{
+    #####:  402:		  error (EXIT_FAILURE, 0,
+        -:  403:			 _("error: the format directive `%%%c' is reserved for future use"),
+    #####:  404:			 (int)fmt_editpos[0]);
+        -:  405:		  /*NOTREACHED*/
+        -:  406:		}
+        -:  407:
+    #####:  408:	      if (len == 2 && !fmt_editpos[1])
+        -:  409:		{
+    #####:  410:		  error (0, 0,
+        -:  411:			 _("warning: format directive `%%%c' "
+        -:  412:			   "should be followed by another character"),
+    #####:  413:			 fmt_editpos[0]);
+        -:  414:		}
+        -:  415:	      else
+        -:  416:		{
+        -:  417:		  /* An unrecognized % escape.  Print the char after the %. */
+    #####:  418:		  error (0, 0,
+        -:  419:			 _("warning: unrecognized format directive `%%%c'"),
+    #####:  420:			 fmt_editpos[0]);
+        -:  421:		}
+    #####:  422:	      segmentp = make_segment (segmentp,
+    #####:  423:				       segstart, fmt_editpos + 1 - segstart,
+        -:  424:				       KIND_PLAIN, 0, 0,
+        -:  425:				       our_pred);
+        -:  426:	    }
+       24:  427:	  segstart = fmt_editpos + 1;
+        -:  428:	}
+        -:  429:    }
+        -:  430:
+        8:  431:  if (fmt_editpos > segstart)
+        8:  432:    make_segment (segmentp, segstart, fmt_editpos - segstart, KIND_PLAIN, 0, 0,
+        -:  433:		  our_pred);
+        8:  434:  return true;
+        -:  435:}
+        -:  436:
+        -:  437:static bool
+    #####:  438:scan_for_digit_differences (const char *p, const char *q,
+        -:  439:			    size_t *first, size_t *n)
+        -:  440:{
+    #####:  441:  bool seen = false;
+        -:  442:  size_t i;
+        -:  443:
+    #####:  444:  for (i=0; p[i] && q[i]; i++)
+        -:  445:    {
+    #####:  446:      if (p[i] != q[i])
+        -:  447:	{
+    #####:  448:	  if (!isdigit ((unsigned char)q[i]) || !isdigit ((unsigned char)q[i]))
+    #####:  449:	    return false;
+        -:  450:
+    #####:  451:	  if (!seen)
+        -:  452:	    {
+    #####:  453:	      *first = i;
+    #####:  454:	      *n = 1;
+    #####:  455:	      seen = 1;
+        -:  456:	    }
+        -:  457:	  else
+        -:  458:	    {
+    #####:  459:	      if (i-*first == *n)
+        -:  460:		{
+        -:  461:		  /* Still in the first sequence of differing digits. */
+    #####:  462:		  ++*n;
+        -:  463:		}
+        -:  464:	      else
+        -:  465:		{
+        -:  466:		  /* More than one differing contiguous character sequence. */
+    #####:  467:		  return false;
+        -:  468:		}
+        -:  469:	    }
+        -:  470:	}
+        -:  471:    }
+    #####:  472:  if (p[i] || q[i])
+        -:  473:    {
+        -:  474:      /* strings are different lengths. */
+    #####:  475:      return false;
+        -:  476:    }
+    #####:  477:  return true;
+        -:  478:}
+        -:  479:
+        -:  480:static char*
+    #####:  481:do_time_format (const char *fmt, const struct tm *p, const char *ns, size_t ns_size)
+        -:  482:{
+        -:  483:  static char *buf = NULL;
+        -:  484:  static size_t buf_size;
+    #####:  485:  char *timefmt = NULL;
+        -:  486:  struct tm altered_time;
+        -:  487:
+        -:  488:
+        -:  489:  /* If the format expands to nothing (%p in some locales, for
+        -:  490:   * example), strftime can return 0.  We actually want to distinguish
+        -:  491:   * the error case where the buffer is too short, so we just prepend
+        -:  492:   * an otherwise uninteresting character to prevent the no-output
+        -:  493:   * case.
+        -:  494:   */
+    #####:  495:  timefmt = xmalloc (strlen (fmt) + 2u);
+    #####:  496:  timefmt[0] = '_';
+    #####:  497:  memcpy (timefmt + 1, fmt, strlen (fmt) + 1);
+        -:  498:
+        -:  499:  /* altered_time is a similar time, but in which both
+        -:  500:   * digits of the seconds field are different.
+        -:  501:   */
+    #####:  502:  altered_time = *p;
+    #####:  503:  if (altered_time.tm_sec >= 11)
+    #####:  504:    altered_time.tm_sec -= 11;
+        -:  505:  else
+    #####:  506:    altered_time.tm_sec += 11;
+        -:  507:
+        -:  508:  /* If we call strftime() with buf_size=0, the program will coredump
+        -:  509:   * on Solaris, since it unconditionally writes the terminating null
+        -:  510:   * character.
+        -:  511:   */
+    #####:  512:  if (buf == NULL)
+        -:  513:    {
+    #####:  514:      buf_size = 1u;
+    #####:  515:      buf = xmalloc (buf_size);
+        -:  516:    }
+        -:  517:  while (true)
+        -:  518:    {
+        -:  519:      /* I'm not sure that Solaris will return 0 when the buffer is too small.
+        -:  520:       * Therefore we do not check for (buf_used != 0) as the termination
+        -:  521:       * condition.
+        -:  522:       */
+    #####:  523:      size_t buf_used = strftime (buf, buf_size, timefmt, p);
+    #####:  524:      if (buf_used		/* Conforming POSIX system */
+    #####:  525:	  && (buf_used < buf_size)) /* Solaris workaround */
+        -:  526:	{
+        -:  527:	  char *altbuf;
+    #####:  528:	  size_t i = 0, n = 0;
+    #####:  529:	  size_t final_len = (buf_used
+        -:  530:			      + 1u /* for \0 */
+    #####:  531:			      + ns_size);
+    #####:  532:	  buf = xrealloc (buf, final_len);
+    #####:  533:	  buf_size = final_len;
+    #####:  534:	  altbuf = xmalloc (final_len);
+    #####:  535:	  strftime (altbuf, buf_size, timefmt, &altered_time);
+        -:  536:
+        -:  537:	  /* Find the seconds digits; they should be the only changed part.
+        -:  538:	   * In theory the result of the two formatting operations could differ in
+        -:  539:	   * more than just one sequence of decimal digits (for example %X might
+        -:  540:	   * in theory return a spelled-out time like "thirty seconds past noon").
+        -:  541:	   * When that happens, we just avoid inserting the nanoseconds field.
+        -:  542:	   */
+    #####:  543:	  if (scan_for_digit_differences (buf, altbuf, &i, &n)
+    #####:  544:	      && (2==n) && !isdigit ((unsigned char)buf[i+n]))
+        -:  545:	    {
+    #####:  546:	      const size_t end_of_seconds = i + n;
+    #####:  547:	      const size_t suffix_len = buf_used-(end_of_seconds)+1;
+        -:  548:
+        -:  549:	      /* Move the tail (including the \0).  Note that this
+        -:  550:	       * is a move of an overlapping memory block, so we
+        -:  551:	       * must use memmove instead of memcpy.  Then insert
+        -:  552:	       * the nanoseconds (but not its trailing \0).
+        -:  553:	       */
+    #####:  554:	      assert (end_of_seconds + ns_size + suffix_len == final_len);
+    #####:  555:	      memmove (buf+end_of_seconds+ns_size,
+    #####:  556:		       buf+end_of_seconds,
+        -:  557:		       suffix_len);
+    #####:  558:	      memcpy (buf+i+n, ns, ns_size);
+        -:  559:	    }
+        -:  560:	  else
+        -:  561:	    {
+        -:  562:	      /* No seconds digits.  No need to insert anything. */
+        -:  563:	    }
+        -:  564:	  /* The first character of buf is the underscore, which we actually
+        -:  565:	   * don't want.
+        -:  566:	   */
+    #####:  567:	  free (timefmt);
+    #####:  568:	  free (altbuf);
+    #####:  569:	  return buf+1;
+        -:  570:	}
+        -:  571:      else
+        -:  572:	{
+    #####:  573:	  buf = x2nrealloc (buf, &buf_size, sizeof *buf);
+        -:  574:	}
+    #####:  575:    }
+        -:  576:}
+        -:  577:
+        -:  578:/* Return a static string formatting the time WHEN according to the
+        -:  579: * strftime format character KIND.
+        -:  580: *
+        -:  581: * This function contains a number of assertions.  These look like
+        -:  582: * runtime checks of the results of computations, which would be a
+        -:  583: * problem since external events should not be tested for with
+        -:  584: * "assert" (instead you should use "if").  However, they are not
+        -:  585: * really runtime checks.  The assertions actually exist to verify
+        -:  586: * that the various buffers are correctly sized.
+        -:  587: */
+        -:  588:static char *
+    #####:  589:format_date (struct timespec ts, int kind)
+        -:  590:{
+        -:  591:  /* In theory, we use an extra 10 characters for 9 digits of
+        -:  592:   * nanoseconds and 1 for the decimal point.  However, the real
+        -:  593:   * world is more complex than that.
+        -:  594:   *
+        -:  595:   * For example, some systems return junk in the tv_nsec part of
+        -:  596:   * st_birthtime.  An example of this is the NetBSD-4.0-RELENG kernel
+        -:  597:   * (at Sat Mar 24 18:46:46 2007) running a NetBSD-3.1-RELEASE
+        -:  598:   * runtime and examining files on an msdos filesytem.  So for that
+        -:  599:   * reason we set NS_BUF_LEN to 32, which is simply "long enough" as
+        -:  600:   * opposed to "exactly the right size".  Note that the behaviour of
+        -:  601:   * NetBSD appears to be a result of the use of uninitialised data,
+        -:  602:   * as it's not 100% reproducible (more like 25%).
+        -:  603:   */
+        -:  604:  enum {
+        -:  605:    NS_BUF_LEN = 32,
+        -:  606:    DATE_LEN_PERCENT_APLUS=21	/* length of result of %A+ (it's longer than %c)*/
+        -:  607:  };
+        -:  608:  static char buf[128u+10u + MAX(DATE_LEN_PERCENT_APLUS,
+        -:  609:			    MAX (LONGEST_HUMAN_READABLE + 2, NS_BUF_LEN+64+200))];
+        -:  610:  char ns_buf[NS_BUF_LEN]; /* -.9999999990 (- sign can happen!)*/
+        -:  611:  int  charsprinted, need_ns_suffix;
+        -:  612:  struct tm *tm;
+        -:  613:  char fmt[6];
+        -:  614:
+        -:  615:  /* human_readable() assumes we pass a buffer which is at least as
+        -:  616:   * long as LONGEST_HUMAN_READABLE.  We use an assertion here to
+        -:  617:   * ensure that no nasty unsigned overflow happened in our calculation
+        -:  618:   * of the size of buf.  Do the assertion here rather than in the
+        -:  619:   * code for %@ so that we find the problem quickly if it exists.  If
+        -:  620:   * you want to submit a patch to move this into the if statement, go
+        -:  621:   * ahead, I'll apply it.  But include performance timings
+        -:  622:   * demonstrating that the performance difference is actually
+        -:  623:   * measurable.
+        -:  624:   */
+        -:  625:  verify (sizeof (buf) >= LONGEST_HUMAN_READABLE);
+        -:  626:
+    #####:  627:  charsprinted = 0;
+    #####:  628:  need_ns_suffix = 0;
+        -:  629:
+        -:  630:  /* Format the main part of the time. */
+    #####:  631:  if (kind == '+')
+        -:  632:    {
+    #####:  633:      strcpy (fmt, "%F+%T");
+    #####:  634:      need_ns_suffix = 1;
+        -:  635:    }
+        -:  636:  else
+        -:  637:    {
+    #####:  638:      fmt[0] = '%';
+    #####:  639:      fmt[1] = kind;
+    #####:  640:      fmt[2] = '\0';
+        -:  641:
+        -:  642:      /* %a, %c, and %t are handled in ctime_format() */
+    #####:  643:      switch (kind)
+        -:  644:	{
+        -:  645:	case 'S':
+        -:  646:	case 'T':
+        -:  647:	case 'X':
+        -:  648:	case '@':
+    #####:  649:	  need_ns_suffix = 1;
+    #####:  650:	  break;
+        -:  651:	default:
+    #####:  652:	  need_ns_suffix = 0;
+    #####:  653:	  break;
+        -:  654:	}
+        -:  655:    }
+        -:  656:
+    #####:  657:  if (need_ns_suffix)
+        -:  658:    {
+        -:  659:      /* Format the nanoseconds part.  Leave a trailing zero to
+        -:  660:       * discourage people from writing scripts which extract the
+        -:  661:       * fractional part of the timestamp by using column offsets.
+        -:  662:       * The reason for discouraging this is that in the future, the
+        -:  663:       * granularity may not be nanoseconds.
+        -:  664:       */
+    #####:  665:      charsprinted = snprintf (ns_buf, NS_BUF_LEN, ".%09ld0", (long int)ts.tv_nsec);
+    #####:  666:      assert (charsprinted < NS_BUF_LEN);
+        -:  667:    }
+        -:  668:  else
+        -:  669:    {
+    #####:  670:      charsprinted = 0;
+    #####:  671:      ns_buf[0] = 0;
+        -:  672:    }
+        -:  673:
+    #####:  674:  if (kind != '@')
+        -:  675:    {
+    #####:  676:      tm = localtime (&ts.tv_sec);
+    #####:  677:      if (tm)
+        -:  678:	{
+    #####:  679:	  char *s = do_time_format (fmt, tm, ns_buf, charsprinted);
+    #####:  680:	  if (s)
+    #####:  681:	    return s;
+        -:  682:	}
+        -:  683:    }
+        -:  684:
+        -:  685:  /* If we get to here, either the format was %@, or we have fallen back to it
+        -:  686:   * because strftime failed.
+        -:  687:   */
+        -:  688:  if (1)
+        -:  689:    {
+    #####:  690:      uintmax_t w = ts.tv_sec;
+        -:  691:      size_t used, len, remaining;
+        -:  692:
+        -:  693:      /* XXX: note that we are negating an unsigned type which is the
+        -:  694:       * widest possible unsigned type.
+        -:  695:       */
+    #####:  696:      char *p = human_readable (ts.tv_sec < 0 ? -w : w, buf + 1,
+        -:  697:				human_ceiling, 1, 1);
+    #####:  698:      assert (p > buf);
+    #####:  699:      assert (p < (buf + (sizeof buf)));
+    #####:  700:      if (ts.tv_sec < 0)
+    #####:  701:	*--p = '-'; /* XXX: Ugh, relying on internal details of human_readable(). */
+        -:  702:
+        -:  703:      /* Add the nanoseconds part.  Because we cannot enforce a
+        -:  704:       * particlar implementation of human_readable, we cannot assume
+        -:  705:       * any particular value for (p-buf).  So we need to be careful
+        -:  706:       * that there is enough space remaining in the buffer.
+        -:  707:       */
+    #####:  708:      if (need_ns_suffix)
+        -:  709:	{
+    #####:  710:	  len = strlen (p);
+    #####:  711:	  used = (p-buf) + len;	/* Offset into buf of current end */
+    #####:  712:	  assert (sizeof buf > used); /* Ensure we can perform subtraction safely. */
+    #####:  713:	  remaining = sizeof buf - used - 1u; /* allow space for NUL */
+        -:  714:
+    #####:  715:	  if (strlen (ns_buf) >= remaining)
+        -:  716:	    {
+    #####:  717:	      error (0, 0,
+        -:  718:		     "charsprinted=%ld but remaining=%lu: ns_buf=%s",
+        -:  719:		     (long)charsprinted, (unsigned long)remaining, ns_buf);
+        -:  720:	    }
+    #####:  721:	  assert (strlen (ns_buf) < remaining);
+    #####:  722:	  strcat (p, ns_buf);
+        -:  723:	}
+    #####:  724:      return p;
+        -:  725:    }
+        -:  726:}
+        -:  727:
+        -:  728:static const char *weekdays[] =
+        -:  729:  {
+        -:  730:    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+        -:  731:  };
+        -:  732:static const char * months[] =
+        -:  733:  {
+        -:  734:    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        -:  735:    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+        -:  736:  };
+        -:  737:
+        -:  738:
+        -:  739:static char *
+    #####:  740:ctime_format (struct timespec ts)
+        -:  741:{
+        -:  742:  const struct tm * ptm;
+        -:  743:#define TIME_BUF_LEN 1024
+        -:  744:  static char resultbuf[TIME_BUF_LEN];
+        -:  745:  int nout;
+        -:  746:
+    #####:  747:  ptm = localtime (&ts.tv_sec);
+    #####:  748:  if (ptm)
+        -:  749:    {
+    #####:  750:      assert (ptm->tm_wday >=  0);
+    #####:  751:      assert (ptm->tm_wday <   7);
+    #####:  752:      assert (ptm->tm_mon  >=  0);
+    #####:  753:      assert (ptm->tm_mon  <  12);
+    #####:  754:      assert (ptm->tm_hour >=  0);
+    #####:  755:      assert (ptm->tm_hour <  24);
+    #####:  756:      assert (ptm->tm_min  <  60);
+    #####:  757:      assert (ptm->tm_sec  <= 61); /* allows 2 leap seconds. */
+        -:  758:
+        -:  759:      /* wkday mon mday hh:mm:ss.nnnnnnnnn yyyy */
+    #####:  760:      nout = snprintf (resultbuf, TIME_BUF_LEN,
+        -:  761:		       "%3s %3s %2d %02d:%02d:%02d.%010ld %04d",
+    #####:  762:		       weekdays[ptm->tm_wday],
+    #####:  763:		       months[ptm->tm_mon],
+        -:  764:		       ptm->tm_mday,
+        -:  765:		       ptm->tm_hour,
+        -:  766:		       ptm->tm_min,
+        -:  767:		       ptm->tm_sec,
+        -:  768:		       (long int)ts.tv_nsec,
+    #####:  769:		       1900 + ptm->tm_year);
+        -:  770:
+    #####:  771:      assert (nout < TIME_BUF_LEN);
+    #####:  772:      return resultbuf;
+        -:  773:    }
+        -:  774:  else
+        -:  775:    {
+        -:  776:      /* The time cannot be represented as a struct tm.
+        -:  777:	 Output it as an integer.  */
+    #####:  778:      return format_date (ts, '@');
+        -:  779:    }
+        -:  780:}
+        -:  781:
+        -:  782:static double
+    #####:  783:file_sparseness (const struct stat *p)
+        -:  784:{
+    #####:  785:  if (0 == p->st_size)
+        -:  786:    {
+    #####:  787:      if (0 == ST_NBLOCKS(*p))
+    #####:  788:	return 1.0;
+        -:  789:      else
+    #####:  790:	return ST_NBLOCKS(*p) < 0 ? -HUGE_VAL : HUGE_VAL;
+        -:  791:    }
+        -:  792:  else
+        -:  793:    {
+    #####:  794:      double blklen = ST_NBLOCKSIZE * (double)ST_NBLOCKS(*p);
+    #####:  795:      return blklen / p->st_size;
+        -:  796:    }
+        -:  797:}
+        -:  798:
+        -:  799:static void
+       16:  800:checked_fprintf (struct format_val *dest, const char *fmt, ...)
+        -:  801:{
+        -:  802:  int rv;
+        -:  803:  va_list ap;
+        -:  804:
+       16:  805:  va_start (ap, fmt);
+       16:  806:  rv = vfprintf (dest->stream, fmt, ap);
+       16:  807:  if (rv < 0)
+    #####:  808:    nonfatal_nontarget_file_error (errno, dest->filename);
+       16:  809:}
+        -:  810:
+        -:  811:static void
+        8:  812:checked_print_quoted (struct format_val *dest,
+        -:  813:			   const char *format, const char *s)
+        -:  814:{
+        8:  815:  int rv = print_quoted (dest->stream, dest->quote_opts, dest->dest_is_tty,
+        -:  816:			 format, s);
+        8:  817:  if (rv < 0)
+    #####:  818:    nonfatal_nontarget_file_error (errno, dest->filename);
+        8:  819:}
+        -:  820:
+        -:  821:
+        -:  822:static void
+        8:  823:checked_fwrite (void *p, size_t siz, size_t nmemb, struct format_val *dest)
+        -:  824:{
+        8:  825:  const size_t items_written = fwrite (p, siz, nmemb, dest->stream);
+        8:  826:  if (items_written < nmemb)
+    #####:  827:    nonfatal_nontarget_file_error (errno, dest->filename);
+        8:  828:}
+        -:  829:
+        -:  830:static void
+    #####:  831:checked_fflush (struct format_val *dest)
+        -:  832:{
+    #####:  833:  if (0 != fflush (dest->stream))
+        -:  834:    {
+    #####:  835:      nonfatal_nontarget_file_error (errno, dest->filename);
+        -:  836:    }
+    #####:  837:}
+        -:  838:
+        -:  839:static const char*
+       16:  840:mode_to_filetype (mode_t m)
+        -:  841:{
+        -:  842:#define HANDLE_TYPE(t,letter) if (m==t) { return letter; }
+        -:  843:#ifdef S_IFREG
+       16:  844:  HANDLE_TYPE(S_IFREG,  "f");	/* regular file */
+        -:  845:#endif
+        -:  846:#ifdef S_IFDIR
+        8:  847:  HANDLE_TYPE(S_IFDIR,  "d");	/* directory */
+        -:  848:#endif
+        -:  849:#ifdef S_IFLNK
+        8:  850:  HANDLE_TYPE(S_IFLNK,  "l");	/* symbolic link */
+        -:  851:#endif
+        -:  852:#ifdef S_IFSOCK
+    #####:  853:  HANDLE_TYPE(S_IFSOCK, "s");	/* Unix domain socket */
+        -:  854:#endif
+        -:  855:#ifdef S_IFBLK
+    #####:  856:  HANDLE_TYPE(S_IFBLK,  "b");	/* block device */
+        -:  857:#endif
+        -:  858:#ifdef S_IFCHR
+    #####:  859:  HANDLE_TYPE(S_IFCHR,  "c");	/* character device */
+        -:  860:#endif
+        -:  861:#ifdef S_IFIFO
+    #####:  862:  HANDLE_TYPE(S_IFIFO,  "p");	/* FIFO */
+        -:  863:#endif
+        -:  864:#ifdef S_IFDOOR
+        -:  865:  HANDLE_TYPE(S_IFDOOR, "D");	/* Door (e.g. on Solaris) */
+        -:  866:#endif
+    #####:  867:  return "U";			/* Unknown */
+        -:  868:}
+        -:  869:
+        -:  870:
+        -:  871:
+        -:  872:static void
+       32:  873:do_fprintf (struct format_val *dest,
+        -:  874:	    struct segment *segment,
+        -:  875:	    const char *pathname,
+        -:  876:	    const struct stat *stat_buf)
+        -:  877:{
+        -:  878:  char hbuf[LONGEST_HUMAN_READABLE + 1];
+        -:  879:  const char *cp;
+        -:  880:
+       32:  881:  switch (segment->segkind)
+        -:  882:    {
+        -:  883:    case KIND_PLAIN:	/* Plain text string (no % conversion). */
+        -:  884:      /* trusted */
+        8:  885:      checked_fwrite(segment->text, 1, segment->text_len, dest);
+        8:  886:      break;
+        -:  887:
+        -:  888:    case KIND_STOP:		/* Terminate argument and flush output. */
+        -:  889:      /* trusted */
+    #####:  890:      checked_fwrite (segment->text, 1, segment->text_len, dest);
+    #####:  891:      checked_fflush (dest);
+    #####:  892:      break;
+        -:  893:
+        -:  894:    case KIND_FORMAT:
+       24:  895:      switch (segment->format_char[0])
+        -:  896:	{
+        -:  897:	case 'a':		/* atime in `ctime' format. */
+        -:  898:	  /* UNTRUSTED, probably unexploitable */
+    #####:  899:	  checked_fprintf (dest, segment->text, ctime_format (get_stat_atime (stat_buf)));
+    #####:  900:	  break;
+        -:  901:	case 'b':		/* size in 512-byte blocks */
+        -:  902:	  /* UNTRUSTED, probably unexploitable */
+    #####:  903:	  checked_fprintf (dest, segment->text,
+    #####:  904:			   human_readable ((uintmax_t) ST_NBLOCKS (*stat_buf),
+        -:  905:					   hbuf, human_ceiling,
+        -:  906:					   ST_NBLOCKSIZE, 512));
+    #####:  907:	  break;
+        -:  908:	case 'c':		/* ctime in `ctime' format */
+        -:  909:	  /* UNTRUSTED, probably unexploitable */
+    #####:  910:	  checked_fprintf (dest, segment->text, ctime_format (get_stat_ctime (stat_buf)));
+    #####:  911:	  break;
+        -:  912:	case 'd':		/* depth in search tree */
+        -:  913:	  /* UNTRUSTED, probably unexploitable */
+    #####:  914:	  checked_fprintf (dest, segment->text, state.curdepth);
+    #####:  915:	  break;
+        -:  916:	case 'D':		/* Device on which file exists (stat.st_dev) */
+        -:  917:	  /* trusted */
+    #####:  918:	  checked_fprintf (dest, segment->text,
+        -:  919:			   human_readable ((uintmax_t) stat_buf->st_dev, hbuf,
+        -:  920:					   human_ceiling, 1, 1));
+    #####:  921:	  break;
+        -:  922:	case 'f':		/* base name of path */
+        -:  923:	  /* sanitised */
+        -:  924:	  {
+    #####:  925:	    char *base = base_name (pathname);
+    #####:  926:	    checked_print_quoted (dest, segment->text, base);
+    #####:  927:	    free (base);
+        -:  928:	  }
+    #####:  929:	  break;
+        -:  930:	case 'F':		/* file system type */
+        -:  931:	  /* trusted */
+    #####:  932:	  checked_print_quoted (dest, segment->text, filesystem_type (stat_buf, pathname));
+    #####:  933:	  break;
+        -:  934:	case 'g':		/* group name */
+        -:  935:	  /* trusted */
+        -:  936:	  /* (well, the actual group is selected by the user but
+        -:  937:	   * its name was selected by the system administrator)
+        -:  938:	   */
+        -:  939:	  {
+        -:  940:	    struct group *g;
+        -:  941:
+    #####:  942:	    g = getgrgid (stat_buf->st_gid);
+    #####:  943:	    if (g)
+        -:  944:	      {
+    #####:  945:		segment->text[segment->text_len] = 's';
+    #####:  946:		checked_fprintf (dest, segment->text, g->gr_name);
+    #####:  947:		break;
+        -:  948:	      }
+        -:  949:	    else
+        -:  950:	      {
+        -:  951:		/* Do nothing. */
+        -:  952:		/*FALLTHROUGH*/
+        -:  953:	      }
+        -:  954:	  }
+        -:  955:	  /*FALLTHROUGH*/ /*...sometimes, so 'G' case.*/
+        -:  956:
+        -:  957:	case 'G':		/* GID number */
+        -:  958:	  /* UNTRUSTED, probably unexploitable */
+    #####:  959:	  checked_fprintf (dest, segment->text,
+    #####:  960:			   human_readable ((uintmax_t) stat_buf->st_gid, hbuf,
+        -:  961:					   human_ceiling, 1, 1));
+    #####:  962:	  break;
+        -:  963:	case 'h':		/* leading directories part of path */
+        -:  964:	  /* sanitised */
+        -:  965:	  {
+    #####:  966:	    cp = strrchr (pathname, '/');
+    #####:  967:	    if (cp == NULL)	/* No leading directories. */
+        -:  968:	      {
+        -:  969:		/* If there is no slash in the pathname, we still
+        -:  970:		 * print the string because it contains characters
+        -:  971:		 * other than just '%s'.  The %h expands to ".".
+        -:  972:		 */
+    #####:  973:		checked_print_quoted (dest, segment->text, ".");
+        -:  974:	      }
+        -:  975:	    else
+        -:  976:	      {
+    #####:  977:		char *s = strdup (pathname);
+    #####:  978:		s[cp - pathname] = 0;
+    #####:  979:		checked_print_quoted (dest, segment->text, s);
+    #####:  980:		free (s);
+        -:  981:	      }
+        -:  982:	  }
+    #####:  983:	  break;
+        -:  984:
+        -:  985:	case 'H':		/* ARGV element file was found under */
+        -:  986:	  /* trusted */
+        -:  987:	  {
+    #####:  988:	    char *s = xmalloc (state.starting_path_length+1);
+    #####:  989:	    memcpy (s, pathname, state.starting_path_length);
+    #####:  990:	    s[state.starting_path_length] = 0;
+    #####:  991:	    checked_fprintf (dest, segment->text, s);
+    #####:  992:	    free (s);
+        -:  993:	  }
+    #####:  994:	  break;
+        -:  995:
+        -:  996:	case 'i':		/* inode number */
+        -:  997:	  /* UNTRUSTED, but not exploitable I think */
+    #####:  998:	  checked_fprintf (dest, segment->text,
+        -:  999:			   human_readable ((uintmax_t) stat_buf->st_ino, hbuf,
+        -: 1000:					   human_ceiling,
+        -: 1001:					   1, 1));
+    #####: 1002:	  break;
+        -: 1003:	case 'k':		/* size in 1K blocks */
+        -: 1004:	  /* UNTRUSTED, but not exploitable I think */
+    #####: 1005:	  checked_fprintf (dest, segment->text,
+    #####: 1006:			   human_readable ((uintmax_t) ST_NBLOCKS (*stat_buf),
+        -: 1007:					   hbuf, human_ceiling,
+        -: 1008:					   ST_NBLOCKSIZE, 1024));
+    #####: 1009:	  break;
+        -: 1010:	case 'l':		/* object of symlink */
+        -: 1011:	  /* sanitised */
+        -: 1012:#ifdef S_ISLNK
+        -: 1013:	  {
+    #####: 1014:	    char *linkname = 0;
+        -: 1015:
+    #####: 1016:	    if (S_ISLNK (stat_buf->st_mode))
+        -: 1017:	      {
+    #####: 1018:		linkname = areadlinkat (state.cwd_dir_fd, state.rel_pathname);
+    #####: 1019:		if (linkname == NULL)
+        -: 1020:		  {
+    #####: 1021:		    nonfatal_target_file_error (errno, pathname);
+    #####: 1022:		    state.exit_status = 1;
+        -: 1023:		  }
+        -: 1024:	      }
+    #####: 1025:	    if (linkname)
+        -: 1026:	      {
+    #####: 1027:		checked_print_quoted (dest, segment->text, linkname);
+        -: 1028:	      }
+        -: 1029:	    else
+        -: 1030:	      {
+        -: 1031:		/* We still need to honour the field width etc., so this is
+        -: 1032:		 * not a no-op.
+        -: 1033:		 */
+    #####: 1034:		checked_print_quoted (dest, segment->text, "");
+        -: 1035:	      }
+    #####: 1036:	    free (linkname);
+        -: 1037:	  }
+        -: 1038:#endif				/* S_ISLNK */
+    #####: 1039:	  break;
+        -: 1040:
+        -: 1041:	case 'M':		/* mode as 10 chars (eg., "-rwxr-x--x" */
+        -: 1042:	  /* UNTRUSTED, probably unexploitable */
+        -: 1043:	  {
+        -: 1044:	    char modestring[16] ;
+    #####: 1045:	    filemodestring (stat_buf, modestring);
+    #####: 1046:	    modestring[10] = '\0';
+    #####: 1047:	    checked_fprintf (dest, segment->text, modestring);
+        -: 1048:	  }
+    #####: 1049:	  break;
+        -: 1050:
+        -: 1051:	case 'm':		/* mode as octal number (perms only) */
+        -: 1052:	  /* UNTRUSTED, probably unexploitable */
+        -: 1053:	  {
+        -: 1054:	    /* Output the mode portably using the traditional numbers,
+        -: 1055:	       even if the host unwisely uses some other numbering
+        -: 1056:	       scheme.  But help the compiler in the common case where
+        -: 1057:	       the host uses the traditional numbering scheme.  */
+    #####: 1058:	    mode_t m = stat_buf->st_mode;
+    #####: 1059:	    bool traditional_numbering_scheme =
+        -: 1060:	      (S_ISUID == 04000 && S_ISGID == 02000 && S_ISVTX == 01000
+        -: 1061:	       && S_IRUSR == 00400 && S_IWUSR == 00200 && S_IXUSR == 00100
+        -: 1062:	       && S_IRGRP == 00040 && S_IWGRP == 00020 && S_IXGRP == 00010
+        -: 1063:	       && S_IROTH == 00004 && S_IWOTH == 00002 && S_IXOTH == 00001);
+    #####: 1064:	    checked_fprintf (dest, segment->text,
+        -: 1065:		     (traditional_numbering_scheme
+        -: 1066:		      ? m & MODE_ALL
+    #####: 1067:		      : ((m & S_ISUID ? 04000 : 0)
+        -: 1068:			 | (m & S_ISGID ? 02000 : 0)
+        -: 1069:			 | (m & S_ISVTX ? 01000 : 0)
+        -: 1070:			 | (m & S_IRUSR ? 00400 : 0)
+        -: 1071:			 | (m & S_IWUSR ? 00200 : 0)
+        -: 1072:			 | (m & S_IXUSR ? 00100 : 0)
+        -: 1073:			 | (m & S_IRGRP ? 00040 : 0)
+        -: 1074:			 | (m & S_IWGRP ? 00020 : 0)
+        -: 1075:			 | (m & S_IXGRP ? 00010 : 0)
+        -: 1076:			 | (m & S_IROTH ? 00004 : 0)
+    #####: 1077:			 | (m & S_IWOTH ? 00002 : 0)
+    #####: 1078:			 | (m & S_IXOTH ? 00001 : 0))));
+        -: 1079:	  }
+    #####: 1080:	  break;
+        -: 1081:
+        -: 1082:	case 'n':		/* number of links */
+        -: 1083:	  /* UNTRUSTED, probably unexploitable */
+    #####: 1084:	  checked_fprintf (dest, segment->text,
+        -: 1085:		   human_readable ((uintmax_t) stat_buf->st_nlink,
+        -: 1086:				   hbuf,
+        -: 1087:				   human_ceiling,
+        -: 1088:				   1, 1));
+    #####: 1089:	  break;
+        -: 1090:
+        -: 1091:	case 'p':		/* pathname */
+        -: 1092:	  /* sanitised */
+        8: 1093:	  checked_print_quoted (dest, segment->text, pathname);
+        8: 1094:	  break;
+        -: 1095:
+        -: 1096:	case 'P':		/* pathname with ARGV element stripped */
+        -: 1097:	  /* sanitised */
+    #####: 1098:	  if (state.curdepth > 0)
+        -: 1099:	    {
+    #####: 1100:	      cp = pathname + state.starting_path_length;
+    #####: 1101:	      if (*cp == '/')
+        -: 1102:		/* Move past the slash between the ARGV element
+        -: 1103:		   and the rest of the pathname.  But if the ARGV element
+        -: 1104:		   ends in a slash, we didn't add another, so we've
+        -: 1105:		   already skipped past it.  */
+    #####: 1106:		cp++;
+        -: 1107:	    }
+        -: 1108:	  else
+        -: 1109:	    {
+    #####: 1110:	      cp = "";
+        -: 1111:	    }
+    #####: 1112:	  checked_print_quoted (dest, segment->text, cp);
+    #####: 1113:	  break;
+        -: 1114:
+        -: 1115:	case 's':		/* size in bytes */
+        -: 1116:	  /* UNTRUSTED, probably unexploitable */
+    #####: 1117:	  checked_fprintf (dest, segment->text,
+    #####: 1118:		   human_readable ((uintmax_t) stat_buf->st_size,
+        -: 1119:				   hbuf, human_ceiling, 1, 1));
+    #####: 1120:	  break;
+        -: 1121:
+        -: 1122:	case 'S':		/* sparseness */
+        -: 1123:	  /* UNTRUSTED, probably unexploitable */
+    #####: 1124:	  checked_fprintf (dest, segment->text, file_sparseness (stat_buf));;
+    #####: 1125:	  break;
+        -: 1126:
+        -: 1127:	case 't':		/* mtime in `ctime' format */
+        -: 1128:	  /* UNTRUSTED, probably unexploitable */
+    #####: 1129:	  checked_fprintf (dest, segment->text,
+        -: 1130:			   ctime_format (get_stat_mtime (stat_buf)));
+    #####: 1131:	  break;
+        -: 1132:
+        -: 1133:	case 'u':		/* user name */
+        -: 1134:	  /* trusted */
+        -: 1135:	  /* (well, the actual user is selected by the user on systems
+        -: 1136:	   * where chown is not restricted, but the user name was
+        -: 1137:	   * selected by the system administrator)
+        -: 1138:	   */
+        -: 1139:	  {
+        -: 1140:	    struct passwd *p;
+        -: 1141:
+    #####: 1142:	    p = getpwuid (stat_buf->st_uid);
+    #####: 1143:	    if (p)
+        -: 1144:	      {
+    #####: 1145:		segment->text[segment->text_len] = 's';
+    #####: 1146:		checked_fprintf (dest, segment->text, p->pw_name);
+    #####: 1147:		break;
+        -: 1148:	      }
+        -: 1149:	    /* else fallthru */
+        -: 1150:	  }
+        -: 1151:	  /* FALLTHROUGH*/ /* .. to case U */
+        -: 1152:
+        -: 1153:	case 'U':		/* UID number */
+        -: 1154:	  /* UNTRUSTED, probably unexploitable */
+    #####: 1155:	  checked_fprintf (dest, segment->text,
+    #####: 1156:			   human_readable ((uintmax_t) stat_buf->st_uid, hbuf,
+        -: 1157:					   human_ceiling, 1, 1));
+    #####: 1158:	  break;
+        -: 1159:
+        -: 1160:	  /* %Y: type of file system entry like `ls -l`:
+        -: 1161:	   *     (d,-,l,s,p,b,c,n) n=nonexistent (symlink)
+        -: 1162:	   */
+        -: 1163:	case 'Y':		/* in case of symlink */
+        -: 1164:	  /* trusted */
+        -: 1165:	  {
+        -: 1166:#ifdef S_ISLNK
+        8: 1167:	    if (S_ISLNK (stat_buf->st_mode))
+        -: 1168:	      {
+        -: 1169:		struct stat sbuf;
+        -: 1170:		/* If we would normally follow links, do not do so.
+        -: 1171:		 * If we would normally not follow links, do so.
+        -: 1172:		 */
+       16: 1173:		if ((following_links () ? optionp_stat : optionl_stat)
+        8: 1174:		    (state.rel_pathname, &sbuf) != 0)
+        -: 1175:		  {
+    #####: 1176:		    if ( errno == ENOENT )
+        -: 1177:		      {
+    #####: 1178:			checked_fprintf (dest, segment->text, "N");
+    #####: 1179:			break;
+        -: 1180:		      }
+    #####: 1181:		    else if ( errno == ELOOP )
+        -: 1182:		      {
+    #####: 1183:			checked_fprintf (dest, segment->text, "L");
+    #####: 1184:			break;
+        -: 1185:		      }
+        -: 1186:		    else
+        -: 1187:		      {
+    #####: 1188:			checked_fprintf (dest, segment->text, "?");
+    #####: 1189:			error (0, errno, "%s",
+        -: 1190:			       safely_quote_err_filename (0, pathname));
+        -: 1191:			/* exit_status = 1;
+        -: 1192:			   return ; */
+    #####: 1193:			break;
+        -: 1194:		      }
+        -: 1195:		  }
+        8: 1196:		checked_fprintf (dest, segment->text,
+        8: 1197:				 mode_to_filetype (sbuf.st_mode & S_IFMT));
+        -: 1198:	      }
+        -: 1199:#endif /* S_ISLNK */
+        -: 1200:	    else
+        -: 1201:	      {
+    #####: 1202:		checked_fprintf (dest, segment->text,
+    #####: 1203:				 mode_to_filetype (stat_buf->st_mode & S_IFMT));
+        -: 1204:	      }
+        -: 1205:	  }
+        8: 1206:	  break;
+        -: 1207:
+        -: 1208:	case 'y':
+        -: 1209:	  /* trusted */
+        -: 1210:	  {
+        8: 1211:	    checked_fprintf (dest, segment->text,
+        8: 1212:			     mode_to_filetype (stat_buf->st_mode & S_IFMT));
+        -: 1213:	  }
+        8: 1214:	  break;
+        -: 1215:
+        -: 1216:	case 'Z':               /* SELinux security context */
+        -: 1217:	  {
+        -: 1218:	    security_context_t scontext;
+    #####: 1219:	    int rv = (*options.x_getfilecon) (state.cwd_dir_fd, state.rel_pathname,
+        -: 1220:					      &scontext);
+    #####: 1221:	    if (rv < 0)
+        -: 1222:	      {
+        -: 1223:		/* If getfilecon fails, there will in the general case
+        -: 1224:		   still be some text to print.   We just make %Z expand
+        -: 1225:		   to an empty string. */
+    #####: 1226:		checked_fprintf (dest, segment->text, "");
+        -: 1227:
+    #####: 1228:		error (0, errno, _("getfilecon failed: %s"),
+        -: 1229:		    safely_quote_err_filename (0, pathname));
+    #####: 1230:		state.exit_status = 1;
+        -: 1231:	      }
+        -: 1232:	    else
+        -: 1233:	      {
+    #####: 1234:		checked_fprintf (dest, segment->text, scontext);
+    #####: 1235:		freecon (scontext);
+        -: 1236:	      }
+        -: 1237:	  }
+    #####: 1238:	  break;
+        -: 1239:
+        -: 1240:	case 0:
+        -: 1241:	case '%':
+    #####: 1242:	  checked_fprintf (dest, segment->text);
+    #####: 1243:	  break;
+        -: 1244:	}
+        -: 1245:      /* end of KIND_FORMAT case */
+       24: 1246:      break;
+        -: 1247:    }
+       32: 1248:}
+        -: 1249:
+        -: 1250:bool
+        8: 1251:pred_fprintf (const char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1252:{
+        8: 1253:  struct format_val *dest = &pred_ptr->args.printf_vec;
+        -: 1254:  struct segment *segment;
+        -: 1255:
+       40: 1256:  for (segment = dest->segment; segment; segment = segment->next)
+        -: 1257:    {
+       32: 1258:      if ( (KIND_FORMAT == segment->segkind) && segment->format_char[1]) /* Component of date. */
+    #####: 1259:	{
+        -: 1260:	  struct timespec ts;
+    #####: 1261:	  int valid = 0;
+        -: 1262:
+    #####: 1263:	  switch (segment->format_char[0])
+        -: 1264:	    {
+        -: 1265:	    case 'A':
+    #####: 1266:	      ts = get_stat_atime (stat_buf);
+    #####: 1267:	      valid = 1;
+    #####: 1268:	      break;
+        -: 1269:	    case 'B':
+    #####: 1270:	      ts = get_stat_birthtime (stat_buf);
+    #####: 1271:	      if ('@' == segment->format_char[1])
+    #####: 1272:		valid = 1;
+        -: 1273:	      else
+    #####: 1274:		valid = (ts.tv_nsec >= 0);
+    #####: 1275:	      break;
+        -: 1276:	    case 'C':
+    #####: 1277:	      ts = get_stat_ctime (stat_buf);
+    #####: 1278:	      valid = 1;
+    #####: 1279:	      break;
+        -: 1280:	    case 'T':
+    #####: 1281:	      ts = get_stat_mtime (stat_buf);
+    #####: 1282:	      valid = 1;
+    #####: 1283:	      break;
+        -: 1284:	    default:
+    #####: 1285:	      assert (0);
+        -: 1286:	      abort ();
+        -: 1287:	    }
+        -: 1288:	  /* We trust the output of format_date not to contain
+        -: 1289:	   * nasty characters, though the value of the date
+        -: 1290:	   * is itself untrusted data.
+        -: 1291:	   */
+    #####: 1292:	  if (valid)
+        -: 1293:	    {
+        -: 1294:	      /* trusted */
+    #####: 1295:	      checked_fprintf (dest, segment->text,
+    #####: 1296:			       format_date (ts, segment->format_char[1]));
+        -: 1297:	    }
+        -: 1298:	  else
+        -: 1299:	    {
+        -: 1300:	      /* The specified timestamp is not available, output
+        -: 1301:	       * nothing for the timestamp, but use the rest (so that
+        -: 1302:	       * for example find foo -printf '[%Bs] %p\n' can print
+        -: 1303:	       * "[] foo").
+        -: 1304:	       */
+        -: 1305:	      /* trusted */
+    #####: 1306:	      checked_fprintf (dest, segment->text, "");
+        -: 1307:	    }
+        -: 1308:	}
+        -: 1309:      else
+        -: 1310:	{
+        -: 1311:	  /* Print a segment which is not a date. */
+       32: 1312:	  do_fprintf (dest, segment, pathname, stat_buf);
+        -: 1313:	}
+        -: 1314:    }
+        8: 1315:  return true;
+        -: 1316:}

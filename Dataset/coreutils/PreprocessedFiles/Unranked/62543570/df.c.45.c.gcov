@@ -1,0 +1,1525 @@
+        -:    0:Source:src/df.c
+        -:    0:Graph:src/df.gcno
+        -:    0:Data:src/df.gcda
+        -:    0:Runs:2
+        -:    0:Programs:1
+        -:    1:/* df - summarize free disk space
+        -:    2:   Copyright (C) 1991-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by David MacKenzie <djm@gnu.ai.mit.edu>.
+        -:   18:   --human-readable and --megabyte options added by lm@sgi.com.
+        -:   19:   --si and large file support added by eggert@twinsun.com.  */
+        -:   20:
+        -:   21:#include <config.h>
+        -:   22:#include <stdio.h>
+        -:   23:#include <sys/types.h>
+        -:   24:#include <getopt.h>
+        -:   25:#include <assert.h>
+        -:   26:
+        -:   27:#include "system.h"
+        -:   28:#include "canonicalize.h"
+        -:   29:#include "error.h"
+        -:   30:#include "fsusage.h"
+        -:   31:#include "human.h"
+        -:   32:#include "mbsalign.h"
+        -:   33:#include "mbswidth.h"
+        -:   34:#include "mountlist.h"
+        -:   35:#include "quote.h"
+        -:   36:#include "find-mount-point.h"
+        -:   37:
+        -:   38:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   39:#define PROGRAM_NAME "df"
+        -:   40:
+        -:   41:#define AUTHORS \
+        -:   42:  proper_name_utf8 ("Torbjorn Granlund", "Torbj\303\266rn Granlund"), \
+        -:   43:  proper_name ("David MacKenzie"), \
+        -:   44:  proper_name ("Paul Eggert")
+        -:   45:
+        -:   46:/* Filled with device numbers of examined file systems to avoid
+        -:   47:   duplicities in output.  */
+        -:   48:struct devlist
+        -:   49:{
+        -:   50:  dev_t dev_num;
+        -:   51:  struct devlist *next;
+        -:   52:};
+        -:   53:
+        -:   54:/* Store of already-processed device numbers.  */
+        -:   55:static struct devlist *devlist_head;
+        -:   56:
+        -:   57:/* If true, show even file systems with zero size or
+        -:   58:   uninteresting types.  */
+        -:   59:static bool show_all_fs;
+        -:   60:
+        -:   61:/* If true, show only local file systems.  */
+        -:   62:static bool show_local_fs;
+        -:   63:
+        -:   64:/* If true, output data for each file system corresponding to a
+        -:   65:   command line argument -- even if it's a dummy (automounter) entry.  */
+        -:   66:static bool show_listed_fs;
+        -:   67:
+        -:   68:/* If true, include rootfs in the output.  */
+        -:   69:static bool show_rootfs;
+        -:   70:
+        -:   71:/* The literal name of the initial root file system.  */
+        -:   72:static char const *ROOTFS = "rootfs";
+        -:   73:
+        -:   74:/* Human-readable options for output.  */
+        -:   75:static int human_output_opts;
+        -:   76:
+        -:   77:/* The units to use when printing sizes.  */
+        -:   78:static uintmax_t output_block_size;
+        -:   79:
+        -:   80:/* True if a file system has been processed for output.  */
+        -:   81:static bool file_systems_processed;
+        -:   82:
+        -:   83:/* If true, invoke the 'sync' system call before getting any usage data.
+        -:   84:   Using this option can make df very slow, especially with many or very
+        -:   85:   busy disks.  Note that this may make a difference on some systems --
+        -:   86:   SunOS 4.1.3, for one.  It is *not* necessary on GNU/Linux.  */
+        -:   87:static bool require_sync;
+        -:   88:
+        -:   89:/* Desired exit status.  */
+        -:   90:static int exit_status;
+        -:   91:
+        -:   92:/* A file system type to display.  */
+        -:   93:
+        -:   94:struct fs_type_list
+        -:   95:{
+        -:   96:  char *fs_name;
+        -:   97:  struct fs_type_list *fs_next;
+        -:   98:};
+        -:   99:
+        -:  100:/* Linked list of file system types to display.
+        -:  101:   If 'fs_select_list' is NULL, list all types.
+        -:  102:   This table is generated dynamically from command-line options,
+        -:  103:   rather than hardcoding into the program what it thinks are the
+        -:  104:   valid file system types; let the user specify any file system type
+        -:  105:   they want to, and if there are any file systems of that type, they
+        -:  106:   will be shown.
+        -:  107:
+        -:  108:   Some file system types:
+        -:  109:   4.2 4.3 ufs nfs swap ignore io vm efs dbg */
+        -:  110:
+        -:  111:static struct fs_type_list *fs_select_list;
+        -:  112:
+        -:  113:/* Linked list of file system types to omit.
+        -:  114:   If the list is empty, don't exclude any types.  */
+        -:  115:
+        -:  116:static struct fs_type_list *fs_exclude_list;
+        -:  117:
+        -:  118:/* Linked list of mounted file systems.  */
+        -:  119:static struct mount_entry *mount_list;
+        -:  120:
+        -:  121:/* If true, print file system type as well.  */
+        -:  122:static bool print_type;
+        -:  123:
+        -:  124:/* If true, print a grand total at the end.  */
+        -:  125:static bool print_grand_total;
+        -:  126:
+        -:  127:/* Grand total data.  */
+        -:  128:static struct fs_usage grand_fsu;
+        -:  129:
+        -:  130:/* Display modes.  */
+        -:  131:enum
+        -:  132:{
+        -:  133:  DEFAULT_MODE,
+        -:  134:  INODES_MODE,
+        -:  135:  HUMAN_MODE,
+        -:  136:  POSIX_MODE,
+        -:  137:  OUTPUT_MODE
+        -:  138:};
+        -:  139:static int header_mode = DEFAULT_MODE;
+        -:  140:
+        -:  141:/* Displayable fields.  */
+        -:  142:typedef enum
+        -:  143:{
+        -:  144:  SOURCE_FIELD, /* file system */
+        -:  145:  FSTYPE_FIELD, /* FS type */
+        -:  146:  SIZE_FIELD,   /* FS size */
+        -:  147:  USED_FIELD,   /* FS size used  */
+        -:  148:  AVAIL_FIELD,  /* FS size available */
+        -:  149:  PCENT_FIELD,  /* percent used */
+        -:  150:  ITOTAL_FIELD, /* inode total */
+        -:  151:  IUSED_FIELD,  /* inodes used */
+        -:  152:  IAVAIL_FIELD, /* inodes available */
+        -:  153:  IPCENT_FIELD, /* inodes used in percent */
+        -:  154:  TARGET_FIELD  /* mount point */
+        -:  155:} display_field_t;
+        -:  156:
+        -:  157:/* Flag if a field contains a block, an inode or another value.  */
+        -:  158:typedef enum
+        -:  159:{
+        -:  160:  BLOCK_FLD, /* Block values field */
+        -:  161:  INODE_FLD, /* Inode values field */
+        -:  162:  OTHER_FLD  /* Neutral field, e.g. target */
+        -:  163:} field_type_t;
+        -:  164:
+        -:  165:/* Attributes of a display field.  */
+        -:  166:struct field_data_t
+        -:  167:{
+        -:  168:  display_field_t field;
+        -:  169:  char const *arg;
+        -:  170:  field_type_t field_type;
+        -:  171:  const char *caption;/* NULL means to use the default header of this field.  */
+        -:  172:  size_t width;       /* Auto adjusted (up) widths used to align columns.  */
+        -:  173:  mbs_align_t align;  /* Alignment for this field.  */
+        -:  174:  bool used;
+        -:  175:};
+        -:  176:
+        -:  177:/* Header strings, minimum width and alignment for the above fields.  */
+        -:  178:static struct field_data_t field_data[] = {
+        -:  179:  [SOURCE_FIELD] = { SOURCE_FIELD,
+        -:  180:    "source", OTHER_FLD, N_("Filesystem"), 14, MBS_ALIGN_LEFT,  false },
+        -:  181:
+        -:  182:  [FSTYPE_FIELD] = { FSTYPE_FIELD,
+        -:  183:    "fstype", OTHER_FLD, N_("Type"),        4, MBS_ALIGN_LEFT,  false },
+        -:  184:
+        -:  185:  [SIZE_FIELD] = { SIZE_FIELD,
+        -:  186:    "size",   BLOCK_FLD, N_("blocks"),      5, MBS_ALIGN_RIGHT, false },
+        -:  187:
+        -:  188:  [USED_FIELD] = { USED_FIELD,
+        -:  189:    "used",   BLOCK_FLD, N_("Used"),        5, MBS_ALIGN_RIGHT, false },
+        -:  190:
+        -:  191:  [AVAIL_FIELD] = { AVAIL_FIELD,
+        -:  192:    "avail",  BLOCK_FLD, N_("Available"),   5, MBS_ALIGN_RIGHT, false },
+        -:  193:
+        -:  194:  [PCENT_FIELD] = { PCENT_FIELD,
+        -:  195:    "pcent",  BLOCK_FLD, N_("Use%"),        4, MBS_ALIGN_RIGHT, false },
+        -:  196:
+        -:  197:  [ITOTAL_FIELD] = { ITOTAL_FIELD,
+        -:  198:    "itotal", INODE_FLD, N_("Inodes"),      5, MBS_ALIGN_RIGHT, false },
+        -:  199:
+        -:  200:  [IUSED_FIELD] = { IUSED_FIELD,
+        -:  201:    "iused",  INODE_FLD, N_("IUsed"),       5, MBS_ALIGN_RIGHT, false },
+        -:  202:
+        -:  203:  [IAVAIL_FIELD] = { IAVAIL_FIELD,
+        -:  204:    "iavail", INODE_FLD, N_("IFree"),       5, MBS_ALIGN_RIGHT, false },
+        -:  205:
+        -:  206:  [IPCENT_FIELD] = { IPCENT_FIELD,
+        -:  207:    "ipcent", INODE_FLD, N_("IUse%"),       4, MBS_ALIGN_RIGHT, false },
+        -:  208:
+        -:  209:  [TARGET_FIELD] = { TARGET_FIELD,
+        -:  210:    "target", OTHER_FLD, N_("Mounted on"),  0, MBS_ALIGN_LEFT,  false }
+        -:  211:};
+        -:  212:
+        -:  213:static char const *all_args_string =
+        -:  214:  "source,fstype,itotal,iused,iavail,ipcent,size,used,avail,pcent,target";
+        -:  215:
+        -:  216:/* Storage for the definition of output columns.  */
+        -:  217:static struct field_data_t **columns;
+        -:  218:
+        -:  219:/* The current number of output columns.  */
+        -:  220:static size_t ncolumns;
+        -:  221:
+        -:  222:/* Field values.  */
+        -:  223:struct field_values_t
+        -:  224:{
+        -:  225:  uintmax_t input_units;
+        -:  226:  uintmax_t output_units;
+        -:  227:  uintmax_t total;
+        -:  228:  uintmax_t available;
+        -:  229:  bool negate_available;
+        -:  230:  uintmax_t available_to_root;
+        -:  231:  uintmax_t used;
+        -:  232:  bool negate_used;
+        -:  233:};
+        -:  234:
+        -:  235:/* Storage for pointers for each string (cell of table).  */
+        -:  236:static char ***table;
+        -:  237:
+        -:  238:/* The current number of processed rows (including header).  */
+        -:  239:static size_t nrows;
+        -:  240:
+        -:  241:/* For long options that have no equivalent short option, use a
+        -:  242:   non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
+        -:  243:enum
+        -:  244:{
+        -:  245:  NO_SYNC_OPTION = CHAR_MAX + 1,
+        -:  246:  SYNC_OPTION,
+        -:  247:  TOTAL_OPTION,
+        -:  248:  OUTPUT_OPTION,
+        -:  249:  MEGABYTES_OPTION  /* FIXME: remove long opt in Aug 2013 */
+        -:  250:};
+        -:  251:
+        -:  252:static struct option const long_options[] =
+        -:  253:{
+        -:  254:  {"all", no_argument, NULL, 'a'},
+        -:  255:  {"block-size", required_argument, NULL, 'B'},
+        -:  256:  {"inodes", no_argument, NULL, 'i'},
+        -:  257:  {"human-readable", no_argument, NULL, 'h'},
+        -:  258:  {"si", no_argument, NULL, 'H'},
+        -:  259:  {"local", no_argument, NULL, 'l'},
+        -:  260:  {"megabytes", no_argument, NULL, MEGABYTES_OPTION}, /* obsolescent,  */
+        -:  261:  {"output", optional_argument, NULL, OUTPUT_OPTION},
+        -:  262:  {"portability", no_argument, NULL, 'P'},
+        -:  263:  {"print-type", no_argument, NULL, 'T'},
+        -:  264:  {"sync", no_argument, NULL, SYNC_OPTION},
+        -:  265:  {"no-sync", no_argument, NULL, NO_SYNC_OPTION},
+        -:  266:  {"total", no_argument, NULL, TOTAL_OPTION},
+        -:  267:  {"type", required_argument, NULL, 't'},
+        -:  268:  {"exclude-type", required_argument, NULL, 'x'},
+        -:  269:  {GETOPT_HELP_OPTION_DECL},
+        -:  270:  {GETOPT_VERSION_OPTION_DECL},
+        -:  271:  {NULL, 0, NULL, 0}
+        -:  272:};
+        -:  273:
+        -:  274:/* Replace problematic chars with '?'.
+        -:  275:   Since only control characters are currently considered,
+        -:  276:   this should work in all encodings.  */
+        -:  277:
+        -:  278:static char*
+       54:  279:hide_problematic_chars (char *cell)
+        -:  280:{
+       54:  281:  char *p = cell;
+      438:  282:  while (*p)
+        -:  283:    {
+      330:  284:      if (iscntrl (to_uchar (*p)))
+    #####:  285:        *p = '?';
+      330:  286:      p++;
+        -:  287:    }
+       54:  288:  return cell;
+        -:  289:}
+        -:  290:
+        -:  291:/* Dynamically allocate a row of pointers in TABLE, which
+        -:  292:   can then be accessed with standard 2D array notation.  */
+        -:  293:
+        -:  294:static void
+        9:  295:alloc_table_row (void)
+        -:  296:{
+        9:  297:  nrows++;
+        9:  298:  table = xnrealloc (table, nrows, sizeof (char *));
+        9:  299:  table[nrows - 1] = xnmalloc (ncolumns, sizeof (char *));
+        9:  300:}
+        -:  301:
+        -:  302:/* Output each cell in the table, accounting for the
+        -:  303:   alignment and max width of each column.  */
+        -:  304:
+        -:  305:static void
+        2:  306:print_table (void)
+        -:  307:{
+        -:  308:  size_t row;
+        -:  309:
+       11:  310:  for (row = 0; row < nrows; row++)
+        -:  311:    {
+        -:  312:      size_t col;
+       63:  313:      for (col = 0; col < ncolumns; col++)
+        -:  314:        {
+       54:  315:          char *cell = table[row][col];
+        -:  316:
+        -:  317:          /* Note the SOURCE_FIELD used to be displayed on it's own line
+        -:  318:             if (!posix_format && mbswidth (cell) > 20), but that
+        -:  319:             functionality was probably more problematic than helpful,
+        -:  320:             hence changed in commit v8.10-40-g99679ff.  */
+       54:  321:          if (col != 0)
+       45:  322:            putchar (' ');
+        -:  323:
+       54:  324:          int flags = 0;
+       54:  325:          if (col == ncolumns - 1) /* The last one.  */
+        9:  326:            flags = MBA_NO_RIGHT_PAD;
+        -:  327:
+       54:  328:          size_t width = columns[col]->width;
+       54:  329:          cell = ambsalign (cell, &width, columns[col]->align, flags);
+        -:  330:          /* When ambsalign fails, output unaligned data.  */
+       54:  331:          fputs (cell ? cell : table[row][col], stdout);
+       54:  332:          free (cell);
+        -:  333:
+       54:  334:          IF_LINT (free (table[row][col]));
+        -:  335:        }
+        9:  336:      putchar ('\n');
+        9:  337:      IF_LINT (free (table[row]));
+        -:  338:    }
+        -:  339:
+        2:  340:  IF_LINT (free (table));
+        2:  341:}
+        -:  342:
+        -:  343:/* Dynamically allocate a struct field_t in COLUMNS, which
+        -:  344:   can then be accessed with standard array notation.  */
+        -:  345:
+        -:  346:static void
+       12:  347:alloc_field (int f, const char *c)
+        -:  348:{
+       12:  349:  ncolumns++;
+       12:  350:  columns = xnrealloc (columns, ncolumns, sizeof (struct field_data_t *));
+       12:  351:  columns[ncolumns - 1] = &field_data[f];
+       12:  352:  if (c != NULL)
+    #####:  353:    columns[ncolumns - 1]->caption = c;
+        -:  354:
+       12:  355:  if (field_data[f].used)
+    #####:  356:    assert (!"field used");
+        -:  357:
+        -:  358:  /* Mark field as used.  */
+       12:  359:  field_data[f].used = true;
+       12:  360:}
+        -:  361:
+        -:  362:
+        -:  363:/* Given a string, ARG, containing a comma-separated list of arguments
+        -:  364:   to the --output option, add the appropriate fields to columns.  */
+        -:  365:static void
+    #####:  366:decode_output_arg (char const *arg)
+        -:  367:{
+    #####:  368:  char *arg_writable = xstrdup (arg);
+    #####:  369:  char *s = arg_writable;
+        -:  370:  do
+        -:  371:    {
+        -:  372:      /* find next comma */
+    #####:  373:      char *comma = strchr (s, ',');
+        -:  374:
+        -:  375:      /* If we found a comma, put a NUL in its place and advance.  */
+    #####:  376:      if (comma)
+    #####:  377:        *comma++ = 0;
+        -:  378:
+        -:  379:      /* process S.  */
+    #####:  380:      display_field_t field = -1;
+    #####:  381:      for (unsigned int i = 0; i < ARRAY_CARDINALITY (field_data); i++)
+        -:  382:        {
+    #####:  383:          if (STREQ (field_data[i].arg, s))
+        -:  384:            {
+    #####:  385:              field = i;
+    #####:  386:              break;
+        -:  387:            }
+        -:  388:        }
+    #####:  389:      if (field == -1)
+        -:  390:        {
+    #####:  391:          error (0, 0, _("option --output: field '%s' unknown"), s);
+    #####:  392:          usage (EXIT_FAILURE);
+        -:  393:        }
+        -:  394:
+    #####:  395:      if (field_data[field].used)
+        -:  396:        {
+        -:  397:          /* Prevent the fields from being used more than once.  */
+    #####:  398:          error (0, 0, _("option --output: field '%s' used more than once"),
+        -:  399:                 field_data[field].arg);
+    #####:  400:          usage (EXIT_FAILURE);
+        -:  401:        }
+        -:  402:
+    #####:  403:      switch (field)
+        -:  404:        {
+        -:  405:        case SOURCE_FIELD:
+        -:  406:        case FSTYPE_FIELD:
+        -:  407:        case USED_FIELD:
+        -:  408:        case PCENT_FIELD:
+        -:  409:        case ITOTAL_FIELD:
+        -:  410:        case IUSED_FIELD:
+        -:  411:        case IAVAIL_FIELD:
+        -:  412:        case IPCENT_FIELD:
+        -:  413:        case TARGET_FIELD:
+    #####:  414:          alloc_field (field, NULL);
+    #####:  415:          break;
+        -:  416:
+        -:  417:        case SIZE_FIELD:
+    #####:  418:          alloc_field (field, N_("Size"));
+    #####:  419:          break;
+        -:  420:
+        -:  421:        case AVAIL_FIELD:
+    #####:  422:          alloc_field (field, N_("Avail"));
+    #####:  423:          break;
+        -:  424:
+        -:  425:        default:
+    #####:  426:          assert (!"invalid field");
+        -:  427:        }
+    #####:  428:      s = comma;
+        -:  429:    }
+    #####:  430:  while (s);
+        -:  431:
+    #####:  432:  free (arg_writable);
+    #####:  433:}
+        -:  434:
+        -:  435:/* Get the appropriate columns for the mode.  */
+        -:  436:static void
+        2:  437:get_field_list (void)
+        -:  438:{
+        2:  439:  switch (header_mode)
+        -:  440:    {
+        -:  441:    case DEFAULT_MODE:
+        2:  442:      alloc_field (SOURCE_FIELD, NULL);
+        2:  443:      if (print_type)
+    #####:  444:        alloc_field (FSTYPE_FIELD, NULL);
+        2:  445:      alloc_field (SIZE_FIELD,   NULL);
+        2:  446:      alloc_field (USED_FIELD,   NULL);
+        2:  447:      alloc_field (AVAIL_FIELD,  NULL);
+        2:  448:      alloc_field (PCENT_FIELD,  NULL);
+        2:  449:      alloc_field (TARGET_FIELD, NULL);
+        2:  450:      break;
+        -:  451:
+        -:  452:    case HUMAN_MODE:
+    #####:  453:      alloc_field (SOURCE_FIELD, NULL);
+    #####:  454:      if (print_type)
+    #####:  455:        alloc_field (FSTYPE_FIELD, NULL);
+        -:  456:
+    #####:  457:      alloc_field (SIZE_FIELD,   N_("Size"));
+    #####:  458:      alloc_field (USED_FIELD,   NULL);
+    #####:  459:      alloc_field (AVAIL_FIELD,  N_("Avail"));
+    #####:  460:      alloc_field (PCENT_FIELD,  NULL);
+    #####:  461:      alloc_field (TARGET_FIELD, NULL);
+    #####:  462:      break;
+        -:  463:
+        -:  464:    case INODES_MODE:
+    #####:  465:      alloc_field (SOURCE_FIELD, NULL);
+    #####:  466:      if (print_type)
+    #####:  467:        alloc_field (FSTYPE_FIELD, NULL);
+    #####:  468:      alloc_field (ITOTAL_FIELD,  NULL);
+    #####:  469:      alloc_field (IUSED_FIELD,   NULL);
+    #####:  470:      alloc_field (IAVAIL_FIELD,  NULL);
+    #####:  471:      alloc_field (IPCENT_FIELD,  NULL);
+    #####:  472:      alloc_field (TARGET_FIELD,  NULL);
+    #####:  473:      break;
+        -:  474:
+        -:  475:    case POSIX_MODE:
+    #####:  476:      alloc_field (SOURCE_FIELD, NULL);
+    #####:  477:      if (print_type)
+    #####:  478:        alloc_field (FSTYPE_FIELD, NULL);
+    #####:  479:      alloc_field (SIZE_FIELD,   NULL);
+    #####:  480:      alloc_field (USED_FIELD,   NULL);
+    #####:  481:      alloc_field (AVAIL_FIELD,  NULL);
+    #####:  482:      alloc_field (PCENT_FIELD,  N_("Capacity"));
+    #####:  483:      alloc_field (TARGET_FIELD, NULL);
+    #####:  484:      break;
+        -:  485:
+        -:  486:    case OUTPUT_MODE:
+    #####:  487:      if (!ncolumns)
+        -:  488:        {
+        -:  489:          /* Add all fields if --output was given without a field list.  */
+    #####:  490:          decode_output_arg (all_args_string);
+        -:  491:        }
+    #####:  492:      break;
+        -:  493:
+        -:  494:    default:
+    #####:  495:      assert (!"invalid header_mode");
+        -:  496:    }
+        2:  497:}
+        -:  498:
+        -:  499:/* Obtain the appropriate header entries.  */
+        -:  500:
+        -:  501:static void
+        2:  502:get_header (void)
+        -:  503:{
+        -:  504:  size_t col;
+        -:  505:
+        2:  506:  alloc_table_row ();
+        -:  507:
+       14:  508:  for (col = 0; col < ncolumns; col++)
+        -:  509:    {
+       12:  510:      char *cell = NULL;
+       12:  511:      char const *header = _(columns[col]->caption);
+        -:  512:
+       12:  513:      if (columns[col]->field == SIZE_FIELD
+        2:  514:          && (header_mode == DEFAULT_MODE
+    #####:  515:              || (header_mode == OUTPUT_MODE
+    #####:  516:                  && !(human_output_opts & human_autoscale))))
+        2:  517:        {
+        -:  518:          char buf[LONGEST_HUMAN_READABLE + 1];
+        -:  519:
+        2:  520:          int opts = (human_suppress_point_zero
+        -:  521:                      | human_autoscale | human_SI
+        -:  522:                      | (human_output_opts
+        2:  523:                         & (human_group_digits | human_base_1024 | human_B)));
+        -:  524:
+        -:  525:          /* Prefer the base that makes the human-readable value more exact,
+        -:  526:             if there is a difference.  */
+        -:  527:
+        2:  528:          uintmax_t q1000 = output_block_size;
+        2:  529:          uintmax_t q1024 = output_block_size;
+        -:  530:          bool divisible_by_1000;
+        -:  531:          bool divisible_by_1024;
+        -:  532:
+        -:  533:          do
+        -:  534:            {
+        2:  535:              divisible_by_1000 = q1000 % 1000 == 0;  q1000 /= 1000;
+        2:  536:              divisible_by_1024 = q1024 % 1024 == 0;  q1024 /= 1024;
+        -:  537:            }
+        2:  538:          while (divisible_by_1000 & divisible_by_1024);
+        -:  539:
+        2:  540:          if (divisible_by_1000 < divisible_by_1024)
+        2:  541:            opts |= human_base_1024;
+        2:  542:          if (divisible_by_1024 < divisible_by_1000)
+    #####:  543:            opts &= ~human_base_1024;
+        2:  544:          if (! (opts & human_base_1024))
+    #####:  545:            opts |= human_B;
+        -:  546:
+        2:  547:          char *num = human_readable (output_block_size, buf, opts, 1, 1);
+        -:  548:
+        -:  549:          /* Reset the header back to the default in OUTPUT_MODE.  */
+        2:  550:          header = N_("blocks");
+        -:  551:
+        -:  552:          /* TRANSLATORS: this is the "1K-blocks" header in "df" output.  */
+        2:  553:          if (asprintf (&cell, _("%s-%s"), num, header) == -1)
+    #####:  554:            cell = NULL;
+        -:  555:        }
+       10:  556:      else if (header_mode == POSIX_MODE && columns[col]->field == SIZE_FIELD)
+    #####:  557:        {
+        -:  558:          char buf[INT_BUFSIZE_BOUND (uintmax_t)];
+    #####:  559:          char *num = umaxtostr (output_block_size, buf);
+        -:  560:
+        -:  561:          /* TRANSLATORS: this is the "1024-blocks" header in "df -P".  */
+    #####:  562:          if (asprintf (&cell, _("%s-%s"), num, header) == -1)
+    #####:  563:            cell = NULL;
+        -:  564:        }
+        -:  565:      else
+       10:  566:        cell = strdup (header);
+        -:  567:
+       12:  568:      if (!cell)
+    #####:  569:        xalloc_die ();
+        -:  570:
+       12:  571:      hide_problematic_chars (cell);
+        -:  572:
+       12:  573:      table[nrows - 1][col] = cell;
+        -:  574:
+       12:  575:      columns[col]->width = MAX (columns[col]->width, mbswidth (cell, 0));
+        -:  576:    }
+        2:  577:}
+        -:  578:
+        -:  579:/* Is FSTYPE a type of file system that should be listed?  */
+        -:  580:
+        -:  581:static bool _GL_ATTRIBUTE_PURE
+       26:  582:selected_fstype (const char *fstype)
+        -:  583:{
+        -:  584:  const struct fs_type_list *fsp;
+        -:  585:
+       26:  586:  if (fs_select_list == NULL || fstype == NULL)
+       26:  587:    return true;
+    #####:  588:  for (fsp = fs_select_list; fsp; fsp = fsp->fs_next)
+    #####:  589:    if (STREQ (fstype, fsp->fs_name))
+    #####:  590:      return true;
+    #####:  591:  return false;
+        -:  592:}
+        -:  593:
+        -:  594:/* Is FSTYPE a type of file system that should be omitted?  */
+        -:  595:
+        -:  596:static bool _GL_ATTRIBUTE_PURE
+       26:  597:excluded_fstype (const char *fstype)
+        -:  598:{
+        -:  599:  const struct fs_type_list *fsp;
+        -:  600:
+       26:  601:  if (fs_exclude_list == NULL || fstype == NULL)
+       26:  602:    return false;
+    #####:  603:  for (fsp = fs_exclude_list; fsp; fsp = fsp->fs_next)
+    #####:  604:    if (STREQ (fstype, fsp->fs_name))
+    #####:  605:      return true;
+    #####:  606:  return false;
+        -:  607:}
+        -:  608:
+        -:  609:/* Check if the device was already examined.  */
+        -:  610:
+        -:  611:static bool
+       25:  612:dev_examined (char const *mount_dir, char const *devname)
+        -:  613:{
+        -:  614:  struct stat buf;
+       25:  615:  if (-1 == stat (mount_dir, &buf))
+    #####:  616:    return false;
+        -:  617:
+       25:  618:  struct devlist *devlist = devlist_head;
+      273:  619:  for ( ; devlist; devlist = devlist->next)
+      252:  620:    if (devlist->dev_num == buf.st_dev)
+        4:  621:      return true;
+        -:  622:
+        -:  623:  /* Add the device number to the global list devlist.  */
+       21:  624:  devlist = xmalloc (sizeof *devlist);
+       21:  625:  devlist->dev_num = buf.st_dev;
+       21:  626:  devlist->next = devlist_head;
+       21:  627:  devlist_head = devlist;
+        -:  628:
+       21:  629:  return false;
+        -:  630:}
+        -:  631:
+        -:  632:/* Return true if N is a known integer value.  On many file systems,
+        -:  633:   UINTMAX_MAX represents an unknown value; on AIX, UINTMAX_MAX - 1
+        -:  634:   represents unknown.  Use a rule that works on AIX file systems, and
+        -:  635:   that almost-always works on other types.  */
+        -:  636:static bool
+       63:  637:known_value (uintmax_t n)
+        -:  638:{
+       63:  639:  return n < UINTMAX_MAX - 1;
+        -:  640:}
+        -:  641:
+        -:  642:/* Like human_readable (N, BUF, human_output_opts, INPUT_UNITS, OUTPUT_UNITS),
+        -:  643:   except:
+        -:  644:
+        -:  645:    - If NEGATIVE, then N represents a negative number,
+        -:  646:      expressed in two's complement.
+        -:  647:    - Otherwise, return "-" if N is unknown.  */
+        -:  648:
+        -:  649:static char const *
+       21:  650:df_readable (bool negative, uintmax_t n, char *buf,
+        -:  651:             uintmax_t input_units, uintmax_t output_units)
+        -:  652:{
+       21:  653:  if (! known_value (n) && !negative)
+    #####:  654:    return "-";
+        -:  655:  else
+        -:  656:    {
+       21:  657:      char *p = human_readable (negative ? -n : n, buf + negative,
+        -:  658:                                human_output_opts, input_units, output_units);
+       21:  659:      if (negative)
+    #####:  660:        *--p = '-';
+       21:  661:      return p;
+        -:  662:    }
+        -:  663:}
+        -:  664:
+        -:  665:/* Logical equivalence */
+        -:  666:#define LOG_EQ(a, b) (!(a) == !(b))
+        -:  667:
+        -:  668:/* Add integral value while using uintmax_t for value part and separate
+        -:  669:   negation flag.  It adds value of SRC and SRC_NEG to DEST and DEST_NEG.
+        -:  670:   The result will be in DEST and DEST_NEG.  See df_readable to understand
+        -:  671:   how the negation flag is used.  */
+        -:  672:static void
+    #####:  673:add_uint_with_neg_flag (uintmax_t *dest, bool *dest_neg,
+        -:  674:                        uintmax_t src, bool src_neg)
+        -:  675:{
+    #####:  676:  if (LOG_EQ (*dest_neg, src_neg))
+        -:  677:    {
+    #####:  678:      *dest += src;
+    #####:  679:      return;
+        -:  680:    }
+        -:  681:
+    #####:  682:  if (*dest_neg)
+    #####:  683:    *dest = -*dest;
+        -:  684:
+    #####:  685:  if (src_neg)
+    #####:  686:    src = -src;
+        -:  687:
+    #####:  688:  if (src < *dest)
+    #####:  689:    *dest -= src;
+        -:  690:  else
+        -:  691:    {
+    #####:  692:      *dest = src - *dest;
+    #####:  693:      *dest_neg = src_neg;
+        -:  694:    }
+        -:  695:
+    #####:  696:  if (*dest_neg)
+    #####:  697:    *dest = -*dest;
+        -:  698:}
+        -:  699:
+        -:  700:/* Return true if S ends in a string that may be a 36-byte UUID,
+        -:  701:   i.e., of the form HHHHHHHH-HHHH-HHHH-HHHH-HHHHHHHHHHHH, where
+        -:  702:   each H is an upper or lower case hexadecimal digit.  */
+        -:  703:static bool _GL_ATTRIBUTE_PURE
+        6:  704:has_uuid_suffix (char const *s)
+        -:  705:{
+        6:  706:  size_t len = strlen (s);
+        6:  707:  return (36 < len
+        6:  708:          && strspn (s + len - 36, "-0123456789abcdefABCDEF") == 36);
+        -:  709:}
+        -:  710:
+        -:  711:/* Obtain the block values BV and inode values IV
+        -:  712:   from the file system usage FSU.  */
+        -:  713:static void
+        7:  714:get_field_values (struct field_values_t *bv,
+        -:  715:                  struct field_values_t *iv,
+        -:  716:                  const struct fs_usage *fsu)
+        -:  717:{
+        -:  718:  /* Inode values.  */
+        7:  719:  iv->input_units = iv->output_units = 1;
+        7:  720:  iv->total = fsu->fsu_files;
+        7:  721:  iv->available = iv->available_to_root = fsu->fsu_ffree;
+        7:  722:  iv->negate_available = false;
+        -:  723:
+        7:  724:  iv->used = UINTMAX_MAX;
+        7:  725:  iv->negate_used = false;
+        7:  726:  if (known_value (iv->total) && known_value (iv->available_to_root))
+        -:  727:    {
+        7:  728:      iv->used = iv->total - iv->available_to_root;
+        7:  729:      iv->negate_used = (iv->total < iv->available_to_root);
+        -:  730:    }
+        -:  731:
+        -:  732:  /* Block values.  */
+        7:  733:  bv->input_units = fsu->fsu_blocksize;
+        7:  734:  bv->output_units = output_block_size;
+        7:  735:  bv->total = fsu->fsu_blocks;
+        7:  736:  bv->available = fsu->fsu_bavail;
+        7:  737:  bv->available_to_root = fsu->fsu_bfree;
+       14:  738:  bv->negate_available = (fsu->fsu_bavail_top_bit_set
+        7:  739:                         && known_value (fsu->fsu_bavail));
+        -:  740:
+        7:  741:  bv->used = UINTMAX_MAX;
+        7:  742:  bv->negate_used = false;
+        7:  743:  if (known_value (bv->total) && known_value (bv->available_to_root))
+        -:  744:    {
+        7:  745:      bv->used = bv->total - bv->available_to_root;
+        7:  746:      bv->negate_used = (bv->total < bv->available_to_root);
+        -:  747:    }
+        7:  748:}
+        -:  749:
+        -:  750:/* Add block and inode values to grand total.  */
+        -:  751:static void
+    #####:  752:add_to_grand_total (struct field_values_t *bv, struct field_values_t *iv)
+        -:  753:{
+    #####:  754:  if (known_value (iv->total))
+    #####:  755:    grand_fsu.fsu_files += iv->total;
+    #####:  756:  if (known_value (iv->available))
+    #####:  757:    grand_fsu.fsu_ffree += iv->available;
+        -:  758:
+    #####:  759:  if (known_value (bv->total))
+    #####:  760:    grand_fsu.fsu_blocks += bv->input_units * bv->total;
+    #####:  761:  if (known_value (bv->available_to_root))
+    #####:  762:    grand_fsu.fsu_bfree += bv->input_units * bv->available_to_root;
+    #####:  763:  if (known_value (bv->available))
+    #####:  764:    add_uint_with_neg_flag (&grand_fsu.fsu_bavail,
+        -:  765:                            &grand_fsu.fsu_bavail_top_bit_set,
+    #####:  766:                            bv->input_units * bv->available,
+    #####:  767:                            bv->negate_available);
+    #####:  768:}
+        -:  769:
+        -:  770:/* Obtain a space listing for the disk device with absolute file name DISK.
+        -:  771:   If MOUNT_POINT is non-NULL, it is the name of the root of the
+        -:  772:   file system on DISK.
+        -:  773:   If STAT_FILE is non-null, it is the name of a file within the file
+        -:  774:   system that the user originally asked for; this provides better
+        -:  775:   diagnostics, and sometimes it provides better results on networked
+        -:  776:   file systems that give different free-space results depending on
+        -:  777:   where in the file system you probe.
+        -:  778:   If FSTYPE is non-NULL, it is the type of the file system on DISK.
+        -:  779:   If MOUNT_POINT is non-NULL, then DISK may be NULL -- certain systems may
+        -:  780:   not be able to produce statistics in this case.
+        -:  781:   ME_DUMMY and ME_REMOTE are the mount entry flags.
+        -:  782:   Caller must set PROCESS_ALL to true when iterating over all entries, as
+        -:  783:   when df is invoked with no non-option argument.  See below for details.  */
+        -:  784:
+        -:  785:static void
+       32:  786:get_dev (char const *disk, char const *mount_point,
+        -:  787:         char const *stat_file, char const *fstype,
+        -:  788:         bool me_dummy, bool me_remote,
+        -:  789:         const struct fs_usage *force_fsu,
+        -:  790:         bool process_all)
+        -:  791:{
+       32:  792:  if (me_remote && show_local_fs)
+       25:  793:    return;
+        -:  794:
+       32:  795:  if (me_dummy && !show_all_fs && !show_listed_fs)
+        6:  796:    return;
+        -:  797:
+       26:  798:  if (!selected_fstype (fstype) || excluded_fstype (fstype))
+    #####:  799:    return;
+        -:  800:
+       26:  801:  if (process_all && !show_all_fs && !show_listed_fs)
+        -:  802:    {
+        -:  803:      /* No arguments nor "df -a", then check if df has to ...  */
+       25:  804:      if (!show_rootfs && STREQ (disk, ROOTFS))
+    #####:  805:        return; /* ... skip rootfs: (unless -trootfs is given.  */
+       25:  806:      if (dev_examined (mount_point, disk))
+        4:  807:        return; /* ... skip duplicate entries (bind mounts).  */
+        -:  808:    }
+        -:  809:
+        -:  810:  /* If MOUNT_POINT is NULL, then the file system is not mounted, and this
+        -:  811:     program reports on the file system that the special file is on.
+        -:  812:     It would be better to report on the unmounted file system,
+        -:  813:     but statfs doesn't do that on most systems.  */
+       22:  814:  if (!stat_file)
+       21:  815:    stat_file = mount_point ? mount_point : disk;
+        -:  816:
+        -:  817:  struct fs_usage fsu;
+       22:  818:  if (force_fsu)
+    #####:  819:    fsu = *force_fsu;
+       22:  820:  else if (get_fs_usage (stat_file, disk, &fsu))
+        -:  821:    {
+    #####:  822:      error (0, errno, "%s", quote (stat_file));
+    #####:  823:      exit_status = EXIT_FAILURE;
+    #####:  824:      return;
+        -:  825:    }
+        -:  826:
+       22:  827:  if (fsu.fsu_blocks == 0 && !show_all_fs && !show_listed_fs)
+       15:  828:    return;
+        -:  829:
+        7:  830:  if (! force_fsu)
+        7:  831:    file_systems_processed = true;
+        -:  832:
+        7:  833:  alloc_table_row ();
+        -:  834:
+        7:  835:  if (! disk)
+    #####:  836:    disk = "-";			/* unknown */
+        -:  837:
+        7:  838:  char *dev_name = xstrdup (disk);
+        -:  839:  char *resolved_dev;
+        -:  840:
+        -:  841:  /* On some systems, dev_name is a long-named symlink like
+        -:  842:     /dev/disk/by-uuid/828fc648-9f30-43d8-a0b1-f7196a2edb66 pointing to a
+        -:  843:     much shorter and more useful name like /dev/sda1.  It may also look
+        -:  844:     like /dev/mapper/luks-828fc648-9f30-43d8-a0b1-f7196a2edb66 and point to
+        -:  845:     /dev/dm-0.  When process_all is true and dev_name is a symlink whose
+        -:  846:     name ends with a UUID use the resolved name instead.  */
+        7:  847:  if (process_all
+        6:  848:      && has_uuid_suffix (dev_name)
+    #####:  849:      && (resolved_dev = canonicalize_filename_mode (dev_name, CAN_EXISTING)))
+        -:  850:    {
+    #####:  851:      free (dev_name);
+    #####:  852:      dev_name = resolved_dev;
+        -:  853:    }
+        -:  854:
+        7:  855:  if (! fstype)
+    #####:  856:    fstype = "-";		/* unknown */
+        -:  857:
+        -:  858:  struct field_values_t block_values;
+        -:  859:  struct field_values_t inode_values;
+        7:  860:  get_field_values (&block_values, &inode_values, &fsu);
+        -:  861:
+        -:  862:  /* Add to grand total unless processing grand total line.  */
+        7:  863:  if (print_grand_total && ! force_fsu)
+    #####:  864:    add_to_grand_total (&block_values, &inode_values);
+        -:  865:
+        -:  866:  size_t col;
+       49:  867:  for (col = 0; col < ncolumns; col++)
+        -:  868:    {
+        -:  869:      char buf[LONGEST_HUMAN_READABLE + 2];
+        -:  870:      char *cell;
+        -:  871:
+        -:  872:      struct field_values_t *v;
+       42:  873:      switch (columns[col]->field_type)
+        -:  874:        {
+        -:  875:        case BLOCK_FLD:
+       28:  876:          v = &block_values;
+       28:  877:          break;
+        -:  878:        case INODE_FLD:
+    #####:  879:          v = &inode_values;
+    #####:  880:          break;
+        -:  881:        case OTHER_FLD:
+       14:  882:          v = NULL;
+       14:  883:          break;
+        -:  884:        default:
+    #####:  885:          assert (!"bad field_type");
+        -:  886:        }
+        -:  887:
+       42:  888:      switch (columns[col]->field)
+        -:  889:        {
+        -:  890:        case SOURCE_FIELD:
+        7:  891:          cell = xstrdup (dev_name);
+        7:  892:          break;
+        -:  893:
+        -:  894:        case FSTYPE_FIELD:
+    #####:  895:          cell = xstrdup (fstype);
+    #####:  896:          break;
+        -:  897:
+        -:  898:        case SIZE_FIELD:
+        -:  899:        case ITOTAL_FIELD:
+        7:  900:          cell = xstrdup (df_readable (false, v->total, buf,
+        -:  901:                                       v->input_units, v->output_units));
+        7:  902:          break;
+        -:  903:
+        -:  904:        case USED_FIELD:
+        -:  905:        case IUSED_FIELD:
+        7:  906:          cell = xstrdup (df_readable (v->negate_used, v->used, buf,
+        -:  907:                                       v->input_units, v->output_units));
+        7:  908:          break;
+        -:  909:
+        -:  910:        case AVAIL_FIELD:
+        -:  911:        case IAVAIL_FIELD:
+        7:  912:          cell = xstrdup (df_readable (v->negate_available, v->available, buf,
+        -:  913:                                       v->input_units, v->output_units));
+        7:  914:          break;
+        -:  915:
+        -:  916:        case PCENT_FIELD:
+        -:  917:        case IPCENT_FIELD:
+        -:  918:          {
+        7:  919:            double pct = -1;
+        7:  920:            if (! known_value (v->used) || ! known_value (v->available))
+        -:  921:              ;
+        7:  922:            else if (!v->negate_used
+        7:  923:                     && v->used <= TYPE_MAXIMUM (uintmax_t) / 100
+        7:  924:                     && v->used + v->available != 0
+       14:  925:                     && (v->used + v->available < v->used)
+        7:  926:                     == v->negate_available)
+        7:  927:              {
+        7:  928:                uintmax_t u100 = v->used * 100;
+        7:  929:                uintmax_t nonroot_total = v->used + v->available;
+        7:  930:                pct = u100 / nonroot_total + (u100 % nonroot_total != 0);
+        -:  931:              }
+        -:  932:            else
+        -:  933:              {
+        -:  934:                /* The calculation cannot be done easily with integer
+        -:  935:                   arithmetic.  Fall back on floating point.  This can suffer
+        -:  936:                   from minor rounding errors, but doing it exactly requires
+        -:  937:                   multiple precision arithmetic, and it's not worth the
+        -:  938:                   aggravation.  */
+    #####:  939:                double u = v->negate_used ? - (double) - v->used : v->used;
+    #####:  940:                double a = v->negate_available
+    #####:  941:                           ? - (double) - v->available : v->available;
+    #####:  942:                double nonroot_total = u + a;
+    #####:  943:                if (nonroot_total)
+        -:  944:                  {
+    #####:  945:                    long int lipct = pct = u * 100 / nonroot_total;
+    #####:  946:                    double ipct = lipct;
+        -:  947:
+        -:  948:                    /* Like 'pct = ceil (dpct);', but avoid ceil so that
+        -:  949:                       the math library needn't be linked.  */
+    #####:  950:                    if (ipct - 1 < pct && pct <= ipct + 1)
+    #####:  951:                      pct = ipct + (ipct < pct);
+        -:  952:                  }
+        -:  953:              }
+        -:  954:
+        7:  955:            if (0 <= pct)
+        -:  956:              {
+        7:  957:                if (asprintf (&cell, "%.0f%%", pct) == -1)
+    #####:  958:                  cell = NULL;
+        -:  959:              }
+        -:  960:            else
+    #####:  961:              cell = strdup ("-");
+        -:  962:
+        7:  963:            if (!cell)
+    #####:  964:              xalloc_die ();
+        -:  965:
+        7:  966:            break;
+        -:  967:          }
+        -:  968:
+        -:  969:        case TARGET_FIELD:
+        -:  970:#ifdef HIDE_AUTOMOUNT_PREFIX
+        -:  971:          /* Don't print the first directory name in MOUNT_POINT if it's an
+        -:  972:             artifact of an automounter.  This is a bit too aggressive to be
+        -:  973:             the default.  */
+        -:  974:          if (STRNCMP_LIT (mount_point, "/auto/") == 0)
+        -:  975:            mount_point += 5;
+        -:  976:          else if (STRNCMP_LIT (mount_point, "/tmp_mnt/") == 0)
+        -:  977:            mount_point += 8;
+        -:  978:#endif
+        7:  979:          cell = xstrdup (mount_point);
+        7:  980:          break;
+        -:  981:
+        -:  982:        default:
+    #####:  983:          assert (!"unhandled field");
+        -:  984:        }
+        -:  985:
+       42:  986:      if (!cell)
+    #####:  987:        assert (!"empty cell");
+        -:  988:
+       42:  989:      hide_problematic_chars (cell);
+       42:  990:      columns[col]->width = MAX (columns[col]->width, mbswidth (cell, 0));
+       42:  991:      table[nrows - 1][col] = cell;
+        -:  992:    }
+        7:  993:  free (dev_name);
+        -:  994:}
+        -:  995:
+        -:  996:/* If DISK corresponds to a mount point, show its usage
+        -:  997:   and return true.  Otherwise, return false.  */
+        -:  998:static bool
+    #####:  999:get_disk (char const *disk)
+        -: 1000:{
+        -: 1001:  struct mount_entry const *me;
+    #####: 1002:  struct mount_entry const *best_match = NULL;
+        -: 1003:
+    #####: 1004:  for (me = mount_list; me; me = me->me_next)
+    #####: 1005:    if (STREQ (disk, me->me_devname))
+    #####: 1006:      best_match = me;
+        -: 1007:
+    #####: 1008:  if (best_match)
+        -: 1009:    {
+    #####: 1010:      get_dev (best_match->me_devname, best_match->me_mountdir, NULL,
+    #####: 1011:               best_match->me_type, best_match->me_dummy,
+    #####: 1012:               best_match->me_remote, NULL, false);
+    #####: 1013:      return true;
+        -: 1014:    }
+        -: 1015:
+    #####: 1016:  return false;
+        -: 1017:}
+        -: 1018:
+        -: 1019:/* Figure out which device file or directory POINT is mounted on
+        -: 1020:   and show its disk usage.
+        -: 1021:   STATP must be the result of 'stat (POINT, STATP)'.  */
+        -: 1022:static void
+        1: 1023:get_point (const char *point, const struct stat *statp)
+        -: 1024:{
+        -: 1025:  struct stat disk_stats;
+        -: 1026:  struct mount_entry *me;
+        1: 1027:  struct mount_entry const *best_match = NULL;
+        -: 1028:
+        -: 1029:  /* Calculate the real absolute file name for POINT, and use that to find
+        -: 1030:     the mount point.  This avoids statting unavailable mount points,
+        -: 1031:     which can hang df.  */
+        1: 1032:  char *resolved = canonicalize_file_name (point);
+        1: 1033:  if (resolved && resolved[0] == '/')
+        -: 1034:    {
+        1: 1035:      size_t resolved_len = strlen (resolved);
+        1: 1036:      size_t best_match_len = 0;
+        -: 1037:
+       32: 1038:      for (me = mount_list; me; me = me->me_next)
+       31: 1039:      if (!STREQ (me->me_type, "lofs")
+       31: 1040:          && (!best_match || best_match->me_dummy || !me->me_dummy))
+        -: 1041:        {
+       25: 1042:          size_t len = strlen (me->me_mountdir);
+       25: 1043:          if (best_match_len <= len && len <= resolved_len
+       25: 1044:              && (len == 1 /* root file system */
+       24: 1045:                  || ((len == resolved_len || resolved[len] == '/')
+        1: 1046:                      && STREQ_LEN (me->me_mountdir, resolved, len))))
+        -: 1047:            {
+        1: 1048:              best_match = me;
+        1: 1049:              best_match_len = len;
+        -: 1050:            }
+        -: 1051:        }
+        -: 1052:    }
+        1: 1053:  free (resolved);
+        1: 1054:  if (best_match
+        1: 1055:      && (stat (best_match->me_mountdir, &disk_stats) != 0
+        1: 1056:          || disk_stats.st_dev != statp->st_dev))
+    #####: 1057:    best_match = NULL;
+        -: 1058:
+        1: 1059:  if (! best_match)
+    #####: 1060:    for (me = mount_list; me; me = me->me_next)
+        -: 1061:      {
+    #####: 1062:        if (me->me_dev == (dev_t) -1)
+        -: 1063:          {
+    #####: 1064:            if (stat (me->me_mountdir, &disk_stats) == 0)
+    #####: 1065:              me->me_dev = disk_stats.st_dev;
+        -: 1066:            else
+        -: 1067:              {
+        -: 1068:                /* Report only I/O errors.  Other errors might be
+        -: 1069:                   caused by shadowed mount points, which means POINT
+        -: 1070:                   can't possibly be on this file system.  */
+    #####: 1071:                if (errno == EIO)
+        -: 1072:                  {
+    #####: 1073:                    error (0, errno, "%s", quote (me->me_mountdir));
+    #####: 1074:                    exit_status = EXIT_FAILURE;
+        -: 1075:                  }
+        -: 1076:
+        -: 1077:                /* So we won't try and fail repeatedly.  */
+    #####: 1078:                me->me_dev = (dev_t) -2;
+        -: 1079:              }
+        -: 1080:          }
+        -: 1081:
+    #####: 1082:        if (statp->st_dev == me->me_dev
+    #####: 1083:            && !STREQ (me->me_type, "lofs")
+    #####: 1084:            && (!best_match || best_match->me_dummy || !me->me_dummy))
+        -: 1085:          {
+        -: 1086:            /* Skip bogus mtab entries.  */
+    #####: 1087:            if (stat (me->me_mountdir, &disk_stats) != 0
+    #####: 1088:                || disk_stats.st_dev != me->me_dev)
+    #####: 1089:              me->me_dev = (dev_t) -2;
+        -: 1090:            else
+    #####: 1091:              best_match = me;
+        -: 1092:          }
+        -: 1093:      }
+        -: 1094:
+        1: 1095:  if (best_match)
+        3: 1096:    get_dev (best_match->me_devname, best_match->me_mountdir, point,
+        3: 1097:             best_match->me_type, best_match->me_dummy, best_match->me_remote,
+        -: 1098:             NULL, false);
+        -: 1099:  else
+        -: 1100:    {
+        -: 1101:      /* We couldn't find the mount entry corresponding to POINT.  Go ahead and
+        -: 1102:         print as much info as we can; methods that require the device to be
+        -: 1103:         present will fail at a later point.  */
+        -: 1104:
+        -: 1105:      /* Find the actual mount point.  */
+    #####: 1106:      char *mp = find_mount_point (point, statp);
+    #####: 1107:      if (mp)
+        -: 1108:        {
+    #####: 1109:          get_dev (NULL, mp, NULL, NULL, false, false, NULL, false);
+    #####: 1110:          free (mp);
+        -: 1111:        }
+        -: 1112:    }
+        1: 1113:}
+        -: 1114:
+        -: 1115:/* Determine what kind of node NAME is and show the disk usage
+        -: 1116:   for it.  STATP is the results of 'stat' on NAME.  */
+        -: 1117:
+        -: 1118:static void
+        1: 1119:get_entry (char const *name, struct stat const *statp)
+        -: 1120:{
+        1: 1121:  if ((S_ISBLK (statp->st_mode) || S_ISCHR (statp->st_mode))
+    #####: 1122:      && get_disk (name))
+        1: 1123:    return;
+        -: 1124:
+        1: 1125:  get_point (name, statp);
+        -: 1126:}
+        -: 1127:
+        -: 1128:/* Show all mounted file systems, except perhaps those that are of
+        -: 1129:   an unselected type or are empty.  */
+        -: 1130:
+        -: 1131:static void
+        1: 1132:get_all_entries (void)
+        -: 1133:{
+        -: 1134:  struct mount_entry *me;
+        -: 1135:
+       32: 1136:  for (me = mount_list; me; me = me->me_next)
+       62: 1137:    get_dev (me->me_devname, me->me_mountdir, NULL, me->me_type,
+       62: 1138:             me->me_dummy, me->me_remote, NULL, true);
+        1: 1139:}
+        -: 1140:
+        -: 1141:/* Add FSTYPE to the list of file system types to display.  */
+        -: 1142:
+        -: 1143:static void
+    #####: 1144:add_fs_type (const char *fstype)
+        -: 1145:{
+        -: 1146:  struct fs_type_list *fsp;
+        -: 1147:
+    #####: 1148:  fsp = xmalloc (sizeof *fsp);
+    #####: 1149:  fsp->fs_name = (char *) fstype;
+    #####: 1150:  fsp->fs_next = fs_select_list;
+    #####: 1151:  fs_select_list = fsp;
+    #####: 1152:}
+        -: 1153:
+        -: 1154:/* Add FSTYPE to the list of file system types to be omitted.  */
+        -: 1155:
+        -: 1156:static void
+    #####: 1157:add_excluded_fs_type (const char *fstype)
+        -: 1158:{
+        -: 1159:  struct fs_type_list *fsp;
+        -: 1160:
+    #####: 1161:  fsp = xmalloc (sizeof *fsp);
+    #####: 1162:  fsp->fs_name = (char *) fstype;
+    #####: 1163:  fsp->fs_next = fs_exclude_list;
+    #####: 1164:  fs_exclude_list = fsp;
+    #####: 1165:}
+        -: 1166:
+        -: 1167:void
+    #####: 1168:usage (int status)
+        -: 1169:{
+    #####: 1170:  if (status != EXIT_SUCCESS)
+    #####: 1171:    emit_try_help ();
+        -: 1172:  else
+        -: 1173:    {
+    #####: 1174:      printf (_("Usage: %s [OPTION]... [FILE]...\n"), program_name);
+    #####: 1175:      fputs (_("\
+        -: 1176:Show information about the file system on which each FILE resides,\n\
+        -: 1177:or all file systems by default.\n\
+        -: 1178:\n\
+        -: 1179:"), stdout);
+    #####: 1180:      fputs (_("\
+        -: 1181:Mandatory arguments to long options are mandatory for short options too.\n\
+        -: 1182:"), stdout);
+    #####: 1183:      fputs (_("\
+        -: 1184:  -a, --all             include dummy file systems\n\
+        -: 1185:  -B, --block-size=SIZE  scale sizes by SIZE before printing them.  E.g.,\n\
+        -: 1186:                           '-BM' prints sizes in units of 1,048,576 bytes.\n\
+        -: 1187:                           See SIZE format below.\n\
+        -: 1188:      --total           produce a grand total\n\
+        -: 1189:  -h, --human-readable  print sizes in human readable format (e.g., 1K 234M 2G)\
+        -: 1190:\n\
+        -: 1191:  -H, --si              likewise, but use powers of 1000 not 1024\n\
+        -: 1192:"), stdout);
+    #####: 1193:      fputs (_("\
+        -: 1194:  -i, --inodes          list inode information instead of block usage\n\
+        -: 1195:  -k                    like --block-size=1K\n\
+        -: 1196:  -l, --local           limit listing to local file systems\n\
+        -: 1197:      --no-sync         do not invoke sync before getting usage info (default)\
+        -: 1198:\n\
+        -: 1199:"), stdout);
+    #####: 1200:      fputs (_("\
+        -: 1201:      --output[=FIELD_LIST]  use the output format defined by FIELD_LIST,\n\
+        -: 1202:                               or print all fields if FIELD_LIST is omitted.\n\
+        -: 1203:  -P, --portability     use the POSIX output format\n\
+        -: 1204:      --sync            invoke sync before getting usage info\n\
+        -: 1205:  -t, --type=TYPE       limit listing to file systems of type TYPE\n\
+        -: 1206:  -T, --print-type      print file system type\n\
+        -: 1207:  -x, --exclude-type=TYPE   limit listing to file systems not of type TYPE\n\
+        -: 1208:  -v                    (ignored)\n\
+        -: 1209:"), stdout);
+    #####: 1210:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####: 1211:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####: 1212:      emit_blocksize_note ("DF");
+    #####: 1213:      emit_size_note ();
+    #####: 1214:      fputs (_("\n\
+        -: 1215:FIELD_LIST is a comma-separated list of columns to be included.  Valid\n\
+        -: 1216:field names are: 'source', 'fstype', 'itotal', 'iused', 'iavail', 'ipcent',\n\
+        -: 1217:'size', 'used', 'avail', 'pcent' and 'target' (see info page).\n\
+        -: 1218:"), stdout);
+    #####: 1219:      emit_ancillary_info ();
+        -: 1220:    }
+    #####: 1221:  exit (status);
+        -: 1222:}
+        -: 1223:
+        -: 1224:int
+        2: 1225:main (int argc, char **argv)
+        -: 1226:{
+        2: 1227:  struct stat *stats IF_LINT ( = 0);
+        -: 1228:
+        -: 1229:  initialize_main (&argc, &argv);
+        2: 1230:  set_program_name (argv[0]);
+        2: 1231:  setlocale (LC_ALL, "");
+        -: 1232:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -: 1233:  textdomain (PACKAGE);
+        -: 1234:
+        2: 1235:  atexit (close_stdout);
+        -: 1236:
+        2: 1237:  fs_select_list = NULL;
+        2: 1238:  fs_exclude_list = NULL;
+        2: 1239:  show_all_fs = false;
+        2: 1240:  show_listed_fs = false;
+        2: 1241:  human_output_opts = -1;
+        2: 1242:  print_type = false;
+        2: 1243:  file_systems_processed = false;
+        2: 1244:  exit_status = EXIT_SUCCESS;
+        2: 1245:  print_grand_total = false;
+        2: 1246:  grand_fsu.fsu_blocksize = 1;
+        -: 1247:
+        -: 1248:  /* If true, use the POSIX output format.  */
+        2: 1249:  bool posix_format = false;
+        -: 1250:
+        2: 1251:  const char *msg_mut_excl = _("options %s and %s are mutually exclusive");
+        -: 1252:
+        -: 1253:  while (true)
+        -: 1254:    {
+        3: 1255:      int oi = -1;
+        3: 1256:      int c = getopt_long (argc, argv, "aB:iF:hHklmPTt:vx:", long_options,
+        -: 1257:                           &oi);
+        3: 1258:      if (c == -1)
+        2: 1259:        break;
+        -: 1260:
+        1: 1261:      switch (c)
+        -: 1262:        {
+        -: 1263:        case 'a':
+    #####: 1264:          show_all_fs = true;
+    #####: 1265:          break;
+        -: 1266:        case 'B':
+        -: 1267:          {
+    #####: 1268:            enum strtol_error e = human_options (optarg, &human_output_opts,
+        -: 1269:                                                 &output_block_size);
+    #####: 1270:            if (e != LONGINT_OK)
+    #####: 1271:              xstrtol_fatal (e, oi, c, long_options, optarg);
+        -: 1272:          }
+    #####: 1273:          break;
+        -: 1274:        case 'i':
+    #####: 1275:          if (header_mode == OUTPUT_MODE)
+        -: 1276:            {
+    #####: 1277:              error (0, 0, msg_mut_excl, "-i", "--output");
+    #####: 1278:              usage (EXIT_FAILURE);
+        -: 1279:            }
+    #####: 1280:          header_mode = INODES_MODE;
+    #####: 1281:          break;
+        -: 1282:        case 'h':
+    #####: 1283:          human_output_opts = human_autoscale | human_SI | human_base_1024;
+    #####: 1284:          output_block_size = 1;
+    #####: 1285:          break;
+        -: 1286:        case 'H':
+    #####: 1287:          human_output_opts = human_autoscale | human_SI;
+    #####: 1288:          output_block_size = 1;
+    #####: 1289:          break;
+        -: 1290:        case 'k':
+    #####: 1291:          human_output_opts = 0;
+    #####: 1292:          output_block_size = 1024;
+    #####: 1293:          break;
+        -: 1294:        case 'l':
+        1: 1295:          show_local_fs = true;
+        1: 1296:          break;
+        -: 1297:        case MEGABYTES_OPTION:
+        -: 1298:          /* Distinguish between the long and the short option.
+        -: 1299:             As we want to remove the long option soon,
+        -: 1300:             give a warning when the long form is used.  */
+    #####: 1301:          error (0, 0, "%s%s", _("warning: "),
+        -: 1302:            _("long option '--megabytes' is deprecated"
+        -: 1303:              " and will soon be removed"));
+        -: 1304:        case 'm': /* obsolescent, exists for BSD compatibility */
+    #####: 1305:          human_output_opts = 0;
+    #####: 1306:          output_block_size = 1024 * 1024;
+    #####: 1307:          break;
+        -: 1308:        case 'T':
+    #####: 1309:          if (header_mode == OUTPUT_MODE)
+        -: 1310:            {
+    #####: 1311:              error (0, 0, msg_mut_excl, "-T", "--output");
+    #####: 1312:              usage (EXIT_FAILURE);
+        -: 1313:            }
+    #####: 1314:          print_type = true;
+    #####: 1315:          break;
+        -: 1316:        case 'P':
+    #####: 1317:          if (header_mode == OUTPUT_MODE)
+        -: 1318:            {
+    #####: 1319:              error (0, 0, msg_mut_excl, "-P", "--output");
+    #####: 1320:              usage (EXIT_FAILURE);
+        -: 1321:            }
+    #####: 1322:          posix_format = true;
+    #####: 1323:          break;
+        -: 1324:        case SYNC_OPTION:
+    #####: 1325:          require_sync = true;
+    #####: 1326:          break;
+        -: 1327:        case NO_SYNC_OPTION:
+    #####: 1328:          require_sync = false;
+    #####: 1329:          break;
+        -: 1330:
+        -: 1331:        case 'F':
+        -: 1332:          /* Accept -F as a synonym for -t for compatibility with Solaris.  */
+        -: 1333:        case 't':
+    #####: 1334:          add_fs_type (optarg);
+    #####: 1335:          show_rootfs = selected_fstype (ROOTFS);
+    #####: 1336:          break;
+        -: 1337:
+        -: 1338:        case 'v':		/* For SysV compatibility.  */
+        -: 1339:          /* ignore */
+    #####: 1340:          break;
+        -: 1341:        case 'x':
+    #####: 1342:          add_excluded_fs_type (optarg);
+    #####: 1343:          break;
+        -: 1344:
+        -: 1345:        case OUTPUT_OPTION:
+    #####: 1346:          if (header_mode == INODES_MODE)
+        -: 1347:            {
+    #####: 1348:              error (0, 0, msg_mut_excl, "-i", "--output");
+    #####: 1349:              usage (EXIT_FAILURE);
+        -: 1350:            }
+    #####: 1351:          if (posix_format && header_mode == DEFAULT_MODE)
+        -: 1352:            {
+    #####: 1353:              error (0, 0, msg_mut_excl, "-P", "--output");
+    #####: 1354:              usage (EXIT_FAILURE);
+        -: 1355:            }
+    #####: 1356:          if (print_type)
+        -: 1357:            {
+    #####: 1358:              error (0, 0, msg_mut_excl, "-T", "--output");
+    #####: 1359:              usage (EXIT_FAILURE);
+        -: 1360:            }
+    #####: 1361:          header_mode = OUTPUT_MODE;
+    #####: 1362:          if (optarg)
+    #####: 1363:            decode_output_arg (optarg);
+    #####: 1364:          break;
+        -: 1365:
+        -: 1366:        case TOTAL_OPTION:
+    #####: 1367:          print_grand_total = true;
+    #####: 1368:          break;
+        -: 1369:
+    #####: 1370:        case_GETOPT_HELP_CHAR;
+    #####: 1371:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -: 1372:
+        -: 1373:        default:
+    #####: 1374:          usage (EXIT_FAILURE);
+        -: 1375:        }
+        1: 1376:    }
+        -: 1377:
+        2: 1378:  if (human_output_opts == -1)
+        -: 1379:    {
+        2: 1380:      if (posix_format)
+        -: 1381:        {
+    #####: 1382:          human_output_opts = 0;
+    #####: 1383:          output_block_size = (getenv ("POSIXLY_CORRECT") ? 512 : 1024);
+        -: 1384:        }
+        -: 1385:      else
+        2: 1386:        human_options (getenv ("DF_BLOCK_SIZE"),
+        -: 1387:                       &human_output_opts, &output_block_size);
+        -: 1388:    }
+        -: 1389:
+        2: 1390:  if (header_mode == INODES_MODE || header_mode == OUTPUT_MODE)
+        -: 1391:    ;
+        2: 1392:  else if (human_output_opts & human_autoscale)
+    #####: 1393:    header_mode = HUMAN_MODE;
+        2: 1394:  else if (posix_format)
+    #####: 1395:    header_mode = POSIX_MODE;
+        -: 1396:
+        -: 1397:  /* Fail if the same file system type was both selected and excluded.  */
+        -: 1398:  {
+        2: 1399:    bool match = false;
+        -: 1400:    struct fs_type_list *fs_incl;
+        2: 1401:    for (fs_incl = fs_select_list; fs_incl; fs_incl = fs_incl->fs_next)
+        -: 1402:      {
+        -: 1403:        struct fs_type_list *fs_excl;
+    #####: 1404:        for (fs_excl = fs_exclude_list; fs_excl; fs_excl = fs_excl->fs_next)
+        -: 1405:          {
+    #####: 1406:            if (STREQ (fs_incl->fs_name, fs_excl->fs_name))
+        -: 1407:              {
+    #####: 1408:                error (0, 0,
+        -: 1409:                       _("file system type %s both selected and excluded"),
+    #####: 1410:                       quote (fs_incl->fs_name));
+    #####: 1411:                match = true;
+    #####: 1412:                break;
+        -: 1413:              }
+        -: 1414:          }
+        -: 1415:      }
+        2: 1416:    if (match)
+    #####: 1417:      exit (EXIT_FAILURE);
+        -: 1418:  }
+        -: 1419:
+        2: 1420:  if (optind < argc)
+        -: 1421:    {
+        -: 1422:      int i;
+        -: 1423:
+        -: 1424:      /* Open each of the given entries to make sure any corresponding
+        -: 1425:         partition is automounted.  This must be done before reading the
+        -: 1426:         file system table.  */
+        1: 1427:      stats = xnmalloc (argc - optind, sizeof *stats);
+        2: 1428:      for (i = optind; i < argc; ++i)
+        -: 1429:        {
+        -: 1430:          /* Prefer to open with O_NOCTTY and use fstat, but fall back
+        -: 1431:             on using "stat", in case the file is unreadable.  */
+        1: 1432:          int fd = open (argv[i], O_RDONLY | O_NOCTTY);
+        1: 1433:          if ((fd < 0 || fstat (fd, &stats[i - optind]))
+    #####: 1434:              && stat (argv[i], &stats[i - optind]))
+        -: 1435:            {
+    #####: 1436:              error (0, errno, "%s", quote (argv[i]));
+    #####: 1437:              exit_status = EXIT_FAILURE;
+    #####: 1438:              argv[i] = NULL;
+        -: 1439:            }
+        1: 1440:          if (0 <= fd)
+        1: 1441:            close (fd);
+        -: 1442:        }
+        -: 1443:    }
+        -: 1444:
+        2: 1445:  mount_list =
+        4: 1446:    read_file_system_list ((fs_select_list != NULL
+        2: 1447:                            || fs_exclude_list != NULL
+        2: 1448:                            || print_type
+        2: 1449:                            || field_data[FSTYPE_FIELD].used
+        4: 1450:                            || show_local_fs));
+        -: 1451:
+        2: 1452:  if (mount_list == NULL)
+        -: 1453:    {
+        -: 1454:      /* Couldn't read the table of mounted file systems.
+        -: 1455:         Fail if df was invoked with no file name arguments,
+        -: 1456:         or when either of -a, -l, -t or -x is used with file name
+        -: 1457:         arguments.  Otherwise, merely give a warning and proceed.  */
+    #####: 1458:      int status = 0;
+    #####: 1459:      if ( ! (optind < argc)
+    #####: 1460:           || (show_all_fs
+    #####: 1461:               || show_local_fs
+    #####: 1462:               || fs_select_list != NULL
+    #####: 1463:               || fs_exclude_list != NULL))
+        -: 1464:        {
+    #####: 1465:          status = EXIT_FAILURE;
+        -: 1466:        }
+    #####: 1467:      const char *warning = (status == 0 ? _("Warning: ") : "");
+    #####: 1468:      error (status, errno, "%s%s", warning,
+        -: 1469:             _("cannot read table of mounted file systems"));
+        -: 1470:    }
+        -: 1471:
+        2: 1472:  if (require_sync)
+    #####: 1473:    sync ();
+        -: 1474:
+        2: 1475:  get_field_list ();
+        2: 1476:  get_header ();
+        -: 1477:
+        2: 1478:  if (optind < argc)
+        -: 1479:    {
+        -: 1480:      int i;
+        -: 1481:
+        -: 1482:      /* Display explicitly requested empty file systems.  */
+        1: 1483:      show_listed_fs = true;
+        -: 1484:
+        2: 1485:      for (i = optind; i < argc; ++i)
+        1: 1486:        if (argv[i])
+        1: 1487:          get_entry (argv[i], &stats[i - optind]);
+        -: 1488:    }
+        -: 1489:  else
+        1: 1490:    get_all_entries ();
+        -: 1491:
+        2: 1492:  if (file_systems_processed)
+        -: 1493:    {
+        2: 1494:      if (print_grand_total)
+    #####: 1495:        get_dev ("total",
+    #####: 1496:                 (field_data[SOURCE_FIELD].used ? "-" : "total"),
+        -: 1497:                 NULL, NULL, false, false, &grand_fsu, false);
+        -: 1498:
+        2: 1499:      print_table ();
+        -: 1500:    }
+        -: 1501:  else
+        -: 1502:    {
+        -: 1503:      /* Print the "no FS processed" diagnostic only if there was no preceding
+        -: 1504:         diagnostic, e.g., if all have been excluded.  */
+    #####: 1505:      if (exit_status == EXIT_SUCCESS)
+    #####: 1506:        error (EXIT_FAILURE, 0, _("no file systems processed"));
+        -: 1507:    }
+        -: 1508:
+        2: 1509:  IF_LINT (free (columns));
+        2: 1510:  IF_LINT (
+        -: 1511:    while (devlist_head)
+        -: 1512:      {
+        -: 1513:        struct devlist *devlist = devlist_head->next;
+        -: 1514:        free (devlist_head);
+        -: 1515:        devlist_head = devlist;
+        -: 1516:      }
+        -: 1517:    );
+        -: 1518:
+        2: 1519:  exit (exit_status);
+        -: 1520:}

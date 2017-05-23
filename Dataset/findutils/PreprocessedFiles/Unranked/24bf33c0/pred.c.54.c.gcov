@@ -1,0 +1,2237 @@
+        -:    0:Source:pred.c
+        -:    0:Graph:pred.gcno
+        -:    0:Data:pred.gcda
+        -:    0:Runs:9
+        -:    0:Programs:2
+        -:    1:/* pred.c -- execute the expression tree.
+        -:    2:   Copyright (C) 1990, 1991, 1992, 1993, 1994, 2000, 2003, 
+        -:    3:                 2004, 2005 Free Software Foundation, Inc.
+        -:    4:
+        -:    5:   This program is free software; you can redistribute it and/or modify
+        -:    6:   it under the terms of the GNU General Public License as published by
+        -:    7:   the Free Software Foundation; either version 2, or (at your option)
+        -:    8:   any later version.
+        -:    9:
+        -:   10:   This program is distributed in the hope that it will be useful,
+        -:   11:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   12:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   13:   GNU General Public License for more details.
+        -:   14:
+        -:   15:   You should have received a copy of the GNU General Public License
+        -:   16:   along with this program; if not, write to the Free Software
+        -:   17:   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
+        -:   18:   USA.
+        -:   19:*/
+        -:   20:
+        -:   21:#include "defs.h"
+        -:   22:
+        -:   23:#include <fnmatch.h>
+        -:   24:#include <signal.h>
+        -:   25:#include <math.h>
+        -:   26:#include <pwd.h>
+        -:   27:#include <grp.h>
+        -:   28:#include <sys/types.h>
+        -:   29:#include <sys/stat.h>
+        -:   30:#include <assert.h>
+        -:   31:#include <fcntl.h>
+        -:   32:#include <locale.h>
+        -:   33:#include <openat.h>
+        -:   34:#include "xalloc.h"
+        -:   35:#include "dirname.h"
+        -:   36:#include "human.h"
+        -:   37:#include "modetype.h"
+        -:   38:#include "filemode.h"
+        -:   39:#include "wait.h"
+        -:   40:#include "printquoted.h"
+        -:   41:#include "buildcmd.h"
+        -:   42:#include "yesno.h"
+        -:   43:#include "listfile.h"
+        -:   44:#include "stat-time.h"
+        -:   45:#include "dircallback.h"
+        -:   46:
+        -:   47:#if ENABLE_NLS
+        -:   48:# include <libintl.h>
+        -:   49:# define _(Text) gettext (Text)
+        -:   50:#else
+        -:   51:# define _(Text) Text
+        -:   52:#endif
+        -:   53:#ifdef gettext_noop
+        -:   54:# define N_(String) gettext_noop (String)
+        -:   55:#else
+        -:   56:/* See locate.c for explanation as to why not use (String) */
+        -:   57:# define N_(String) String
+        -:   58:#endif
+        -:   59:
+        -:   60:#if !defined(SIGCHLD) && defined(SIGCLD)
+        -:   61:#define SIGCHLD SIGCLD
+        -:   62:#endif
+        -:   63:
+        -:   64:
+        -:   65:
+        -:   66:#if HAVE_DIRENT_H
+        -:   67:# include <dirent.h>
+        -:   68:# define NAMLEN(dirent) strlen((dirent)->d_name)
+        -:   69:#else
+        -:   70:# define dirent direct
+        -:   71:# define NAMLEN(dirent) (dirent)->d_namlen
+        -:   72:# if HAVE_SYS_NDIR_H
+        -:   73:#  include <sys/ndir.h>
+        -:   74:# endif
+        -:   75:# if HAVE_SYS_DIR_H
+        -:   76:#  include <sys/dir.h>
+        -:   77:# endif
+        -:   78:# if HAVE_NDIR_H
+        -:   79:#  include <ndir.h>
+        -:   80:# endif
+        -:   81:#endif
+        -:   82:
+        -:   83:#ifdef CLOSEDIR_VOID
+        -:   84:/* Fake a return value. */
+        -:   85:#define CLOSEDIR(d) (closedir (d), 0)
+        -:   86:#else
+        -:   87:#define CLOSEDIR(d) closedir (d)
+        -:   88:#endif
+        -:   89:
+        -:   90:
+        -:   91:
+        -:   92:
+        -:   93:/* Get or fake the disk device blocksize.
+        -:   94:   Usually defined by sys/param.h (if at all).  */
+        -:   95:#ifndef DEV_BSIZE
+        -:   96:# ifdef BSIZE
+        -:   97:#  define DEV_BSIZE BSIZE
+        -:   98:# else /* !BSIZE */
+        -:   99:#  define DEV_BSIZE 4096
+        -:  100:# endif /* !BSIZE */
+        -:  101:#endif /* !DEV_BSIZE */
+        -:  102:
+        -:  103:/* Extract or fake data from a `struct stat'.
+        -:  104:   ST_BLKSIZE: Preferred I/O blocksize for the file, in bytes.
+        -:  105:   ST_NBLOCKS: Number of blocks in the file, including indirect blocks.
+        -:  106:   ST_NBLOCKSIZE: Size of blocks used when calculating ST_NBLOCKS.  */
+        -:  107:#ifndef HAVE_STRUCT_STAT_ST_BLOCKS
+        -:  108:# define ST_BLKSIZE(statbuf) DEV_BSIZE
+        -:  109:# if defined(_POSIX_SOURCE) || !defined(BSIZE) /* fileblocks.c uses BSIZE.  */
+        -:  110:#  define ST_NBLOCKS(statbuf) \
+        -:  111:  (S_ISREG ((statbuf).st_mode) \
+        -:  112:   || S_ISDIR ((statbuf).st_mode) \
+        -:  113:   ? (statbuf).st_size / ST_NBLOCKSIZE + ((statbuf).st_size % ST_NBLOCKSIZE != 0) : 0)
+        -:  114:# else /* !_POSIX_SOURCE && BSIZE */
+        -:  115:#  define ST_NBLOCKS(statbuf) \
+        -:  116:  (S_ISREG ((statbuf).st_mode) \
+        -:  117:   || S_ISDIR ((statbuf).st_mode) \
+        -:  118:   ? st_blocks ((statbuf).st_size) : 0)
+        -:  119:# endif /* !_POSIX_SOURCE && BSIZE */
+        -:  120:#else /* HAVE_STRUCT_STAT_ST_BLOCKS */
+        -:  121:/* Some systems, like Sequents, return st_blksize of 0 on pipes. */
+        -:  122:# define ST_BLKSIZE(statbuf) ((statbuf).st_blksize > 0 \
+        -:  123:			       ? (statbuf).st_blksize : DEV_BSIZE)
+        -:  124:# if defined(hpux) || defined(__hpux__) || defined(__hpux)
+        -:  125:/* HP-UX counts st_blocks in 1024-byte units.
+        -:  126:   This loses when mixing HP-UX and BSD filesystems with NFS.  */
+        -:  127:#  define ST_NBLOCKSIZE 1024
+        -:  128:# else /* !hpux */
+        -:  129:#  if defined(_AIX) && defined(_I386)
+        -:  130:/* AIX PS/2 counts st_blocks in 4K units.  */
+        -:  131:#   define ST_NBLOCKSIZE (4 * 1024)
+        -:  132:#  else /* not AIX PS/2 */
+        -:  133:#   if defined(_CRAY)
+        -:  134:#    define ST_NBLOCKS(statbuf) \
+        -:  135:  (S_ISREG ((statbuf).st_mode) \
+        -:  136:   || S_ISDIR ((statbuf).st_mode) \
+        -:  137:   ? (statbuf).st_blocks * ST_BLKSIZE(statbuf)/ST_NBLOCKSIZE : 0)
+        -:  138:#   endif /* _CRAY */
+        -:  139:#  endif /* not AIX PS/2 */
+        -:  140:# endif /* !hpux */
+        -:  141:#endif /* HAVE_STRUCT_STAT_ST_BLOCKS */
+        -:  142:
+        -:  143:#ifndef ST_NBLOCKS
+        -:  144:# define ST_NBLOCKS(statbuf) \
+        -:  145:  (S_ISREG ((statbuf).st_mode) \
+        -:  146:   || S_ISDIR ((statbuf).st_mode) \
+        -:  147:   ? (statbuf).st_blocks : 0)
+        -:  148:#endif
+        -:  149:
+        -:  150:#ifndef ST_NBLOCKSIZE
+        -:  151:# define ST_NBLOCKSIZE 512
+        -:  152:#endif
+        -:  153:
+        -:  154:
+        -:  155:#undef MAX
+        -:  156:#define MAX(a, b) ((a) > (b) ? (a) : (b))
+        -:  157:
+        -:  158:static boolean match_lname PARAMS((char *pathname, struct stat *stat_buf, struct predicate *pred_ptr, boolean ignore_case));
+        -:  159:
+        -:  160:static char *format_date PARAMS((struct timespec ts, int kind));
+        -:  161:static char *ctime_format PARAMS((struct timespec ts));
+        -:  162:
+        -:  163:#ifdef	DEBUG
+        -:  164:struct pred_assoc
+        -:  165:{
+        -:  166:  PRED_FUNC pred_func;
+        -:  167:  char *pred_name;
+        -:  168:};
+        -:  169:
+        -:  170:struct pred_assoc pred_table[] =
+        -:  171:{
+        -:  172:  {pred_amin, "amin    "},
+        -:  173:  {pred_and, "and     "},
+        -:  174:  {pred_anewer, "anewer  "},
+        -:  175:  {pred_atime, "atime   "},
+        -:  176:  {pred_close, ")       "},
+        -:  177:  {pred_cmin, "cmin    "},
+        -:  178:  {pred_cnewer, "cnewer  "},
+        -:  179:  {pred_comma, ",       "},
+        -:  180:  {pred_ctime, "ctime   "},
+        -:  181:  {pred_delete, "delete  "},
+        -:  182:  {pred_empty, "empty   "},
+        -:  183:  {pred_exec, "exec    "},
+        -:  184:  {pred_execdir, "execdir "},
+        -:  185:  {pred_executable, "executable "},
+        -:  186:  {pred_false, "false   "},
+        -:  187:  {pred_fprint, "fprint  "},
+        -:  188:  {pred_fprint0, "fprint0 "},
+        -:  189:  {pred_fprintf, "fprintf "},
+        -:  190:  {pred_fstype, "fstype  "},
+        -:  191:  {pred_gid, "gid     "},
+        -:  192:  {pred_group, "group   "},
+        -:  193:  {pred_ilname, "ilname  "},
+        -:  194:  {pred_iname, "iname   "},
+        -:  195:  {pred_inum, "inum    "},
+        -:  196:  {pred_ipath, "ipath   "},
+        -:  197:  {pred_links, "links   "},
+        -:  198:  {pred_lname, "lname   "},
+        -:  199:  {pred_ls, "ls      "},
+        -:  200:  {pred_mmin, "mmin    "},
+        -:  201:  {pred_mtime, "mtime   "},
+        -:  202:  {pred_name, "name    "},
+        -:  203:  {pred_negate, "not     "},
+        -:  204:  {pred_newer, "newer   "},
+        -:  205:  {pred_newerXY, "newerXY   "},
+        -:  206:  {pred_nogroup, "nogroup "},
+        -:  207:  {pred_nouser, "nouser  "},
+        -:  208:  {pred_ok, "ok      "},
+        -:  209:  {pred_okdir, "okdir   "},
+        -:  210:  {pred_open, "(       "},
+        -:  211:  {pred_or, "or      "},
+        -:  212:  {pred_path, "path    "},
+        -:  213:  {pred_perm, "perm    "},
+        -:  214:  {pred_print, "print   "},
+        -:  215:  {pred_print0, "print0  "},
+        -:  216:  {pred_prune, "prune   "},
+        -:  217:  {pred_quit, "quit    "},
+        -:  218:  {pred_readable, "readable    "},
+        -:  219:  {pred_regex, "regex   "},
+        -:  220:  {pred_samefile,"samefile "},
+        -:  221:  {pred_size, "size    "},
+        -:  222:  {pred_true, "true    "},
+        -:  223:  {pred_type, "type    "},
+        -:  224:  {pred_uid, "uid     "},
+        -:  225:  {pred_used, "used    "},
+        -:  226:  {pred_user, "user    "},
+        -:  227:  {pred_writable, "writable "},
+        -:  228:  {pred_xtype, "xtype   "},
+        -:  229:  {0, "none    "}
+        -:  230:};
+        -:  231:#endif
+        -:  232:
+        -:  233:/* Returns ts1 - ts2 */
+    #####:  234:static double ts_difference(struct timespec ts1,
+        -:  235:			    struct timespec ts2)
+        -:  236:{
+    #####:  237:  double d =  difftime(ts1.tv_sec, ts2.tv_sec) 
+    #####:  238:    + (1.0e-9 * (ts1.tv_nsec - ts2.tv_nsec));
+    #####:  239:  return d;
+        -:  240:}
+        -:  241:
+        -:  242:
+        -:  243:static int 
+    #####:  244:compare_ts(struct timespec ts1,
+        -:  245:	   struct timespec ts2)
+        -:  246:{
+    #####:  247:  if ((ts1.tv_sec == ts2.tv_sec) &&
+    #####:  248:      (ts1.tv_nsec == ts2.tv_nsec))
+        -:  249:    {
+    #####:  250:      return 0;
+        -:  251:    }
+        -:  252:  else
+        -:  253:    {
+    #####:  254:      double diff = ts_difference(ts1, ts2);
+    #####:  255:      return diff < 0.0 ? -1 : +1;
+        -:  256:    }
+        -:  257:}
+        -:  258:
+        -:  259:/* Predicate processing routines.
+        -:  260: 
+        -:  261:   PATHNAME is the full pathname of the file being checked.
+        -:  262:   *STAT_BUF contains information about PATHNAME.
+        -:  263:   *PRED_PTR contains information for applying the predicate.
+        -:  264: 
+        -:  265:   Return true if the file passes this predicate, false if not. */
+        -:  266:
+        -:  267:
+        -:  268:/* pred_timewindow
+        -:  269: *
+        -:  270: * Returns true if THE_TIME is 
+        -:  271: * COMP_GT: after the specified time
+        -:  272: * COMP_LT: before the specified time
+        -:  273: * COMP_EQ: less than WINDOW seconds after the specified time.
+        -:  274: */
+        -:  275:static boolean
+    #####:  276:pred_timewindow(struct timespec ts, struct predicate const *pred_ptr, int window)
+        -:  277:{
+        -:  278:  double delta;
+        -:  279:  
+    #####:  280:  switch (pred_ptr->args.reftime.kind)
+        -:  281:    {
+        -:  282:    case COMP_GT:
+    #####:  283:      return compare_ts(ts, pred_ptr->args.reftime.ts) > 0;
+        -:  284:      
+        -:  285:    case COMP_LT:
+    #####:  286:      return compare_ts(ts, pred_ptr->args.reftime.ts) < 0;
+        -:  287:      
+        -:  288:    case COMP_EQ:
+    #####:  289:      delta = ts_difference(ts, pred_ptr->args.reftime.ts);
+    #####:  290:      return (delta >= 0.0 && delta < window);
+        -:  291:    }
+    #####:  292:}
+        -:  293:
+        -:  294:
+        -:  295:boolean
+    #####:  296:pred_amin (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  297:{
+        -:  298:  (void) &pathname;
+    #####:  299:  return pred_timewindow(get_stat_atime(stat_buf), pred_ptr, 60);
+        -:  300:}
+        -:  301:
+        -:  302:boolean
+       16:  303:pred_and (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  304:{
+       16:  305:  if (pred_ptr->pred_left == NULL
+    #####:  306:      || (*pred_ptr->pred_left->pred_func) (pathname, stat_buf,
+        -:  307:					    pred_ptr->pred_left))
+        -:  308:    {
+        -:  309:      /* Check whether we need a stat here. */
+       16:  310:      if (get_info(pathname, stat_buf, pred_ptr) != 0)
+    #####:  311:	    return false;
+       16:  312:      return ((*pred_ptr->pred_right->pred_func) (pathname, stat_buf,  
+        -:  313:						  pred_ptr->pred_right));
+        -:  314:    }
+        -:  315:  else
+    #####:  316:    return (false);
+        -:  317:}
+        -:  318:
+        -:  319:boolean
+    #####:  320:pred_anewer (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  321:{
+        -:  322:  (void) &pathname;
+    #####:  323:  assert(COMP_GT == pred_ptr->args.reftime.kind);
+    #####:  324:  return compare_ts(get_stat_atime(stat_buf), pred_ptr->args.reftime.ts) > 0;
+        -:  325:}
+        -:  326:
+        -:  327:boolean
+    #####:  328:pred_atime (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  329:{
+        -:  330:  (void) &pathname;
+    #####:  331:  return pred_timewindow(get_stat_atime(stat_buf), pred_ptr, DAYSECS);
+        -:  332:}
+        -:  333:
+        -:  334:boolean
+    #####:  335:pred_close (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  336:{
+        -:  337:  (void) &pathname;
+        -:  338:  (void) &stat_buf;
+        -:  339:  (void) &pred_ptr;
+        -:  340:  
+    #####:  341:  return true;
+        -:  342:}
+        -:  343:
+        -:  344:boolean
+    #####:  345:pred_cmin (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  346:{
+        -:  347:  (void) pathname;
+    #####:  348:  return pred_timewindow(get_stat_ctime(stat_buf), pred_ptr, 60);
+        -:  349:}
+        -:  350:
+        -:  351:boolean
+    #####:  352:pred_cnewer (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  353:{
+        -:  354:  (void) pathname;
+        -:  355:  
+    #####:  356:  assert(COMP_GT == pred_ptr->args.reftime.kind);
+    #####:  357:  return compare_ts(get_stat_ctime(stat_buf), pred_ptr->args.reftime.ts) > 0;
+        -:  358:}
+        -:  359:
+        -:  360:boolean
+    #####:  361:pred_comma (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  362:{
+    #####:  363:  if (pred_ptr->pred_left != NULL)
+    #####:  364:    (*pred_ptr->pred_left->pred_func) (pathname, stat_buf,
+        -:  365:				       pred_ptr->pred_left);
+        -:  366:  /* Check whether we need a stat here. */
+        -:  367:  /* TODO: what about need_type? */
+    #####:  368:  if (get_info(pathname, stat_buf, pred_ptr) != 0)
+    #####:  369:    return false;
+    #####:  370:  return ((*pred_ptr->pred_right->pred_func) (pathname, stat_buf,
+        -:  371:					      pred_ptr->pred_right));
+        -:  372:}
+        -:  373:
+        -:  374:boolean
+    #####:  375:pred_ctime (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  376:{
+        -:  377:  (void) &pathname;
+    #####:  378:  return pred_timewindow(get_stat_ctime(stat_buf), pred_ptr, DAYSECS);
+        -:  379:}
+        -:  380:
+        -:  381:boolean
+    #####:  382:pred_delete (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  383:{
+        -:  384:  (void) pred_ptr;
+        -:  385:  (void) stat_buf;
+    #####:  386:  if (strcmp (state.rel_pathname, "."))
+        -:  387:    {
+    #####:  388:      int flags=0;
+    #####:  389:      if (S_ISDIR(stat_buf->st_mode))
+    #####:  390:	flags |= AT_REMOVEDIR;
+    #####:  391:      if (0 != unlinkat(state.cwd_dir_fd, state.rel_pathname, flags))
+        -:  392:	{
+    #####:  393:	  error (0, errno, "cannot delete %s", pathname);
+    #####:  394:	  return false;
+        -:  395:	}
+        -:  396:      else
+        -:  397:	{
+    #####:  398:	  return true;
+        -:  399:	}
+        -:  400:    }
+        -:  401:  
+        -:  402:  /* nothing to do. */
+    #####:  403:  return true;
+        -:  404:}
+        -:  405:
+        -:  406:boolean
+    #####:  407:pred_empty (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  408:{
+        -:  409:  (void) pathname;
+        -:  410:  (void) pred_ptr;
+        -:  411:  
+    #####:  412:  if (S_ISDIR (stat_buf->st_mode))
+        -:  413:    {
+        -:  414:      int fd;
+        -:  415:      DIR *d;
+        -:  416:      struct dirent *dp;
+    #####:  417:      boolean empty = true;
+        -:  418:
+    #####:  419:      errno = 0;
+    #####:  420:      if ((fd = openat(state.cwd_dir_fd, state.rel_pathname, O_RDONLY
+        -:  421:#if defined O_LARGEFILE
+        -:  422:			|O_LARGEFILE
+        -:  423:#endif
+        -:  424:		       )) < 0)
+        -:  425:	{
+    #####:  426:	  error (0, errno, "%s", pathname);
+    #####:  427:	  state.exit_status = 1;
+    #####:  428:	  return false;
+        -:  429:	}
+    #####:  430:      d = fdopendir (fd);
+    #####:  431:      if (d == NULL)
+        -:  432:	{
+    #####:  433:	  error (0, errno, "%s", pathname);
+    #####:  434:	  state.exit_status = 1;
+    #####:  435:	  return false;
+        -:  436:	}
+    #####:  437:      for (dp = readdir (d); dp; dp = readdir (d))
+        -:  438:	{
+    #####:  439:	  if (dp->d_name[0] != '.'
+    #####:  440:	      || (dp->d_name[1] != '\0'
+    #####:  441:		  && (dp->d_name[1] != '.' || dp->d_name[2] != '\0')))
+        -:  442:	    {
+    #####:  443:	      empty = false;
+    #####:  444:	      break;
+        -:  445:	    }
+        -:  446:	}
+    #####:  447:      if (CLOSEDIR (d))
+        -:  448:	{
+    #####:  449:	  error (0, errno, "%s", pathname);
+    #####:  450:	  state.exit_status = 1;
+    #####:  451:	  return false;
+        -:  452:	}
+    #####:  453:      return (empty);
+        -:  454:    }
+    #####:  455:  else if (S_ISREG (stat_buf->st_mode))
+    #####:  456:    return (stat_buf->st_size == 0);
+        -:  457:  else
+    #####:  458:    return (false);
+        -:  459:}
+        -:  460:
+        -:  461:static boolean
+    #####:  462:new_impl_pred_exec (int dirfd, const char *pathname,
+        -:  463:		    struct stat *stat_buf,
+        -:  464:		    struct predicate *pred_ptr,
+        -:  465:		    const char *prefix, size_t pfxlen)
+        -:  466:{
+    #####:  467:  struct exec_val *execp = &pred_ptr->args.exec_vec;
+    #####:  468:  size_t len = strlen(pathname);
+        -:  469:
+        -:  470:  (void) stat_buf;
+    #####:  471:  execp->dirfd = dirfd;
+    #####:  472:  if (execp->multiple)
+        -:  473:    {
+        -:  474:      /* Push the argument onto the current list. 
+        -:  475:       * The command may or may not be run at this point, 
+        -:  476:       * depending on the command line length limits.
+        -:  477:       */
+    #####:  478:      bc_push_arg(&execp->ctl,
+        -:  479:		  &execp->state,
+        -:  480:		  pathname, len+1,
+        -:  481:		  prefix, pfxlen,
+        -:  482:		  0);
+        -:  483:
+        -:  484:      /* remember that there are pending execdirs. */
+    #####:  485:      state.execdirs_outstanding = true;
+        -:  486:      
+        -:  487:      /* POSIX: If the primary expression is punctuated by a plus
+        -:  488:       * sign, the primary shall always evaluate as true
+        -:  489:       */
+    #####:  490:      return true;
+        -:  491:    }
+        -:  492:  else
+        -:  493:    {
+        -:  494:      int i;
+        -:  495:
+    #####:  496:      for (i=0; i<execp->num_args; ++i)
+        -:  497:	{
+    #####:  498:	  bc_do_insert(&execp->ctl,
+        -:  499:		       &execp->state,
+    #####:  500:		       execp->replace_vec[i],
+    #####:  501:		       strlen(execp->replace_vec[i]),
+        -:  502:		       prefix, pfxlen,
+        -:  503:		       pathname, len,
+        -:  504:		       0);
+        -:  505:	}
+        -:  506:
+        -:  507:      /* Actually invoke the command. */
+    #####:  508:      return  execp->ctl.exec_callback(&execp->ctl,
+        -:  509:					&execp->state);
+        -:  510:    }
+        -:  511:}
+        -:  512:
+        -:  513:
+        -:  514:boolean
+    #####:  515:pred_exec (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  516:{
+    #####:  517:  return new_impl_pred_exec(get_start_dirfd(),
+        -:  518:			    pathname, stat_buf, pred_ptr, NULL, 0);
+        -:  519:}
+        -:  520:
+        -:  521:boolean
+    #####:  522:pred_execdir (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  523:{
+    #####:  524:   const char *prefix = (state.rel_pathname[0] == '/') ? NULL : "./";
+        -:  525:   (void) &pathname;
+    #####:  526:   return new_impl_pred_exec (get_current_dirfd(),
+    #####:  527:			      state.rel_pathname, stat_buf, pred_ptr,
+        -:  528:			      prefix, (prefix ? 2 : 0));
+        -:  529:}
+        -:  530:
+        -:  531:boolean
+    #####:  532:pred_false (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  533:{
+        -:  534:  (void) &pathname;
+        -:  535:  (void) &stat_buf;
+        -:  536:  (void) &pred_ptr;
+        -:  537:
+        -:  538:  
+    #####:  539:  return (false);
+        -:  540:}
+        -:  541:
+        -:  542:boolean
+    #####:  543:pred_fls (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  544:{
+    #####:  545:  list_file (pathname, state.cwd_dir_fd, state.rel_pathname, stat_buf, options.start_time.tv_sec,
+        -:  546:	     options.output_block_size,
+    #####:  547:	     pred_ptr->literal_control_chars, pred_ptr->args.stream);
+    #####:  548:  return true;
+        -:  549:}
+        -:  550:
+        -:  551:boolean
+    #####:  552:pred_fprint (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  553:{
+        -:  554:  (void) &pathname;
+        -:  555:  (void) &stat_buf;
+        -:  556:  
+    #####:  557:  print_quoted(pred_ptr->args.printf_vec.stream,
+    #####:  558:	       pred_ptr->args.printf_vec.quote_opts,
+    #####:  559:	       pred_ptr->args.printf_vec.dest_is_tty,
+        -:  560:	       "%s\n",
+        -:  561:	       pathname);
+    #####:  562:  return true;
+        -:  563:}
+        -:  564:
+        -:  565:boolean
+    #####:  566:pred_fprint0 (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  567:{
+        -:  568:  (void) &pathname;
+        -:  569:  (void) &stat_buf;
+        -:  570:  
+    #####:  571:  fputs (pathname, pred_ptr->args.stream);
+    #####:  572:  putc (0, pred_ptr->args.stream);
+    #####:  573:  return (true);
+        -:  574:}
+        -:  575:
+        -:  576:
+        -:  577:
+        -:  578:static char*
+    #####:  579:mode_to_filetype(mode_t m)
+        -:  580:{
+    #####:  581:  return
+    #####:  582:    m == S_IFSOCK ? "s" :
+    #####:  583:    m == S_IFLNK  ? "l" :
+    #####:  584:    m == S_IFREG  ? "f" :
+    #####:  585:    m == S_IFBLK  ? "b" :
+    #####:  586:    m == S_IFDIR  ? "d" :
+    #####:  587:    m == S_IFCHR  ? "c" :
+        -:  588:#ifdef S_IFDOOR
+        -:  589:    m == S_IFDOOR ? "D" :
+        -:  590:#endif
+    #####:  591:    m == S_IFIFO  ? "p" : "U";
+        -:  592:}
+        -:  593:
+        -:  594:static double 
+    #####:  595:file_sparseness(const struct stat *p)
+        -:  596:{
+    #####:  597:  if (0 == p->st_size)
+        -:  598:    {
+    #####:  599:      if (0 == p->st_blocks)
+    #####:  600:	return 1.0;
+        -:  601:      else
+    #####:  602:	return p->st_blocks < 0 ? -HUGE_VAL : HUGE_VAL;
+        -:  603:    }
+        -:  604:  else
+        -:  605:    {
+    #####:  606:      double blklen = file_blocksize(p) * (double)p->st_blocks;
+    #####:  607:      return blklen / p->st_size;
+        -:  608:    }
+        -:  609:}
+        -:  610:
+        -:  611:
+        -:  612:
+        -:  613:static boolean
+       32:  614:do_fprintf(FILE *fp,
+        -:  615:	   struct segment *segment,
+        -:  616:	   char *pathname,
+        -:  617:	   const struct stat *stat_buf,
+        -:  618:	   boolean ttyflag,
+        -:  619:	   const struct quoting_options *qopts)
+        -:  620:{
+        -:  621:  char hbuf[LONGEST_HUMAN_READABLE + 1];
+        -:  622:  char *cp;
+        -:  623:
+       32:  624:  switch (segment->segkind)
+        -:  625:    {
+        -:  626:    case KIND_PLAIN:	/* Plain text string (no % conversion). */
+        -:  627:      /* trusted */
+       16:  628:      fwrite (segment->text, 1, segment->text_len, fp);
+       16:  629:      break;
+        -:  630:	  
+        -:  631:    case KIND_STOP:		/* Terminate argument and flush output. */
+        -:  632:      /* trusted */
+    #####:  633:      fwrite (segment->text, 1, segment->text_len, fp);
+    #####:  634:      fflush (fp);
+    #####:  635:      return (true);
+        -:  636:	  
+        -:  637:    case KIND_FORMAT:
+       16:  638:      switch (segment->format_char[0])
+        -:  639:	{
+        -:  640:	case 'a':		/* atime in `ctime' format. */
+        -:  641:	  /* UNTRUSTED, probably unexploitable */
+    #####:  642:	  fprintf (fp, segment->text, ctime_format (get_stat_atime(stat_buf)));
+    #####:  643:	  break;
+        -:  644:	case 'b':		/* size in 512-byte blocks */
+        -:  645:	  /* UNTRUSTED, probably unexploitable */
+    #####:  646:	  fprintf (fp, segment->text,
+    #####:  647:		   human_readable ((uintmax_t) ST_NBLOCKS (*stat_buf),
+        -:  648:				   hbuf, human_ceiling,
+        -:  649:				   ST_NBLOCKSIZE, 512));
+    #####:  650:	  break;
+        -:  651:	case 'c':		/* ctime in `ctime' format */
+        -:  652:	  /* UNTRUSTED, probably unexploitable */
+    #####:  653:	  fprintf (fp, segment->text, ctime_format (get_stat_ctime(stat_buf)));
+    #####:  654:	  break;
+        -:  655:	case 'd':		/* depth in search tree */
+        -:  656:	  /* UNTRUSTED, probably unexploitable */
+    #####:  657:	  fprintf (fp, segment->text, state.curdepth);
+    #####:  658:	  break;
+        -:  659:	case 'D':		/* Device on which file exists (stat.st_dev) */
+        -:  660:	  /* trusted */
+    #####:  661:	  fprintf (fp, segment->text, 
+        -:  662:		   human_readable ((uintmax_t) stat_buf->st_dev, hbuf,
+        -:  663:				   human_ceiling, 1, 1));
+    #####:  664:	  break;
+        -:  665:	case 'f':		/* base name of path */
+        -:  666:	  /* sanitised */
+    #####:  667:	  print_quoted (fp, qopts, ttyflag, segment->text, base_name (pathname));
+    #####:  668:	  break;
+        -:  669:	case 'F':		/* filesystem type */
+        -:  670:	  /* trusted */
+    #####:  671:	  print_quoted (fp, qopts, ttyflag, segment->text, filesystem_type (stat_buf, pathname));
+    #####:  672:	  break;
+        -:  673:	case 'g':		/* group name */
+        -:  674:	  /* trusted */
+        -:  675:	  /* (well, the actual group is selected by the user but
+        -:  676:	   * its name was selected by the system administrator)
+        -:  677:	   */
+        -:  678:	  {
+        -:  679:	    struct group *g;
+        -:  680:
+    #####:  681:	    g = getgrgid (stat_buf->st_gid);
+    #####:  682:	    if (g)
+        -:  683:	      {
+    #####:  684:		segment->text[segment->text_len] = 's';
+    #####:  685:		fprintf (fp, segment->text, g->gr_name);
+    #####:  686:		break;
+        -:  687:	      }
+        -:  688:	    else
+        -:  689:	      {
+        -:  690:		/* Do nothing. */
+        -:  691:		/*FALLTHROUGH*/
+        -:  692:	      }
+        -:  693:	  }
+        -:  694:	case 'G':		/* GID number */
+        -:  695:	  /* UNTRUSTED, probably unexploitable */
+    #####:  696:	  fprintf (fp, segment->text,
+    #####:  697:		   human_readable ((uintmax_t) stat_buf->st_gid, hbuf,
+        -:  698:				   human_ceiling, 1, 1));
+    #####:  699:	  break;
+        -:  700:	case 'h':		/* leading directories part of path */
+        -:  701:	  /* sanitised */
+        -:  702:	  {
+        -:  703:	    char cc;
+        -:  704:	    
+    #####:  705:	    cp = strrchr (pathname, '/');
+    #####:  706:	    if (cp == NULL)	/* No leading directories. */
+        -:  707:	      {
+        -:  708:		/* If there is no slash in the pathname, we still
+        -:  709:		 * print the string because it contains characters
+        -:  710:		 * other than just '%s'.  The %h expands to ".".
+        -:  711:		 */
+    #####:  712:		print_quoted (fp, qopts, ttyflag, segment->text, ".");
+        -:  713:	      }
+        -:  714:	    else
+        -:  715:	      {
+    #####:  716:		cc = *cp;
+    #####:  717:		*cp = '\0';
+    #####:  718:		print_quoted (fp, qopts, ttyflag, segment->text, pathname);
+    #####:  719:		*cp = cc;
+        -:  720:	      }
+    #####:  721:	    break;
+        -:  722:	  }
+        -:  723:	case 'H':		/* ARGV element file was found under */
+        -:  724:	  /* trusted */
+        -:  725:	  {
+       16:  726:	    char cc = pathname[state.starting_path_length];
+        -:  727:
+       16:  728:	    pathname[state.starting_path_length] = '\0';
+       16:  729:	    fprintf (fp, segment->text, pathname);
+       16:  730:	    pathname[state.starting_path_length] = cc;
+       16:  731:	    break;
+        -:  732:	  }
+        -:  733:	case 'i':		/* inode number */
+        -:  734:	  /* UNTRUSTED, but not exploitable I think */
+    #####:  735:	  fprintf (fp, segment->text,
+        -:  736:		   human_readable ((uintmax_t) stat_buf->st_ino, hbuf,
+        -:  737:				   human_ceiling,
+        -:  738:				   1, 1));
+    #####:  739:	  break;
+        -:  740:	case 'k':		/* size in 1K blocks */
+        -:  741:	  /* UNTRUSTED, but not exploitable I think */
+    #####:  742:	  fprintf (fp, segment->text,
+    #####:  743:		   human_readable ((uintmax_t) ST_NBLOCKS (*stat_buf),
+        -:  744:				   hbuf, human_ceiling,
+        -:  745:				   ST_NBLOCKSIZE, 1024)); 
+    #####:  746:	  break;
+        -:  747:	case 'l':		/* object of symlink */
+        -:  748:	  /* sanitised */
+        -:  749:#ifdef S_ISLNK
+        -:  750:	  {
+    #####:  751:	    char *linkname = 0;
+        -:  752:
+    #####:  753:	    if (S_ISLNK (stat_buf->st_mode))
+        -:  754:	      {
+    #####:  755:		linkname = get_link_name_at (pathname, state.cwd_dir_fd, state.rel_pathname);
+    #####:  756:		if (linkname == 0)
+    #####:  757:		  state.exit_status = 1;
+        -:  758:	      }
+    #####:  759:	    if (linkname)
+        -:  760:	      {
+    #####:  761:		print_quoted (fp, qopts, ttyflag, segment->text, linkname);
+    #####:  762:		free (linkname);
+        -:  763:	      }
+        -:  764:	    else
+        -:  765:	      {
+        -:  766:		/* We still need to honour the field width etc., so this is
+        -:  767:		 * not a no-op.
+        -:  768:		 */
+    #####:  769:		print_quoted (fp, qopts, ttyflag, segment->text, "");
+        -:  770:	      }
+        -:  771:	  }
+        -:  772:#endif				/* S_ISLNK */
+    #####:  773:	  break;
+        -:  774:
+        -:  775:	case 'M':		/* mode as 10 chars (eg., "-rwxr-x--x" */
+        -:  776:	  /* UNTRUSTED, probably unexploitable */
+        -:  777:	  {
+        -:  778:	    char modestring[16] ;
+    #####:  779:	    filemodestring (stat_buf, modestring);
+    #####:  780:	    modestring[10] = '\0';
+    #####:  781:	    fprintf (fp, segment->text, modestring);
+        -:  782:	  }
+    #####:  783:	  break;
+        -:  784:
+        -:  785:	case 'm':		/* mode as octal number (perms only) */
+        -:  786:	  /* UNTRUSTED, probably unexploitable */
+        -:  787:	  {
+        -:  788:	    /* Output the mode portably using the traditional numbers,
+        -:  789:	       even if the host unwisely uses some other numbering
+        -:  790:	       scheme.  But help the compiler in the common case where
+        -:  791:	       the host uses the traditional numbering scheme.  */
+    #####:  792:	    mode_t m = stat_buf->st_mode;
+    #####:  793:	    boolean traditional_numbering_scheme =
+        -:  794:	      (S_ISUID == 04000 && S_ISGID == 02000 && S_ISVTX == 01000
+        -:  795:	       && S_IRUSR == 00400 && S_IWUSR == 00200 && S_IXUSR == 00100
+        -:  796:	       && S_IRGRP == 00040 && S_IWGRP == 00020 && S_IXGRP == 00010
+        -:  797:	       && S_IROTH == 00004 && S_IWOTH == 00002 && S_IXOTH == 00001);
+    #####:  798:	    fprintf (fp, segment->text,
+        -:  799:		     (traditional_numbering_scheme
+        -:  800:		      ? m & MODE_ALL
+    #####:  801:		      : ((m & S_ISUID ? 04000 : 0)
+        -:  802:			 | (m & S_ISGID ? 02000 : 0)
+        -:  803:			 | (m & S_ISVTX ? 01000 : 0)
+        -:  804:			 | (m & S_IRUSR ? 00400 : 0)
+        -:  805:			 | (m & S_IWUSR ? 00200 : 0)
+        -:  806:			 | (m & S_IXUSR ? 00100 : 0)
+        -:  807:			 | (m & S_IRGRP ? 00040 : 0)
+        -:  808:			 | (m & S_IWGRP ? 00020 : 0)
+        -:  809:			 | (m & S_IXGRP ? 00010 : 0)
+        -:  810:			 | (m & S_IROTH ? 00004 : 0)
+    #####:  811:			 | (m & S_IWOTH ? 00002 : 0)
+    #####:  812:			 | (m & S_IXOTH ? 00001 : 0))));
+        -:  813:	  }
+    #####:  814:	  break;
+        -:  815:	  
+        -:  816:	case 'n':		/* number of links */
+        -:  817:	  /* UNTRUSTED, probably unexploitable */
+    #####:  818:	  fprintf (fp, segment->text,
+        -:  819:		   human_readable ((uintmax_t) stat_buf->st_nlink,
+        -:  820:				   hbuf,
+        -:  821:				   human_ceiling,
+        -:  822:				   1, 1));
+    #####:  823:	  break;
+        -:  824:	case 'p':		/* pathname */
+        -:  825:	  /* sanitised */
+    #####:  826:	  print_quoted (fp, qopts, ttyflag, segment->text, pathname);
+    #####:  827:	  break;
+        -:  828:	case 'P':		/* pathname with ARGV element stripped */
+        -:  829:	  /* sanitised */
+    #####:  830:	  if (state.curdepth > 0)
+        -:  831:	    {
+    #####:  832:	      cp = pathname + state.starting_path_length;
+    #####:  833:	      if (*cp == '/')
+        -:  834:		/* Move past the slash between the ARGV element
+        -:  835:		   and the rest of the pathname.  But if the ARGV element
+        -:  836:		   ends in a slash, we didn't add another, so we've
+        -:  837:		   already skipped past it.  */
+    #####:  838:		cp++;
+        -:  839:	    }
+        -:  840:	  else
+    #####:  841:	    cp = "";
+    #####:  842:	  print_quoted (fp, qopts, ttyflag, segment->text, cp);
+    #####:  843:	  break;
+        -:  844:	case 's':		/* size in bytes */
+        -:  845:	  /* UNTRUSTED, probably unexploitable */
+    #####:  846:	  fprintf (fp, segment->text,
+    #####:  847:		   human_readable ((uintmax_t) stat_buf->st_size,
+        -:  848:				   hbuf, human_ceiling, 1, 1));
+    #####:  849:	  break;
+        -:  850:	  
+        -:  851:	case 'S':		/* sparseness */
+        -:  852:	  /* UNTRUSTED, probably unexploitable */
+    #####:  853:	  fprintf (fp, segment->text, file_sparseness(stat_buf));;
+    #####:  854:	  break;
+        -:  855:	  
+        -:  856:	case 't':		/* mtime in `ctime' format */
+        -:  857:	  /* UNTRUSTED, probably unexploitable */
+    #####:  858:	  fprintf (fp, segment->text, ctime_format (get_stat_mtime(stat_buf)));
+    #####:  859:	  break;
+        -:  860:	  
+        -:  861:	case 'u':		/* user name */
+        -:  862:	  /* trusted */
+        -:  863:	  /* (well, the actual user is selected by the user on systems
+        -:  864:	   * where chown is not restricted, but the user name was
+        -:  865:	   * selected by the system administrator)
+        -:  866:	   */
+        -:  867:	  {
+        -:  868:	    struct passwd *p;
+        -:  869:
+    #####:  870:	    p = getpwuid (stat_buf->st_uid);
+    #####:  871:	    if (p)
+        -:  872:	      {
+    #####:  873:		segment->text[segment->text_len] = 's';
+    #####:  874:		fprintf (fp, segment->text, p->pw_name);
+    #####:  875:		break;
+        -:  876:	      }
+        -:  877:	    /* else fallthru */
+        -:  878:	  }
+        -:  879:	  
+        -:  880:	case 'U':		/* UID number */
+        -:  881:	  /* UNTRUSTED, probably unexploitable */
+    #####:  882:	  fprintf (fp, segment->text,
+    #####:  883:		   human_readable ((uintmax_t) stat_buf->st_uid, hbuf,
+        -:  884:				   human_ceiling, 1, 1));
+    #####:  885:	  break;
+        -:  886:
+        -:  887:	  /* type of filesystem entry like `ls -l`: (d,-,l,s,p,b,c,n) n=nonexistent(symlink) */
+        -:  888:	case 'Y':		/* in case of symlink */
+        -:  889:	  /* trusted */
+        -:  890:	  {
+        -:  891:#ifdef S_ISLNK
+    #####:  892:	    if (S_ISLNK (stat_buf->st_mode))
+        -:  893:	      {
+        -:  894:		struct stat sbuf;
+        -:  895:		/* If we would normally follow links, do not do so.
+        -:  896:		 * If we would normally not follow links, do so.
+        -:  897:		 */
+    #####:  898:		if ((following_links() ? lstat : stat)
+    #####:  899:		    (state.rel_pathname, &sbuf) != 0)
+        -:  900:		  {
+    #####:  901:		    if ( errno == ENOENT ) {
+    #####:  902:		      fprintf (fp, segment->text, "N");
+    #####:  903:		      break;
+        -:  904:		    };
+    #####:  905:		    if ( errno == ELOOP ) {
+    #####:  906:		      fprintf (fp, segment->text, "L");
+    #####:  907:		      break;
+        -:  908:		    };
+    #####:  909:		    error (0, errno, "%s", pathname);
+        -:  910:		    /* exit_status = 1;
+        -:  911:		       return (false); */
+        -:  912:		  }
+    #####:  913:		fprintf (fp, segment->text,
+    #####:  914:			 mode_to_filetype(sbuf.st_mode & S_IFMT));
+        -:  915:	      }
+        -:  916:#endif /* S_ISLNK */
+        -:  917:	    else
+        -:  918:	      {
+    #####:  919:		fprintf (fp, segment->text,
+    #####:  920:			 mode_to_filetype(stat_buf->st_mode & S_IFMT));
+        -:  921:	      }
+        -:  922:	  }
+    #####:  923:	  break;
+        -:  924:
+        -:  925:	case 'y':
+        -:  926:	  /* trusted */
+        -:  927:	  {
+    #####:  928:	    fprintf (fp, segment->text,
+    #####:  929:		     mode_to_filetype(stat_buf->st_mode & S_IFMT));
+        -:  930:	  }
+    #####:  931:	  break;
+        -:  932:	}
+       16:  933:      break;
+        -:  934:    }
+        -:  935:  #warning this function needs a return statement.  See Savannah bug#19146.
+       32:  936:}
+        -:  937:
+        -:  938:boolean
+       16:  939:pred_fprintf (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -:  940:{
+       16:  941:  FILE *fp = pred_ptr->args.printf_vec.stream;
+        -:  942:  struct segment *segment;
+       16:  943:  boolean ttyflag = pred_ptr->args.printf_vec.dest_is_tty;
+       16:  944:  const struct quoting_options *qopts = pred_ptr->args.printf_vec.quote_opts;
+        -:  945:
+       64:  946:  for (segment = pred_ptr->args.printf_vec.segment; segment;
+       32:  947:       segment = segment->next)
+        -:  948:    {
+       32:  949:      if ( (KIND_FORMAT == segment->segkind) && segment->format_char[1]) /* Component of date. */
+    #####:  950:	{
+        -:  951:	  struct timespec ts;
+    #####:  952:	  int valid = 0;
+        -:  953:	  
+    #####:  954:	  switch (segment->format_char[0])
+        -:  955:	    {
+        -:  956:	    case 'A':
+    #####:  957:	      ts = get_stat_atime(stat_buf);
+    #####:  958:	      valid = 1;
+    #####:  959:	      break;
+        -:  960:	    case 'B':
+    #####:  961:	      ts = get_stat_birthtime(stat_buf);
+    #####:  962:	      if ('@' == segment->format_char[1])
+    #####:  963:		valid = 1;
+        -:  964:	      else
+    #####:  965:		valid = (ts.tv_nsec >= 0);
+    #####:  966:	      break;
+        -:  967:	    case 'C':
+    #####:  968:	      ts = get_stat_ctime(stat_buf);
+    #####:  969:	      valid = 1;
+    #####:  970:	      break;
+        -:  971:	    case 'T':
+    #####:  972:	      ts = get_stat_mtime(stat_buf);
+    #####:  973:	      valid = 1;
+    #####:  974:	      break;
+        -:  975:	    default:
+    #####:  976:	      assert(0);
+        -:  977:	      abort ();
+        -:  978:	    }
+        -:  979:	  /* We trust the output of format_date not to contain 
+        -:  980:	   * nasty characters, though the value of the date
+        -:  981:	   * is itself untrusted data.
+        -:  982:	   */
+    #####:  983:	  if (valid)
+        -:  984:	    {
+        -:  985:	      /* trusted */
+    #####:  986:	      fprintf (fp, segment->text,
+    #####:  987:		       format_date (ts, segment->format_char[1]));
+        -:  988:	    }
+        -:  989:	  else
+        -:  990:	    {
+        -:  991:	      /* The specified timestamp is not available, output
+        -:  992:	       * nothing for the timestamp, but use the rest (so that
+        -:  993:	       * for example find foo -printf '[%Bs] %p\n' can print
+        -:  994:	       * "[] foo").
+        -:  995:	       */
+        -:  996:	      /* trusted */
+    #####:  997:	      fprintf (fp, segment->text, "");
+        -:  998:	    }
+        -:  999:	}
+        -: 1000:      else
+        -: 1001:	{
+       32: 1002:	  do_fprintf(fp, segment, pathname, stat_buf, ttyflag, qopts);
+        -: 1003:	}
+        -: 1004:    }
+       16: 1005:  return true;
+        -: 1006:}
+        -: 1007:
+        -: 1008:boolean
+    #####: 1009:pred_fstype (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1010:{
+        -: 1011:  (void) pathname;
+        -: 1012:  
+    #####: 1013:  if (strcmp (filesystem_type (stat_buf, pathname), pred_ptr->args.str) == 0)
+    #####: 1014:    return true;
+        -: 1015:  else
+    #####: 1016:    return false;
+        -: 1017:}
+        -: 1018:
+        -: 1019:boolean
+    #####: 1020:pred_gid (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1021:{
+        -: 1022:  (void) pathname;
+        -: 1023:  
+    #####: 1024:  switch (pred_ptr->args.numinfo.kind)
+        -: 1025:    {
+        -: 1026:    case COMP_GT:
+    #####: 1027:      if (stat_buf->st_gid > pred_ptr->args.numinfo.l_val)
+    #####: 1028:	return (true);
+    #####: 1029:      break;
+        -: 1030:    case COMP_LT:
+    #####: 1031:      if (stat_buf->st_gid < pred_ptr->args.numinfo.l_val)
+    #####: 1032:	return (true);
+    #####: 1033:      break;
+        -: 1034:    case COMP_EQ:
+    #####: 1035:      if (stat_buf->st_gid == pred_ptr->args.numinfo.l_val)
+    #####: 1036:	return (true);
+    #####: 1037:      break;
+        -: 1038:    }
+    #####: 1039:  return (false);
+        -: 1040:}
+        -: 1041:
+        -: 1042:boolean
+    #####: 1043:pred_group (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1044:{
+        -: 1045:  (void) pathname;
+        -: 1046:  
+    #####: 1047:  if (pred_ptr->args.gid == stat_buf->st_gid)
+    #####: 1048:    return (true);
+        -: 1049:  else
+    #####: 1050:    return (false);
+        -: 1051:}
+        -: 1052:
+        -: 1053:boolean
+    #####: 1054:pred_ilname (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1055:{
+    #####: 1056:  return match_lname (pathname, stat_buf, pred_ptr, true);
+        -: 1057:}
+        -: 1058:
+        -: 1059:boolean
+    #####: 1060:pred_iname (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1061:{
+        -: 1062:  const char *base;
+        -: 1063:
+        -: 1064:  (void) stat_buf;
+        -: 1065:
+        -: 1066:  /* FNM_PERIOD is not used here because POSIX requires that it not be.
+        -: 1067:   * See http://standards.ieee.org/reading/ieee/interp/1003-2-92_int/pasc-1003.2-126.html
+        -: 1068:   */
+    #####: 1069:  base = base_name (pathname);
+    #####: 1070:  if (fnmatch (pred_ptr->args.str, base, FNM_CASEFOLD) == 0)
+    #####: 1071:    return (true);
+    #####: 1072:  return (false);
+        -: 1073:}
+        -: 1074:
+        -: 1075:boolean
+    #####: 1076:pred_inum (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1077:{
+        -: 1078:  (void) pathname;
+        -: 1079:  
+    #####: 1080:  switch (pred_ptr->args.numinfo.kind)
+        -: 1081:    {
+        -: 1082:    case COMP_GT:
+    #####: 1083:      if (stat_buf->st_ino > pred_ptr->args.numinfo.l_val)
+    #####: 1084:	return (true);
+    #####: 1085:      break;
+        -: 1086:    case COMP_LT:
+    #####: 1087:      if (stat_buf->st_ino < pred_ptr->args.numinfo.l_val)
+    #####: 1088:	return (true);
+    #####: 1089:      break;
+        -: 1090:    case COMP_EQ:
+    #####: 1091:      if (stat_buf->st_ino == pred_ptr->args.numinfo.l_val)
+    #####: 1092:	return (true);
+    #####: 1093:      break;
+        -: 1094:    }
+    #####: 1095:  return (false);
+        -: 1096:}
+        -: 1097:
+        -: 1098:boolean
+    #####: 1099:pred_ipath (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1100:{
+        -: 1101:  (void) stat_buf;
+        -: 1102:  
+    #####: 1103:  if (fnmatch (pred_ptr->args.str, pathname, FNM_CASEFOLD) == 0)
+    #####: 1104:    return (true);
+    #####: 1105:  return (false);
+        -: 1106:}
+        -: 1107:
+        -: 1108:boolean
+    #####: 1109:pred_links (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1110:{
+        -: 1111:  (void) pathname;
+        -: 1112:  
+    #####: 1113:  switch (pred_ptr->args.numinfo.kind)
+        -: 1114:    {
+        -: 1115:    case COMP_GT:
+    #####: 1116:      if (stat_buf->st_nlink > pred_ptr->args.numinfo.l_val)
+    #####: 1117:	return (true);
+    #####: 1118:      break;
+        -: 1119:    case COMP_LT:
+    #####: 1120:      if (stat_buf->st_nlink < pred_ptr->args.numinfo.l_val)
+    #####: 1121:	return (true);
+    #####: 1122:      break;
+        -: 1123:    case COMP_EQ:
+    #####: 1124:      if (stat_buf->st_nlink == pred_ptr->args.numinfo.l_val)
+    #####: 1125:	return (true);
+    #####: 1126:      break;
+        -: 1127:    }
+    #####: 1128:  return (false);
+        -: 1129:}
+        -: 1130:
+        -: 1131:boolean
+    #####: 1132:pred_lname (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1133:{
+    #####: 1134:  return match_lname (pathname, stat_buf, pred_ptr, false);
+        -: 1135:}
+        -: 1136:
+        -: 1137:static boolean
+    #####: 1138:match_lname (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr, boolean ignore_case)
+        -: 1139:{
+    #####: 1140:  boolean ret = false;
+        -: 1141:#ifdef S_ISLNK
+    #####: 1142:  if (S_ISLNK (stat_buf->st_mode))
+        -: 1143:    {
+    #####: 1144:      char *linkname = get_link_name_at (pathname, state.cwd_dir_fd, state.rel_pathname);
+    #####: 1145:      if (linkname)
+        -: 1146:	{
+    #####: 1147:	  if (fnmatch (pred_ptr->args.str, linkname,
+        -: 1148:		       ignore_case ? FNM_CASEFOLD : 0) == 0)
+    #####: 1149:	    ret = true;
+    #####: 1150:	  free (linkname);
+        -: 1151:	}
+        -: 1152:    }
+        -: 1153:#endif /* S_ISLNK */
+    #####: 1154:  return ret;
+        -: 1155:}
+        -: 1156:
+        -: 1157:boolean
+    #####: 1158:pred_ls (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1159:{
+    #####: 1160:  list_file (pathname, state.cwd_dir_fd, state.rel_pathname,
+        -: 1161:	     stat_buf, options.start_time.tv_sec,
+        -: 1162:	     options.output_block_size,
+    #####: 1163:	     pred_ptr->literal_control_chars,
+        -: 1164:	     stdout);
+    #####: 1165:  return true;
+        -: 1166:}
+        -: 1167:
+        -: 1168:boolean
+    #####: 1169:pred_mmin (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1170:{
+        -: 1171:  (void) &pathname;
+    #####: 1172:  return pred_timewindow(get_stat_mtime(stat_buf), pred_ptr, 60);
+        -: 1173:}
+        -: 1174:
+        -: 1175:boolean
+    #####: 1176:pred_mtime (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1177:{
+        -: 1178:  (void) pathname;
+    #####: 1179:  return pred_timewindow(get_stat_mtime(stat_buf), pred_ptr, DAYSECS);
+        -: 1180:}
+        -: 1181:
+        -: 1182:boolean
+    #####: 1183:pred_name (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1184:{
+        -: 1185:  const char *base;
+        -: 1186:
+        -: 1187:  (void) stat_buf;
+    #####: 1188:  base = base_name (pathname);
+        -: 1189:
+        -: 1190:  /* FNM_PERIOD is not used here because POSIX requires that it not be.
+        -: 1191:   * See http://standards.ieee.org/reading/ieee/interp/1003-2-92_int/pasc-1003.2-126.html
+        -: 1192:   */
+    #####: 1193:  if (fnmatch (pred_ptr->args.str, base, 0) == 0)
+    #####: 1194:    return (true);
+    #####: 1195:  return (false);
+        -: 1196:}
+        -: 1197:
+        -: 1198:boolean
+    #####: 1199:pred_negate (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1200:{
+        -: 1201:  /* Check whether we need a stat here. */
+        -: 1202:  /* TODO: what about need_type? */
+    #####: 1203:  if (get_info(pathname, stat_buf, pred_ptr) != 0)
+    #####: 1204:    return false;
+    #####: 1205:  return (!(*pred_ptr->pred_right->pred_func) (pathname, stat_buf,
+    #####: 1206:					      pred_ptr->pred_right));
+        -: 1207:}
+        -: 1208:
+        -: 1209:boolean
+    #####: 1210:pred_newer (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1211:{
+        -: 1212:  (void) pathname;
+        -: 1213:  
+    #####: 1214:  assert(COMP_GT == pred_ptr->args.reftime.kind);
+    #####: 1215:  return compare_ts(get_stat_mtime(stat_buf), pred_ptr->args.reftime.ts) > 0;
+        -: 1216:}
+        -: 1217:
+        -: 1218:boolean
+    #####: 1219:pred_newerXY (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1220:{
+        -: 1221:  struct timespec ts;
+        -: 1222:  
+    #####: 1223:  assert(COMP_GT == pred_ptr->args.reftime.kind);
+        -: 1224:  
+    #####: 1225:  switch (pred_ptr->args.reftime.xval)
+        -: 1226:    {
+        -: 1227:    case XVAL_ATIME:
+    #####: 1228:      ts = get_stat_atime(stat_buf);
+    #####: 1229:      break;
+        -: 1230:    case XVAL_BIRTHTIME:
+    #####: 1231:      ts = get_stat_birthtime(stat_buf);
+    #####: 1232:      if (ts.tv_nsec < 0);
+        -: 1233:	{
+        -: 1234:	  /* XXX: Cannot determine birth time.  Warn once. */
+    #####: 1235:	  error(0, 0, _("Warning: cannot determine birth time of file `%s'"),
+        -: 1236:		pathname);
+    #####: 1237:	  return 0;
+        -: 1238:	}
+        -: 1239:      break;
+        -: 1240:    case XVAL_CTIME:
+    #####: 1241:      ts = get_stat_ctime(stat_buf);
+    #####: 1242:      break;
+        -: 1243:    case XVAL_MTIME:
+    #####: 1244:      ts = get_stat_mtime(stat_buf);
+    #####: 1245:      break;
+        -: 1246:    case XVAL_TIME:		/* Should not happen (-newertY is not valid). */
+    #####: 1247:      assert(pred_ptr->args.reftime.xval != XVAL_TIME);
+    #####: 1248:      abort();
+        -: 1249:      break;
+        -: 1250:    }
+    #####: 1251:  return compare_ts(ts, pred_ptr->args.reftime.ts) > 0;
+        -: 1252:}
+        -: 1253:
+        -: 1254:boolean
+    #####: 1255:pred_nogroup (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1256:{
+        -: 1257:  (void) pathname;
+        -: 1258:  (void) pred_ptr;
+        -: 1259:  
+        -: 1260:#ifdef CACHE_IDS
+        -: 1261:  extern char *gid_unused;
+        -: 1262:
+        -: 1263:  return gid_unused[(unsigned) stat_buf->st_gid];
+        -: 1264:#else
+    #####: 1265:  return getgrgid (stat_buf->st_gid) == NULL;
+        -: 1266:#endif
+        -: 1267:}
+        -: 1268:
+        -: 1269:boolean
+    #####: 1270:pred_nouser (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1271:{
+        -: 1272:#ifdef CACHE_IDS
+        -: 1273:  extern char *uid_unused;
+        -: 1274:#endif
+        -: 1275:  
+        -: 1276:  (void) pathname;
+        -: 1277:  (void) pred_ptr;
+        -: 1278:  
+        -: 1279:#ifdef CACHE_IDS
+        -: 1280:  return uid_unused[(unsigned) stat_buf->st_uid];
+        -: 1281:#else
+    #####: 1282:  return getpwuid (stat_buf->st_uid) == NULL;
+        -: 1283:#endif
+        -: 1284:}
+        -: 1285:
+        -: 1286:
+        -: 1287:static boolean
+    #####: 1288:is_ok(const char *program, const char *arg)
+        -: 1289:{
+    #####: 1290:  fflush (stdout);
+        -: 1291:  /* The draft open standard requires that, in the POSIX locale,
+        -: 1292:     the last non-blank character of this prompt be '?'.
+        -: 1293:     The exact format is not specified.
+        -: 1294:     This standard does not have requirements for locales other than POSIX
+        -: 1295:  */
+        -: 1296:  /* XXX: printing UNTRUSTED data here. */
+    #####: 1297:  fprintf (stderr, _("< %s ... %s > ? "), program, arg);
+    #####: 1298:  fflush (stderr);
+    #####: 1299:  return yesno();
+        -: 1300:}
+        -: 1301:
+        -: 1302:boolean
+    #####: 1303:pred_ok (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1304:{
+    #####: 1305:  if (is_ok(pred_ptr->args.exec_vec.replace_vec[0], pathname))
+    #####: 1306:    return new_impl_pred_exec (get_start_dirfd(),
+        -: 1307:			       pathname, stat_buf, pred_ptr, NULL, 0);
+        -: 1308:  else
+    #####: 1309:    return false;
+        -: 1310:}
+        -: 1311:
+        -: 1312:boolean
+    #####: 1313:pred_okdir (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1314:{
+    #####: 1315:  const char *prefix = (state.rel_pathname[0] == '/') ? NULL : "./";
+    #####: 1316:  if (is_ok(pred_ptr->args.exec_vec.replace_vec[0], pathname))
+    #####: 1317:    return new_impl_pred_exec (get_current_dirfd(),
+    #####: 1318:			       state.rel_pathname, stat_buf, pred_ptr, 
+        -: 1319:			       prefix, (prefix ? 2 : 0));
+        -: 1320:  else
+    #####: 1321:    return false;
+        -: 1322:}
+        -: 1323:
+        -: 1324:boolean
+    #####: 1325:pred_open (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1326:{
+        -: 1327:  (void) pathname;
+        -: 1328:  (void) stat_buf;
+        -: 1329:  (void) pred_ptr;
+    #####: 1330:  return true;
+        -: 1331:}
+        -: 1332:
+        -: 1333:boolean
+    #####: 1334:pred_or (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1335:{
+    #####: 1336:  if (pred_ptr->pred_left == NULL
+    #####: 1337:      || !(*pred_ptr->pred_left->pred_func) (pathname, stat_buf,
+        -: 1338:					     pred_ptr->pred_left))
+        -: 1339:    {
+    #####: 1340:      if (get_info(pathname, stat_buf, pred_ptr) != 0)
+    #####: 1341:	return false;
+    #####: 1342:      return ((*pred_ptr->pred_right->pred_func) (pathname, stat_buf,
+        -: 1343:						  pred_ptr->pred_right));
+        -: 1344:    }
+        -: 1345:  else
+    #####: 1346:    return true;
+        -: 1347:}
+        -: 1348:
+        -: 1349:boolean
+    #####: 1350:pred_path (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1351:{
+        -: 1352:  (void) stat_buf;
+    #####: 1353:  if (fnmatch (pred_ptr->args.str, pathname, 0) == 0)
+    #####: 1354:    return (true);
+    #####: 1355:  return (false);
+        -: 1356:}
+        -: 1357:
+        -: 1358:boolean
+    #####: 1359:pred_perm (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1360:{
+    #####: 1361:  mode_t mode = stat_buf->st_mode;
+    #####: 1362:  mode_t perm_val = pred_ptr->args.perm.val[S_ISDIR (mode) != 0];
+        -: 1363:  (void) pathname;
+    #####: 1364:  switch (pred_ptr->args.perm.kind)
+        -: 1365:    {
+        -: 1366:    case PERM_AT_LEAST:
+    #####: 1367:      return (mode & perm_val) == perm_val;
+        -: 1368:      break;
+        -: 1369:
+        -: 1370:    case PERM_ANY:
+        -: 1371:      /* True if any of the bits set in the mask are also set in the file's mode.
+        -: 1372:       *
+        -: 1373:       *
+        -: 1374:       * Otherwise, if onum is prefixed by a hyphen, the primary shall
+        -: 1375:       * evaluate as true if at least all of the bits specified in
+        -: 1376:       * onum that are also set in the octal mask 07777 are set.
+        -: 1377:       *
+        -: 1378:       * Eric Blake's interpretation is that the mode argument is zero, 
+        -: 1379:       
+        -: 1380:       */
+    #####: 1381:      if (0 == perm_val)
+    #####: 1382:	return true;		/* Savannah bug 14748; we used to return false */
+        -: 1383:      else
+    #####: 1384:	return (mode & perm_val) != 0;
+        -: 1385:      break;
+        -: 1386:
+        -: 1387:    case PERM_EXACT:
+    #####: 1388:      return (mode & MODE_ALL) == perm_val;
+        -: 1389:      break;
+        -: 1390:
+        -: 1391:    default:
+    #####: 1392:      abort ();
+        -: 1393:      break;
+        -: 1394:    }
+        -: 1395:}
+        -: 1396:
+        -: 1397:
+        -: 1398:struct access_check_args
+        -: 1399:{
+        -: 1400:  const char *filename;
+        -: 1401:  int access_type;
+        -: 1402:  int cb_errno;
+        -: 1403:};
+        -: 1404:
+        -: 1405:
+        -: 1406:static int
+    #####: 1407:access_callback(void *context)
+        -: 1408:{
+        -: 1409:  int rv;
+    #####: 1410:  struct access_check_args *args = context;
+    #####: 1411:  if ((rv = access(args->filename, args->access_type)) < 0)
+    #####: 1412:    args->cb_errno = errno;
+    #####: 1413:  return rv;
+        -: 1414:}
+        -: 1415:
+        -: 1416:static int
+    #####: 1417:can_access(int access_type)
+        -: 1418:{
+        -: 1419:  struct access_check_args args;
+    #####: 1420:  args.filename = state.rel_pathname;
+    #####: 1421:  args.access_type = access_type;
+    #####: 1422:  args.cb_errno = 0;
+    #####: 1423:  return 0 == run_in_dir(state.cwd_dir_fd, access_callback, &args);
+        -: 1424:}
+        -: 1425:
+        -: 1426:
+        -: 1427:boolean
+    #####: 1428:pred_executable (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1429:{
+        -: 1430:  (void) pathname;
+        -: 1431:  (void) stat_buf;
+        -: 1432:  (void) pred_ptr;
+        -: 1433:  
+    #####: 1434:  return can_access(X_OK);
+        -: 1435:}
+        -: 1436:
+        -: 1437:boolean
+    #####: 1438:pred_readable (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1439:{
+        -: 1440:  (void) pathname;
+        -: 1441:  (void) stat_buf;
+        -: 1442:  (void) pred_ptr;
+        -: 1443:  
+    #####: 1444:  return can_access(R_OK);
+        -: 1445:}
+        -: 1446:
+        -: 1447:boolean
+    #####: 1448:pred_writable (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1449:{
+        -: 1450:  (void) pathname;
+        -: 1451:  (void) stat_buf;
+        -: 1452:  (void) pred_ptr;
+        -: 1453:  
+    #####: 1454:  return can_access(W_OK);
+        -: 1455:}
+        -: 1456:
+        -: 1457:boolean
+    #####: 1458:pred_print (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1459:{
+        -: 1460:  (void) stat_buf;
+        -: 1461:  (void) pred_ptr;
+        -: 1462:  /* puts (pathname); */
+    #####: 1463:  print_quoted(pred_ptr->args.printf_vec.stream,
+    #####: 1464:	       pred_ptr->args.printf_vec.quote_opts,
+    #####: 1465:	       pred_ptr->args.printf_vec.dest_is_tty,
+        -: 1466:	       "%s\n", pathname);
+    #####: 1467:  return true;
+        -: 1468:}
+        -: 1469:
+        -: 1470:boolean
+    #####: 1471:pred_print0 (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1472:{
+        -: 1473:  (void) stat_buf;
+        -: 1474:  (void) pred_ptr;
+    #####: 1475:  fputs (pathname, stdout);
+    #####: 1476:  putc (0, stdout);
+    #####: 1477:  return (true);
+        -: 1478:}
+        -: 1479:
+        -: 1480:boolean
+    #####: 1481:pred_prune (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1482:{
+        -: 1483:  (void) pathname;
+        -: 1484:  (void) pred_ptr;
+        -: 1485:
+    #####: 1486:  if (options.do_dir_first == true &&
+    #####: 1487:      stat_buf != NULL &&
+    #####: 1488:      S_ISDIR(stat_buf->st_mode))
+    #####: 1489:    state.stop_at_current_level = true;
+        -: 1490:
+    #####: 1491:  return (options.do_dir_first); /* This is what SunOS find seems to do. */
+        -: 1492:}
+        -: 1493:
+        -: 1494:boolean
+    #####: 1495:pred_quit (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1496:{
+        -: 1497:  (void) pathname;
+        -: 1498:  (void) stat_buf;
+        -: 1499:  (void) pred_ptr;
+        -: 1500:
+        -: 1501:  /* Run any cleanups.  This includes executing any command lines 
+        -: 1502:   * we have partly built but not executed.
+        -: 1503:   */
+    #####: 1504:  cleanup();
+        -: 1505:  
+        -: 1506:  /* Since -exec and friends don't leave child processes running in the 
+        -: 1507:   * background, there is no need to wait for them here.
+        -: 1508:   */
+    #####: 1509:  exit(state.exit_status);	/* 0 for success, etc. */
+        -: 1510:}
+        -: 1511:
+        -: 1512:boolean
+    #####: 1513:pred_regex (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1514:{
+    #####: 1515:  int len = strlen (pathname);
+        -: 1516:(void) stat_buf;
+    #####: 1517:  if (re_match (pred_ptr->args.regex, pathname, len, 0,
+    #####: 1518:		(struct re_registers *) NULL) == len)
+    #####: 1519:    return (true);
+    #####: 1520:  return (false);
+        -: 1521:}
+        -: 1522:
+        -: 1523:boolean
+    #####: 1524:pred_size (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1525:{
+        -: 1526:  uintmax_t f_val;
+        -: 1527:
+        -: 1528:  (void) pathname;
+    #####: 1529:  f_val = ((stat_buf->st_size / pred_ptr->args.size.blocksize)
+    #####: 1530:	   + (stat_buf->st_size % pred_ptr->args.size.blocksize != 0));
+    #####: 1531:  switch (pred_ptr->args.size.kind)
+        -: 1532:    {
+        -: 1533:    case COMP_GT:
+    #####: 1534:      if (f_val > pred_ptr->args.size.size)
+    #####: 1535:	return (true);
+    #####: 1536:      break;
+        -: 1537:    case COMP_LT:
+    #####: 1538:      if (f_val < pred_ptr->args.size.size)
+    #####: 1539:	return (true);
+    #####: 1540:      break;
+        -: 1541:    case COMP_EQ:
+    #####: 1542:      if (f_val == pred_ptr->args.size.size)
+    #####: 1543:	return (true);
+    #####: 1544:      break;
+        -: 1545:    }
+    #####: 1546:  return (false);
+        -: 1547:}
+        -: 1548:
+        -: 1549:boolean
+    #####: 1550:pred_samefile (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1551:{
+        -: 1552:  /* Potential optimisation: because of the loop protection, we always
+        -: 1553:   * know the device of the current directory, hence the device number
+        -: 1554:   * of the file we're currently considering.  If -L is not in effect,
+        -: 1555:   * and the device number of the file we're looking for is not the
+        -: 1556:   * same as the device number of the current directory, this
+        -: 1557:   * predicate cannot return true.  Hence there would be no need to
+        -: 1558:   * stat the file we're looking at.
+        -: 1559:   */
+        -: 1560:  (void) pathname;
+        -: 1561:  
+    #####: 1562:  return stat_buf->st_ino == pred_ptr->args.fileid.ino
+    #####: 1563:    &&   stat_buf->st_dev == pred_ptr->args.fileid.dev;
+        -: 1564:}
+        -: 1565:
+        -: 1566:boolean
+    #####: 1567:pred_true (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1568:{
+        -: 1569:  (void) pathname;
+        -: 1570:  (void) stat_buf;
+        -: 1571:  (void) pred_ptr;
+    #####: 1572:  return true;
+        -: 1573:}
+        -: 1574:
+        -: 1575:boolean
+    #####: 1576:pred_type (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1577:{
+        -: 1578:  mode_t mode;
+    #####: 1579:  mode_t type = pred_ptr->args.type;
+        -: 1580:
+    #####: 1581:  assert(state.have_type);
+    #####: 1582:  assert(state.type != 0);
+        -: 1583:  
+        -: 1584:  (void) pathname;
+        -: 1585:
+    #####: 1586:  if (state.have_stat)
+    #####: 1587:     mode = stat_buf->st_mode;
+        -: 1588:  else
+    #####: 1589:     mode = state.type;
+        -: 1590:
+        -: 1591:#ifndef S_IFMT
+        -: 1592:  /* POSIX system; check `mode' the slow way. */
+        -: 1593:  if ((S_ISBLK (mode) && type == S_IFBLK)
+        -: 1594:      || (S_ISCHR (mode) && type == S_IFCHR)
+        -: 1595:      || (S_ISDIR (mode) && type == S_IFDIR)
+        -: 1596:      || (S_ISREG (mode) && type == S_IFREG)
+        -: 1597:#ifdef S_IFLNK
+        -: 1598:      || (S_ISLNK (mode) && type == S_IFLNK)
+        -: 1599:#endif
+        -: 1600:#ifdef S_IFIFO
+        -: 1601:      || (S_ISFIFO (mode) && type == S_IFIFO)
+        -: 1602:#endif
+        -: 1603:#ifdef S_IFSOCK
+        -: 1604:      || (S_ISSOCK (mode) && type == S_IFSOCK)
+        -: 1605:#endif
+        -: 1606:#ifdef S_IFDOOR
+        -: 1607:      || (S_ISDOOR (mode) && type == S_IFDOOR)
+        -: 1608:#endif
+        -: 1609:      )
+        -: 1610:#else /* S_IFMT */
+        -: 1611:  /* Unix system; check `mode' the fast way. */
+    #####: 1612:  if ((mode & S_IFMT) == type)
+        -: 1613:#endif /* S_IFMT */
+    #####: 1614:    return (true);
+        -: 1615:  else
+    #####: 1616:    return (false);
+        -: 1617:}
+        -: 1618:
+        -: 1619:boolean
+    #####: 1620:pred_uid (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1621:{
+        -: 1622:  (void) pathname;
+    #####: 1623:  switch (pred_ptr->args.numinfo.kind)
+        -: 1624:    {
+        -: 1625:    case COMP_GT:
+    #####: 1626:      if (stat_buf->st_uid > pred_ptr->args.numinfo.l_val)
+    #####: 1627:	return (true);
+    #####: 1628:      break;
+        -: 1629:    case COMP_LT:
+    #####: 1630:      if (stat_buf->st_uid < pred_ptr->args.numinfo.l_val)
+    #####: 1631:	return (true);
+    #####: 1632:      break;
+        -: 1633:    case COMP_EQ:
+    #####: 1634:      if (stat_buf->st_uid == pred_ptr->args.numinfo.l_val)
+    #####: 1635:	return (true);
+    #####: 1636:      break;
+        -: 1637:    }
+    #####: 1638:  return (false);
+        -: 1639:}
+        -: 1640:
+        -: 1641:boolean
+    #####: 1642:pred_used (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1643:{
+        -: 1644:  struct timespec delta, at, ct;
+        -: 1645:
+        -: 1646:  (void) pathname;
+        -: 1647:
+        -: 1648:  /* TODO: this needs to be retested carefully (manually, if necessary) */
+    #####: 1649:  at = get_stat_atime(stat_buf);
+    #####: 1650:  ct = get_stat_ctime(stat_buf);
+    #####: 1651:  delta.tv_sec  = at.tv_sec  - ct.tv_sec;
+    #####: 1652:  delta.tv_nsec = at.tv_nsec - ct.tv_nsec;
+    #####: 1653:  if (delta.tv_nsec < 0)
+        -: 1654:    {
+    #####: 1655:      delta.tv_nsec += 1000000000;
+    #####: 1656:      delta.tv_sec  -=          1;
+        -: 1657:    }
+    #####: 1658:  return pred_timewindow(delta, pred_ptr, DAYSECS);
+        -: 1659:}
+        -: 1660:
+        -: 1661:boolean
+    #####: 1662:pred_user (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1663:{
+        -: 1664:  (void) pathname;
+    #####: 1665:  if (pred_ptr->args.uid == stat_buf->st_uid)
+    #####: 1666:    return (true);
+        -: 1667:  else
+    #####: 1668:    return (false);
+        -: 1669:}
+        -: 1670:
+        -: 1671:boolean
+    #####: 1672:pred_xtype (char *pathname, struct stat *stat_buf, struct predicate *pred_ptr)
+        -: 1673:{
+        -: 1674:  struct stat sbuf;		/* local copy, not stat_buf because we're using a different stat method */
+        -: 1675:  int (*ystat) (const char*, struct stat *p);
+        -: 1676:
+        -: 1677:  /* If we would normally stat the link itself, stat the target instead.
+        -: 1678:   * If we would normally follow the link, stat the link itself instead. 
+        -: 1679:   */
+    #####: 1680:  if (following_links())
+    #####: 1681:    ystat = optionp_stat;
+        -: 1682:  else
+    #####: 1683:    ystat = optionl_stat;
+        -: 1684:  
+    #####: 1685:  set_stat_placeholders(&sbuf);
+    #####: 1686:  if ((*ystat) (state.rel_pathname, &sbuf) != 0)
+        -: 1687:    {
+    #####: 1688:      if (following_links() && errno == ENOENT)
+        -: 1689:	{
+        -: 1690:	  /* If we failed to follow the symlink,
+        -: 1691:	   * fall back on looking at the symlink itself. 
+        -: 1692:	   */
+        -: 1693:	  /* Mimic behavior of ls -lL. */
+    #####: 1694:	  return (pred_type (pathname, stat_buf, pred_ptr));
+        -: 1695:	}
+        -: 1696:      else
+        -: 1697:	{
+    #####: 1698:	  error (0, errno, "%s", pathname);
+    #####: 1699:	  state.exit_status = 1;
+        -: 1700:	}
+    #####: 1701:      return false;
+        -: 1702:    }
+        -: 1703:  /* Now that we have our stat() information, query it in the same 
+        -: 1704:   * way that -type does.
+        -: 1705:   */
+    #####: 1706:  return (pred_type (pathname, &sbuf, pred_ptr));
+        -: 1707:}
+        -: 1708:
+        -: 1709:/*  1) fork to get a child; parent remembers the child pid
+        -: 1710:    2) child execs the command requested
+        -: 1711:    3) parent waits for child; checks for proper pid of child
+        -: 1712:
+        -: 1713:    Possible returns:
+        -: 1714:
+        -: 1715:    ret		errno	status(h)   status(l)
+        -: 1716:
+        -: 1717:    pid		x	signal#	    0177	stopped
+        -: 1718:    pid		x	exit arg    0		term by _exit
+        -: 1719:    pid		x	0	    signal #	term by signal
+        -: 1720:    -1		EINTR				parent got signal
+        -: 1721:    -1		other				some other kind of error
+        -: 1722:
+        -: 1723:    Return true only if the pid matches, status(l) is
+        -: 1724:    zero, and the exit arg (status high) is 0.
+        -: 1725:    Otherwise return false, possibly printing an error message. */
+        -: 1726:
+        -: 1727:
+        -: 1728:static boolean
+    #####: 1729:prep_child_for_exec (boolean close_stdin, int dirfd)
+        -: 1730:{
+    #####: 1731:  boolean ok = true;
+    #####: 1732:  if (close_stdin)
+        -: 1733:    {
+    #####: 1734:      const char inputfile[] = "/dev/null";
+        -: 1735:      
+    #####: 1736:      if (close(0) < 0)
+        -: 1737:	{
+    #####: 1738:	  error(0, errno, _("Cannot close standard input"));
+    #####: 1739:	  ok = false;
+        -: 1740:	}
+        -: 1741:      else 
+        -: 1742:	{
+    #####: 1743:	  if (open(inputfile, O_RDONLY
+        -: 1744:#if defined O_LARGEFILE
+        -: 1745:		   |O_LARGEFILE
+        -: 1746:#endif
+        -: 1747:		   ) < 0)
+        -: 1748:	    {
+        -: 1749:	      /* This is not entirely fatal, since 
+        -: 1750:	       * executing the child with a closed
+        -: 1751:	       * stdin is almost as good as executing it
+        -: 1752:	       * with its stdin attached to /dev/null.
+        -: 1753:	       */
+    #####: 1754:	      error (0, errno, "%s", inputfile);
+        -: 1755:	      /* do not set ok=false, it is OK to continue anyway. */
+        -: 1756:	    }
+        -: 1757:	}
+        -: 1758:    }
+        -: 1759:
+        -: 1760:  /* Even if DebugSearch is set, don't announce our change of
+        -: 1761:   * directory, since we're not going to emit a subsequent
+        -: 1762:   * announcement of a call to stat() anyway, as we're about to exec
+        -: 1763:   * something.
+        -: 1764:   */
+    #####: 1765:  if (dirfd != AT_FDCWD)
+        -: 1766:    {
+    #####: 1767:      assert(dirfd >= 0);
+    #####: 1768:      if (0 != fchdir(dirfd))
+        -: 1769:	{
+        -: 1770:	  /* If we cannot execute our command in the correct directory,
+        -: 1771:	   * we should not execute it at all.
+        -: 1772:	   */
+    #####: 1773:	  error(0, errno, _("Failed to change directory"));
+    #####: 1774:	  ok = false;
+        -: 1775:	}
+        -: 1776:    }
+    #####: 1777:  return ok;
+        -: 1778:}
+        -: 1779:
+        -: 1780:
+        -: 1781:
+        -: 1782:int
+    #####: 1783:launch (const struct buildcmd_control *ctl,
+        -: 1784:	struct buildcmd_state *buildstate)
+        -: 1785:{
+        -: 1786:  int wait_status;
+        -: 1787:  pid_t child_pid;
+        -: 1788:  static int first_time = 1;
+    #####: 1789:  const struct exec_val *execp = buildstate->usercontext;
+        -: 1790:
+    #####: 1791:  if (!execp->use_current_dir)
+        -: 1792:    {
+    #####: 1793:      assert(starting_desc >= 0);
+    #####: 1794:      assert(execp->dirfd == starting_desc);
+        -: 1795:    }
+        -: 1796:  
+        -: 1797:	
+        -: 1798:  /* Null terminate the arg list.  */
+    #####: 1799:  bc_push_arg (ctl, buildstate, (char *) NULL, 0, NULL, 0, false); 
+        -: 1800:  
+        -: 1801:  /* Make sure output of command doesn't get mixed with find output. */
+    #####: 1802:  fflush (stdout);
+    #####: 1803:  fflush (stderr);
+        -: 1804:  
+        -: 1805:  /* Make sure to listen for the kids.  */
+    #####: 1806:  if (first_time)
+        -: 1807:    {
+    #####: 1808:      first_time = 0;
+    #####: 1809:      signal (SIGCHLD, SIG_DFL);
+        -: 1810:    }
+        -: 1811:
+    #####: 1812:  child_pid = fork ();
+    #####: 1813:  if (child_pid == -1)
+    #####: 1814:    error (1, errno, _("cannot fork"));
+    #####: 1815:  if (child_pid == 0)
+        -: 1816:    {
+        -: 1817:      /* We are the child. */
+    #####: 1818:      assert(starting_desc >= 0);
+    #####: 1819:      if (!prep_child_for_exec(execp->close_stdin, execp->dirfd))
+        -: 1820:	{
+    #####: 1821:	  _exit(1);
+        -: 1822:	}
+        -: 1823:      
+    #####: 1824:      execvp (buildstate->cmd_argv[0], buildstate->cmd_argv);
+    #####: 1825:      error (0, errno, "%s", buildstate->cmd_argv[0]);
+    #####: 1826:      _exit (1);
+        -: 1827:    }
+        -: 1828:
+        -: 1829:
+        -: 1830:  /* In parent; set up for next time. */
+    #####: 1831:  bc_clear_args(ctl, buildstate);
+        -: 1832:
+        -: 1833:  
+    #####: 1834:  while (waitpid (child_pid, &wait_status, 0) == (pid_t) -1)
+        -: 1835:    {
+    #####: 1836:      if (errno != EINTR)
+        -: 1837:	{
+    #####: 1838:	  error (0, errno, _("error waiting for %s"), buildstate->cmd_argv[0]);
+    #####: 1839:	  state.exit_status = 1;
+    #####: 1840:	  return 0;		/* FAIL */
+        -: 1841:	}
+        -: 1842:    }
+        -: 1843:  
+    #####: 1844:  if (WIFSIGNALED (wait_status))
+        -: 1845:    {
+    #####: 1846:      error (0, 0, _("%s terminated by signal %d"),
+    #####: 1847:	     buildstate->cmd_argv[0], WTERMSIG (wait_status));
+        -: 1848:      
+    #####: 1849:      if (execp->multiple)
+        -: 1850:	{
+        -: 1851:	  /* -exec   \; just returns false if the invoked command fails. 
+        -: 1852:	   * -exec {} + returns true if the invoked command fails, but
+        -: 1853:	   *            sets the program exit status.
+        -: 1854:	   */
+    #####: 1855:	  state.exit_status = 1;
+        -: 1856:	}
+        -: 1857:      
+    #####: 1858:      return 1;			/* OK */
+        -: 1859:    }
+        -: 1860:
+    #####: 1861:  if (0 == WEXITSTATUS (wait_status))
+        -: 1862:    {
+    #####: 1863:      return 1;			/* OK */
+        -: 1864:    }
+        -: 1865:  else
+        -: 1866:    {
+    #####: 1867:      if (execp->multiple)
+        -: 1868:	{
+        -: 1869:	  /* -exec   \; just returns false if the invoked command fails. 
+        -: 1870:	   * -exec {} + returns true if the invoked command fails, but
+        -: 1871:	   *            sets the program exit status.
+        -: 1872:	   */
+    #####: 1873:	  state.exit_status = 1;
+        -: 1874:	}
+    #####: 1875:      return 0;			/* FAIL */
+        -: 1876:    }
+        -: 1877:  
+        -: 1878:}
+        -: 1879:
+        -: 1880:
+        -: 1881:/* Return a static string formatting the time WHEN according to the
+        -: 1882: * strftime format character KIND.
+        -: 1883: *
+        -: 1884: * This function contains a number of assertions.  These look like
+        -: 1885: * runtime checks of the results of computations, which would be a
+        -: 1886: * problem since external events should not be tested for with
+        -: 1887: * "assert" (instead you should use "if").  However, they are not
+        -: 1888: * really runtime checks.  The assertions actually exist to verify
+        -: 1889: * that the various buffers are correctly sized.
+        -: 1890: */
+        -: 1891:static char *
+    #####: 1892:format_date (struct timespec ts, int kind)
+        -: 1893:{
+        -: 1894:  /* In theory, we use an extra 10 characters for 9 digits of
+        -: 1895:   * nanoseconds and 1 for the decimal point.  However, the real
+        -: 1896:   * world is more complex than that.
+        -: 1897:   *
+        -: 1898:   * For example, some systems return junk in the tv_nsec part of
+        -: 1899:   * st_birthtime.  An example of this is the NetBSD-4.0-RELENG kernel
+        -: 1900:   * (at Sat Mar 24 18:46:46 2007) running a NetBSD-3.1-RELEASE
+        -: 1901:   * runtime and examining files on an msdos filesytem.  So for that 
+        -: 1902:   * reason we set NS_BUF_LEN to 32, which is simply "long enough" as 
+        -: 1903:   * opposed to "exactly the right size".  Note that the behaviour of 
+        -: 1904:   * NetBSD appears to be a result of the use of uninitialised data, 
+        -: 1905:   * as it's not 100% reproducible (more like 25%).
+        -: 1906:   */
+        -: 1907:  enum {
+        -: 1908:    NS_BUF_LEN = 32,
+        -: 1909:    DATE_LEN_PERCENT_APLUS=21	/* length of result of %A+ (it's longer than %c)*/
+        -: 1910:  };	  
+        -: 1911:  static char buf[128u+10u + MAX(DATE_LEN_PERCENT_APLUS,
+        -: 1912:			    MAX (LONGEST_HUMAN_READABLE + 2, NS_BUF_LEN+64+200))];
+        -: 1913:  char ns_buf[NS_BUF_LEN]; /* -.9999999990 (- sign can happen!)*/
+        -: 1914:  int  charsprinted, need_ns_suffix;
+        -: 1915:  struct tm *tm;
+        -: 1916:  char fmt[6];
+        -: 1917:
+        -: 1918:  /* human_readable() assumes we pass a buffer which is at least as
+        -: 1919:   * long as LONGEST_HUMAN_READABLE.  We use an assertion here to
+        -: 1920:   * ensure that no nasty unsigned overflow happend in our calculation
+        -: 1921:   * of the size of buf.  Do the assertion here rather than in the
+        -: 1922:   * code for %@ so that we find the problem quickly if it exists.  If
+        -: 1923:   * you want to submit a patch to move this into the if statement, go
+        -: 1924:   * ahead, I'll apply it.  But include performance timings
+        -: 1925:   * demonstrating that the performance difference is actually
+        -: 1926:   * measurable.
+        -: 1927:   */
+        -: 1928:  assert(sizeof(buf) >= LONGEST_HUMAN_READABLE);
+        -: 1929:  
+        -: 1930:  /* Format the main part of the time. */
+    #####: 1931:  if (kind == '+')
+        -: 1932:    {
+    #####: 1933:      strcpy (fmt, "%F+%T");
+    #####: 1934:      need_ns_suffix = 1;
+        -: 1935:    }
+        -: 1936:  else
+        -: 1937:    {
+    #####: 1938:      fmt[0] = '%';
+    #####: 1939:      fmt[1] = kind;
+    #####: 1940:      fmt[2] = '\0';
+        -: 1941:
+        -: 1942:      /* %a, %c, and %t are handled in ctime_format() */
+    #####: 1943:      switch (kind)
+        -: 1944:	{
+        -: 1945:	case 'S':
+        -: 1946:	case 'T':
+        -: 1947:	case 'X':
+        -: 1948:	case '@':
+    #####: 1949:	  need_ns_suffix = 1;
+    #####: 1950:	  break;
+        -: 1951:	default:
+    #####: 1952:	  need_ns_suffix = 0;
+    #####: 1953:	  break;
+        -: 1954:	}
+        -: 1955:    }
+        -: 1956:
+    #####: 1957:  if (need_ns_suffix)
+        -: 1958:    {
+        -: 1959:      /* Format the nanoseconds part.  Leave a trailing zero to discourage people from 
+        -: 1960:       * writing scripts which extract the fractional part of the timestamp by using 
+        -: 1961:       * column offsets.  The reason for discouraging this is that in the future, the 
+        -: 1962:       * granularity may not be nanoseconds.
+        -: 1963:       */
+    #####: 1964:      ns_buf[0] = 0;
+    #####: 1965:      charsprinted = snprintf(ns_buf, NS_BUF_LEN, ".%09ld0", (long int)ts.tv_nsec);
+    #####: 1966:      assert(charsprinted < NS_BUF_LEN);
+        -: 1967:    }
+        -: 1968:
+    #####: 1969:  if (kind != '@'
+    #####: 1970:      && (tm = localtime (&ts.tv_sec))
+    #####: 1971:      && strftime (buf, sizeof buf, fmt, tm))
+        -: 1972:    {
+        -: 1973:      /* For %AS, %CS, %TS, add the fractional part of the seconds information. */
+    #####: 1974:      if (need_ns_suffix)
+        -: 1975:	{
+    #####: 1976:	  assert((sizeof buf - strlen(buf)) > strlen(ns_buf));
+    #####: 1977:	  strcat(buf, ns_buf);
+        -: 1978:	}
+    #####: 1979:      return buf;
+        -: 1980:    }
+        -: 1981:  else
+        -: 1982:    {
+    #####: 1983:      uintmax_t w = ts.tv_sec;
+        -: 1984:      size_t used, len, remaining;
+        -: 1985:
+        -: 1986:      /* XXX: note that we are negating an unsigned type which is the
+        -: 1987:       * widest possible unsigned type.
+        -: 1988:       */
+    #####: 1989:      char *p = human_readable (ts.tv_sec < 0 ? -w : w, buf + 1,
+        -: 1990:				human_ceiling, 1, 1);
+    #####: 1991:      assert(p > buf);
+    #####: 1992:      assert(p < (buf + (sizeof buf)));
+    #####: 1993:      if (ts.tv_sec < 0)
+    #####: 1994:	*--p = '-'; /* XXX: Ugh, relying on internal details of human_readable(). */
+        -: 1995:
+        -: 1996:      /* Add the nanoseconds part.  Because we cannot enforce a particlar implementation 
+        -: 1997:       * of human_readable, we cannot assume any particular value for (p-buf).  So we 
+        -: 1998:       * need to be careful that there is enough space remaining in the buffer.
+        -: 1999:       */
+    #####: 2000:      if (need_ns_suffix)
+        -: 2001:	{
+    #####: 2002:	  len = strlen(p);
+    #####: 2003:	  used = (p-buf) + len;	/* Offset into buf of current end */
+    #####: 2004:	  assert(sizeof buf > used); /* Ensure we can perform subtraction safely. */
+    #####: 2005:	  remaining = sizeof buf - used - 1u; /* allow space for NUL */
+        -: 2006:	  
+    #####: 2007:	  if (strlen(ns_buf) >= remaining)
+        -: 2008:	    {
+    #####: 2009:	      error(0, 0,
+        -: 2010:		    "charsprinted=%ld but remaining=%lu: ns_buf=%s",
+        -: 2011:		    (long)charsprinted, (unsigned long)remaining, ns_buf);
+        -: 2012:	    }
+    #####: 2013:	  assert(strlen(ns_buf) < remaining);
+    #####: 2014:	  strcat(p, ns_buf);
+        -: 2015:	}
+    #####: 2016:      return p;
+        -: 2017:    }
+        -: 2018:}
+        -: 2019:
+        -: 2020:static const char *weekdays[] = 
+        -: 2021:  {
+        -: 2022:    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+        -: 2023:  };
+        -: 2024:static char * months[] = 
+        -: 2025:  {
+        -: 2026:    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        -: 2027:    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+        -: 2028:  };
+        -: 2029:
+        -: 2030:
+        -: 2031:static char *
+    #####: 2032:ctime_format (struct timespec ts)
+        -: 2033:{
+        -: 2034:  const struct tm * ptm;
+        -: 2035:#define TIME_BUF_LEN 1024u
+        -: 2036:  static char resultbuf[TIME_BUF_LEN];
+        -: 2037:  int nout;
+        -: 2038:  
+    #####: 2039:  ptm = localtime(&ts.tv_sec);
+    #####: 2040:  if (ptm)
+        -: 2041:    {
+    #####: 2042:      assert(ptm->tm_wday >=  0);
+    #####: 2043:      assert(ptm->tm_wday <   7);
+    #####: 2044:      assert(ptm->tm_mon  >=  0);
+    #####: 2045:      assert(ptm->tm_mon  <  12);
+    #####: 2046:      assert(ptm->tm_hour >=  0);
+    #####: 2047:      assert(ptm->tm_hour <  24);
+    #####: 2048:      assert(ptm->tm_min  <  60);
+    #####: 2049:      assert(ptm->tm_sec  <= 61); /* allows 2 leap seconds. */
+        -: 2050:      
+        -: 2051:      /* wkday mon mday hh:mm:ss.nnnnnnnnn yyyy */
+    #####: 2052:      nout = snprintf(resultbuf, TIME_BUF_LEN,
+        -: 2053:		      "%3s %3s %2d %02d:%02d:%02d.%010ld %04d",
+    #####: 2054:		      weekdays[ptm->tm_wday],
+    #####: 2055:		      months[ptm->tm_mon],
+        -: 2056:		      ptm->tm_mday,
+        -: 2057:		      ptm->tm_hour,
+        -: 2058:		      ptm->tm_min,
+        -: 2059:		      ptm->tm_sec,
+        -: 2060:		      (long int)ts.tv_nsec,
+    #####: 2061:		      1900 + ptm->tm_year);
+        -: 2062:      
+    #####: 2063:      assert(nout < TIME_BUF_LEN);
+    #####: 2064:      return resultbuf;
+        -: 2065:    }
+        -: 2066:  else
+        -: 2067:    {
+        -: 2068:      /* The time cannot be represented as a struct tm.
+        -: 2069:	 Output it as an integer.  */
+    #####: 2070:      return format_date (ts, '@');
+        -: 2071:    }
+        -: 2072:}
+        -: 2073:
+        -: 2074:/* Copy STR into BUF and trim blanks from the end of BUF.
+        -: 2075:   Return BUF. */
+        -: 2076:
+        -: 2077:static char *
+    #####: 2078:blank_rtrim (str, buf)
+        -: 2079:     char *str;
+        -: 2080:     char *buf;
+        -: 2081:{
+        -: 2082:  int i;
+        -: 2083:
+    #####: 2084:  if (str == NULL)
+    #####: 2085:    return (NULL);
+    #####: 2086:  strcpy (buf, str);
+    #####: 2087:  i = strlen (buf) - 1;
+    #####: 2088:  while ((i >= 0) && ((buf[i] == ' ') || buf[i] == '\t'))
+    #####: 2089:    i--;
+    #####: 2090:  buf[++i] = '\0';
+    #####: 2091:  return (buf);
+        -: 2092:}
+        -: 2093:
+        -: 2094:/* Print out the predicate list starting at NODE. */
+        -: 2095:void
+    #####: 2096:print_list (FILE *fp, struct predicate *node)
+        -: 2097:{
+        -: 2098:  struct predicate *cur;
+        -: 2099:  char name[256];
+        -: 2100:
+    #####: 2101:  cur = node;
+    #####: 2102:  while (cur != NULL)
+        -: 2103:    {
+    #####: 2104:      fprintf (fp, "%s ", blank_rtrim (cur->p_name, name));
+    #####: 2105:      cur = cur->pred_next;
+        -: 2106:    }
+    #####: 2107:  fprintf (fp, "\n");
+    #####: 2108:}
+        -: 2109:
+        -: 2110:/* Print out the predicate list starting at NODE. */
+        -: 2111:static void
+    #####: 2112:print_parenthesised(FILE *fp, struct predicate *node)
+        -: 2113:{
+    #####: 2114:  int parens = 0;
+        -: 2115:
+    #####: 2116:  if (node)
+        -: 2117:    {
+    #####: 2118:      if ( ( (node->pred_func == pred_or)
+    #####: 2119:	     || (node->pred_func == pred_and) )
+    #####: 2120:	  && node->pred_left == NULL)
+        -: 2121:	{
+        -: 2122:	  /* We print "<nothing> or  X" as just "X"
+        -: 2123:	   * We print "<nothing> and X" as just "X"
+        -: 2124:	   */
+    #####: 2125:	  print_parenthesised(fp, node->pred_right);
+        -: 2126:	}
+        -: 2127:      else
+        -: 2128:	{
+    #####: 2129:	  if (node->pred_left || node->pred_right)
+    #####: 2130:	    parens = 1;
+        -: 2131:
+    #####: 2132:	  if (parens)
+    #####: 2133:	    fprintf(fp, "%s", " ( ");
+    #####: 2134:	  print_optlist(fp, node);
+    #####: 2135:	  if (parens)
+    #####: 2136:	    fprintf(fp, "%s", " ) ");
+        -: 2137:	}
+        -: 2138:    }
+    #####: 2139:}
+        -: 2140:
+        -: 2141:void
+    #####: 2142:print_optlist (FILE *fp, const struct predicate *p)
+        -: 2143:{
+    #####: 2144:  if (p)
+        -: 2145:    {
+    #####: 2146:      print_parenthesised(fp, p->pred_left);
+    #####: 2147:      fprintf (fp,
+        -: 2148:	       "%s%s",
+    #####: 2149:	       p->need_stat ? "[call stat] " : "",
+    #####: 2150:	       p->need_type ? "[need type] " : "");
+    #####: 2151:      print_predicate(fp, p);
+    #####: 2152:      fprintf(fp, " [%g] ", p->est_success_rate);
+    #####: 2153:      print_parenthesised(fp, p->pred_right);
+        -: 2154:    }
+    #####: 2155:}
+        -: 2156:
+        -: 2157:#ifdef _NDEBUG
+        -: 2158:/* If _NDEBUG is defined, the assertions will do nothing.   Hence 
+        -: 2159: * there is no point in having a function body for pred_sanity_check()
+        -: 2160: * if that preprocessor macro is defined. 
+        -: 2161: */
+        -: 2162:void
+        -: 2163:pred_sanity_check(const struct predicate *predicates)
+        -: 2164:{
+        -: 2165:  /* Do nothing, since assert() is a no-op with _NDEBUG set */
+        -: 2166:  return;
+        -: 2167:}
+        -: 2168:#else
+        -: 2169:void
+       41: 2170:pred_sanity_check(const struct predicate *predicates)
+        -: 2171:{
+        -: 2172:  const struct predicate *p;
+        -: 2173:  
+       90: 2174:  for (p=predicates; p != NULL; p=p->pred_next)
+        -: 2175:    {
+        -: 2176:      /* All predicates must do something. */
+       49: 2177:      assert(p->pred_func != NULL);
+        -: 2178:
+        -: 2179:      /* All predicates must have a parser table entry. */
+       49: 2180:      assert(p->parser_entry != NULL);
+        -: 2181:      
+        -: 2182:      /* If the parser table tells us that just one predicate function is 
+        -: 2183:       * possible, verify that that is still the one that is in effect.
+        -: 2184:       * If the parser has NULL for the predicate function, that means that 
+        -: 2185:       * the parse_xxx function fills it in, so we can't check it.
+        -: 2186:       */
+       49: 2187:      if (p->parser_entry->pred_func)
+        -: 2188:	{
+       17: 2189:	  assert(p->parser_entry->pred_func == p->pred_func);
+        -: 2190:	}
+        -: 2191:      
+       49: 2192:      switch (p->parser_entry->type)
+        -: 2193:	{
+        -: 2194:	  /* Options all take effect during parsing, so there should
+        -: 2195:	   * be no predicate entries corresponding to them.  Hence we
+        -: 2196:	   * should not see any ARG_OPTION or ARG_POSITIONAL_OPTION
+        -: 2197:	   * items.
+        -: 2198:	   *
+        -: 2199:	   * This is a silly way of coding this test, but it prevents
+        -: 2200:	   * a compiler warning (i.e. otherwise it would think that
+        -: 2201:	   * there would be case statements missing).
+        -: 2202:	   */
+        -: 2203:	case ARG_OPTION:
+        -: 2204:	case ARG_POSITIONAL_OPTION:
+    #####: 2205:	  assert(p->parser_entry->type != ARG_OPTION);
+    #####: 2206:	  assert(p->parser_entry->type != ARG_POSITIONAL_OPTION);
+    #####: 2207:	  break;
+        -: 2208:	  
+        -: 2209:	case ARG_ACTION:
+       32: 2210:	  assert(p->side_effects); /* actions have side effects. */
+       32: 2211:	  if (p->pred_func != pred_prune && p->pred_func != pred_quit)
+        -: 2212:	    {
+        -: 2213:	      /* actions other than -prune and -quit should
+        -: 2214:	       * inhibit the default -print
+        -: 2215:	       */
+       32: 2216:	      assert(p->no_default_print);
+        -: 2217:	    }
+       32: 2218:	  break;
+        -: 2219:
+        -: 2220:	case ARG_PUNCTUATION:
+        -: 2221:	case ARG_TEST:
+        -: 2222:	case ARG_NOOP:
+        -: 2223:	  /* Punctuation and tests should have no side
+        -: 2224:	   * effects and not inhibit default print.
+        -: 2225:	   */
+       17: 2226:	  assert(!p->no_default_print);
+       17: 2227:	  assert(!p->side_effects);
+       17: 2228:	  break;
+        -: 2229:	}
+        -: 2230:    }
+       41: 2231:}
+        -: 2232:#endif

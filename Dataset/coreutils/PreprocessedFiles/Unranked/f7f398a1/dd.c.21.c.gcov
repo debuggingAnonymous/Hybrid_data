@@ -1,0 +1,2301 @@
+        -:    0:Source:dd.c
+        -:    0:Graph:dd.gcno
+        -:    0:Data:dd.gcda
+        -:    0:Runs:2
+        -:    0:Programs:1
+        -:    1:/* dd -- convert a file while copying it.
+        -:    2:   Copyright (C) 1985-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by Paul Rubin, David MacKenzie, and Stuart Kemp. */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:
+        -:   21:#define SWAB_ALIGN_OFFSET 2
+        -:   22:
+        -:   23:#include <assert.h>
+        -:   24:#include <sys/types.h>
+        -:   25:#include <signal.h>
+        -:   26:#include <getopt.h>
+        -:   27:
+        -:   28:#include "system.h"
+        -:   29:#include "close-stream.h"
+        -:   30:#include "error.h"
+        -:   31:#include "fd-reopen.h"
+        -:   32:#include "gethrxtime.h"
+        -:   33:#include "human.h"
+        -:   34:#include "long-options.h"
+        -:   35:#include "quote.h"
+        -:   36:#include "quotearg.h"
+        -:   37:#include "xstrtol.h"
+        -:   38:#include "xtime.h"
+        -:   39:
+        -:   40:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   41:#define PROGRAM_NAME "dd"
+        -:   42:
+        -:   43:#define AUTHORS \
+        -:   44:  proper_name ("Paul Rubin"), \
+        -:   45:  proper_name ("David MacKenzie"), \
+        -:   46:  proper_name ("Stuart Kemp")
+        -:   47:
+        -:   48:/* Use SA_NOCLDSTOP as a proxy for whether the sigaction machinery is
+        -:   49:   present.  */
+        -:   50:#ifndef SA_NOCLDSTOP
+        -:   51:# define SA_NOCLDSTOP 0
+        -:   52:# define sigprocmask(How, Set, Oset) /* empty */
+        -:   53:# define sigset_t int
+        -:   54:# if ! HAVE_SIGINTERRUPT
+        -:   55:#  define siginterrupt(sig, flag) /* empty */
+        -:   56:# endif
+        -:   57:#endif
+        -:   58:
+        -:   59:/* NonStop circa 2011 lacks SA_RESETHAND; see Bug#9076.  */
+        -:   60:#ifndef SA_RESETHAND
+        -:   61:# define SA_RESETHAND 0
+        -:   62:#endif
+        -:   63:
+        -:   64:#ifndef SIGINFO
+        -:   65:# define SIGINFO SIGUSR1
+        -:   66:#endif
+        -:   67:
+        -:   68:/* This may belong in GNULIB's fcntl module instead.
+        -:   69:   Define O_CIO to 0 if it is not supported by this OS. */
+        -:   70:#ifndef O_CIO
+        -:   71:# define O_CIO 0
+        -:   72:#endif
+        -:   73:
+        -:   74:/* On AIX 5.1 and AIX 5.2, O_NOCACHE is defined via <fcntl.h>
+        -:   75:   and would interfere with our use of that name, below.  */
+        -:   76:#undef O_NOCACHE
+        -:   77:
+        -:   78:#if ! HAVE_FDATASYNC
+        -:   79:# define fdatasync(fd) (errno = ENOSYS, -1)
+        -:   80:#endif
+        -:   81:
+        -:   82:#define output_char(c)				\
+        -:   83:  do						\
+        -:   84:    {						\
+        -:   85:      obuf[oc++] = (c);				\
+        -:   86:      if (oc >= output_blocksize)		\
+        -:   87:        write_output ();			\
+        -:   88:    }						\
+        -:   89:  while (0)
+        -:   90:
+        -:   91:/* Default input and output blocksize. */
+        -:   92:#define DEFAULT_BLOCKSIZE 512
+        -:   93:
+        -:   94:/* How many bytes to add to the input and output block sizes before invoking
+        -:   95:   malloc.  See dd_copy for details.  INPUT_BLOCK_SLOP must be no less than
+        -:   96:   OUTPUT_BLOCK_SLOP.  */
+        -:   97:#define INPUT_BLOCK_SLOP (2 * SWAB_ALIGN_OFFSET + 2 * page_size - 1)
+        -:   98:#define OUTPUT_BLOCK_SLOP (page_size - 1)
+        -:   99:
+        -:  100:/* Maximum blocksize for the given SLOP.
+        -:  101:   Keep it smaller than SIZE_MAX - SLOP, so that we can
+        -:  102:   allocate buffers that size.  Keep it smaller than SSIZE_MAX, for
+        -:  103:   the benefit of system calls like "read".  And keep it smaller than
+        -:  104:   OFF_T_MAX, for the benefit of the large-offset seek code.  */
+        -:  105:#define MAX_BLOCKSIZE(slop) MIN (SIZE_MAX - (slop), MIN (SSIZE_MAX, OFF_T_MAX))
+        -:  106:
+        -:  107:/* Conversions bit masks. */
+        -:  108:enum
+        -:  109:  {
+        -:  110:    C_ASCII = 01,
+        -:  111:
+        -:  112:    C_EBCDIC = 02,
+        -:  113:    C_IBM = 04,
+        -:  114:    C_BLOCK = 010,
+        -:  115:    C_UNBLOCK = 020,
+        -:  116:    C_LCASE = 040,
+        -:  117:    C_UCASE = 0100,
+        -:  118:    C_SWAB = 0200,
+        -:  119:    C_NOERROR = 0400,
+        -:  120:    C_NOTRUNC = 01000,
+        -:  121:    C_SYNC = 02000,
+        -:  122:
+        -:  123:    /* Use separate input and output buffers, and combine partial
+        -:  124:       input blocks. */
+        -:  125:    C_TWOBUFS = 04000,
+        -:  126:
+        -:  127:    C_NOCREAT = 010000,
+        -:  128:    C_EXCL = 020000,
+        -:  129:    C_FDATASYNC = 040000,
+        -:  130:    C_FSYNC = 0100000,
+        -:  131:
+        -:  132:    C_SPARSE = 0200000
+        -:  133:  };
+        -:  134:
+        -:  135:/* Status bit masks.  */
+        -:  136:enum
+        -:  137:  {
+        -:  138:    STATUS_NOXFER = 01
+        -:  139:  };
+        -:  140:
+        -:  141:/* The name of the input file, or NULL for the standard input. */
+        -:  142:static char const *input_file = NULL;
+        -:  143:
+        -:  144:/* The name of the output file, or NULL for the standard output. */
+        -:  145:static char const *output_file = NULL;
+        -:  146:
+        -:  147:/* The page size on this host.  */
+        -:  148:static size_t page_size;
+        -:  149:
+        -:  150:/* The number of bytes in which atomic reads are done. */
+        -:  151:static size_t input_blocksize = 0;
+        -:  152:
+        -:  153:/* The number of bytes in which atomic writes are done. */
+        -:  154:static size_t output_blocksize = 0;
+        -:  155:
+        -:  156:/* Conversion buffer size, in bytes.  0 prevents conversions. */
+        -:  157:static size_t conversion_blocksize = 0;
+        -:  158:
+        -:  159:/* Skip this many records of 'input_blocksize' bytes before input. */
+        -:  160:static uintmax_t skip_records = 0;
+        -:  161:
+        -:  162:/* Skip this many bytes before input in addition of 'skip_records'
+        -:  163:   records.  */
+        -:  164:static size_t skip_bytes = 0;
+        -:  165:
+        -:  166:/* Skip this many records of 'output_blocksize' bytes before output. */
+        -:  167:static uintmax_t seek_records = 0;
+        -:  168:
+        -:  169:/* Skip this many bytes in addition to 'seek_records' records before
+        -:  170:   output.  */
+        -:  171:static uintmax_t seek_bytes = 0;
+        -:  172:
+        -:  173:/* Whether the final output was done with a seek (rather than a write).  */
+        -:  174:static bool final_op_was_seek;
+        -:  175:
+        -:  176:/* Copy only this many records.  The default is effectively infinity.  */
+        -:  177:static uintmax_t max_records = (uintmax_t) -1;
+        -:  178:
+        -:  179:/* Copy this many bytes in addition to 'max_records' records.  */
+        -:  180:static size_t max_bytes = 0;
+        -:  181:
+        -:  182:/* Bit vector of conversions to apply. */
+        -:  183:static int conversions_mask = 0;
+        -:  184:
+        -:  185:/* Open flags for the input and output files.  */
+        -:  186:static int input_flags = 0;
+        -:  187:static int output_flags = 0;
+        -:  188:
+        -:  189:/* Status flags for what is printed to stderr.  */
+        -:  190:static int status_flags = 0;
+        -:  191:
+        -:  192:/* If nonzero, filter characters through the translation table.  */
+        -:  193:static bool translation_needed = false;
+        -:  194:
+        -:  195:/* Number of partial blocks written. */
+        -:  196:static uintmax_t w_partial = 0;
+        -:  197:
+        -:  198:/* Number of full blocks written. */
+        -:  199:static uintmax_t w_full = 0;
+        -:  200:
+        -:  201:/* Number of partial blocks read. */
+        -:  202:static uintmax_t r_partial = 0;
+        -:  203:
+        -:  204:/* Number of full blocks read. */
+        -:  205:static uintmax_t r_full = 0;
+        -:  206:
+        -:  207:/* Number of bytes written.  */
+        -:  208:static uintmax_t w_bytes = 0;
+        -:  209:
+        -:  210:/* Time that dd started.  */
+        -:  211:static xtime_t start_time;
+        -:  212:
+        -:  213:/* True if input is seekable.  */
+        -:  214:static bool input_seekable;
+        -:  215:
+        -:  216:/* Error number corresponding to initial attempt to lseek input.
+        -:  217:   If ESPIPE, do not issue any more diagnostics about it.  */
+        -:  218:static int input_seek_errno;
+        -:  219:
+        -:  220:/* File offset of the input, in bytes, along with a flag recording
+        -:  221:   whether it overflowed.  */
+        -:  222:static uintmax_t input_offset;
+        -:  223:static bool input_offset_overflow;
+        -:  224:
+        -:  225:/* True if a partial read should be diagnosed.  */
+        -:  226:static bool warn_partial_read;
+        -:  227:
+        -:  228:/* Records truncated by conv=block. */
+        -:  229:static uintmax_t r_truncate = 0;
+        -:  230:
+        -:  231:/* Output representation of newline and space characters.
+        -:  232:   They change if we're converting to EBCDIC.  */
+        -:  233:static char newline_character = '\n';
+        -:  234:static char space_character = ' ';
+        -:  235:
+        -:  236:/* Output buffer. */
+        -:  237:static char *obuf;
+        -:  238:
+        -:  239:/* Current index into 'obuf'. */
+        -:  240:static size_t oc = 0;
+        -:  241:
+        -:  242:/* Index into current line, for 'conv=block' and 'conv=unblock'.  */
+        -:  243:static size_t col = 0;
+        -:  244:
+        -:  245:/* The set of signals that are caught.  */
+        -:  246:static sigset_t caught_signals;
+        -:  247:
+        -:  248:/* If nonzero, the value of the pending fatal signal.  */
+        -:  249:static sig_atomic_t volatile interrupt_signal;
+        -:  250:
+        -:  251:/* A count of the number of pending info signals that have been received.  */
+        -:  252:static sig_atomic_t volatile info_signal_count;
+        -:  253:
+        -:  254:/* Whether to discard cache for input or output.  */
+        -:  255:static bool i_nocache, o_nocache;
+        -:  256:
+        -:  257:/* Function used for read (to handle iflag=fullblock parameter).  */
+        -:  258:static ssize_t (*iread_fnc) (int fd, char *buf, size_t size);
+        -:  259:
+        -:  260:/* A longest symbol in the struct symbol_values tables below.  */
+        -:  261:#define LONGEST_SYMBOL "count_bytes"
+        -:  262:
+        -:  263:/* A symbol and the corresponding integer value.  */
+        -:  264:struct symbol_value
+        -:  265:{
+        -:  266:  char symbol[sizeof LONGEST_SYMBOL];
+        -:  267:  int value;
+        -:  268:};
+        -:  269:
+        -:  270:/* Conversion symbols, for conv="...".  */
+        -:  271:static struct symbol_value const conversions[] =
+        -:  272:{
+        -:  273:  {"ascii", C_ASCII | C_TWOBUFS},	/* EBCDIC to ASCII. */
+        -:  274:  {"ebcdic", C_EBCDIC | C_TWOBUFS},	/* ASCII to EBCDIC. */
+        -:  275:  {"ibm", C_IBM | C_TWOBUFS},	/* Slightly different ASCII to EBCDIC. */
+        -:  276:  {"block", C_BLOCK | C_TWOBUFS},	/* Variable to fixed length records. */
+        -:  277:  {"unblock", C_UNBLOCK | C_TWOBUFS},	/* Fixed to variable length records. */
+        -:  278:  {"lcase", C_LCASE | C_TWOBUFS},	/* Translate upper to lower case. */
+        -:  279:  {"ucase", C_UCASE | C_TWOBUFS},	/* Translate lower to upper case. */
+        -:  280:  {"sparse", C_SPARSE},		/* Try to sparsely write output. */
+        -:  281:  {"swab", C_SWAB | C_TWOBUFS},	/* Swap bytes of input. */
+        -:  282:  {"noerror", C_NOERROR},	/* Ignore i/o errors. */
+        -:  283:  {"nocreat", C_NOCREAT},	/* Do not create output file.  */
+        -:  284:  {"excl", C_EXCL},		/* Fail if the output file already exists.  */
+        -:  285:  {"notrunc", C_NOTRUNC},	/* Do not truncate output file. */
+        -:  286:  {"sync", C_SYNC},		/* Pad input records to ibs with NULs. */
+        -:  287:  {"fdatasync", C_FDATASYNC},	/* Synchronize output data before finishing.  */
+        -:  288:  {"fsync", C_FSYNC},		/* Also synchronize output metadata.  */
+        -:  289:  {"", 0}
+        -:  290:};
+        -:  291:
+        -:  292:#define FFS_MASK(x) ((x) ^ ((x) & ((x) - 1)))
+        -:  293:enum
+        -:  294:  {
+        -:  295:    /* Compute a value that's bitwise disjoint from the union
+        -:  296:       of all O_ values.  */
+        -:  297:    v = ~(0
+        -:  298:          | O_APPEND
+        -:  299:          | O_BINARY
+        -:  300:          | O_CIO
+        -:  301:          | O_DIRECT
+        -:  302:          | O_DIRECTORY
+        -:  303:          | O_DSYNC
+        -:  304:          | O_NOATIME
+        -:  305:          | O_NOCTTY
+        -:  306:          | O_NOFOLLOW
+        -:  307:          | O_NOLINKS
+        -:  308:          | O_NONBLOCK
+        -:  309:          | O_SYNC
+        -:  310:          | O_TEXT
+        -:  311:          ),
+        -:  312:
+        -:  313:    /* Use its lowest bits for private flags.  */
+        -:  314:    O_FULLBLOCK = FFS_MASK (v),
+        -:  315:    v2 = v ^ O_FULLBLOCK,
+        -:  316:
+        -:  317:    O_NOCACHE = FFS_MASK (v2),
+        -:  318:    v3 = v2 ^ O_NOCACHE,
+        -:  319:
+        -:  320:    O_COUNT_BYTES = FFS_MASK (v3),
+        -:  321:    v4 = v3 ^ O_COUNT_BYTES,
+        -:  322:
+        -:  323:    O_SKIP_BYTES = FFS_MASK (v4),
+        -:  324:    v5 = v4 ^ O_SKIP_BYTES,
+        -:  325:
+        -:  326:    O_SEEK_BYTES = FFS_MASK (v5)
+        -:  327:  };
+        -:  328:
+        -:  329:/* Ensure that we got something.  */
+        -:  330:verify (O_FULLBLOCK != 0);
+        -:  331:verify (O_NOCACHE != 0);
+        -:  332:verify (O_COUNT_BYTES != 0);
+        -:  333:verify (O_SKIP_BYTES != 0);
+        -:  334:verify (O_SEEK_BYTES != 0);
+        -:  335:
+        -:  336:#define MULTIPLE_BITS_SET(i) (((i) & ((i) - 1)) != 0)
+        -:  337:
+        -:  338:/* Ensure that this is a single-bit value.  */
+        -:  339:verify ( ! MULTIPLE_BITS_SET (O_FULLBLOCK));
+        -:  340:verify ( ! MULTIPLE_BITS_SET (O_NOCACHE));
+        -:  341:verify ( ! MULTIPLE_BITS_SET (O_COUNT_BYTES));
+        -:  342:verify ( ! MULTIPLE_BITS_SET (O_SKIP_BYTES));
+        -:  343:verify ( ! MULTIPLE_BITS_SET (O_SEEK_BYTES));
+        -:  344:
+        -:  345:/* Flags, for iflag="..." and oflag="...".  */
+        -:  346:static struct symbol_value const flags[] =
+        -:  347:{
+        -:  348:  {"append",	  O_APPEND},
+        -:  349:  {"binary",	  O_BINARY},
+        -:  350:  {"cio",	  O_CIO},
+        -:  351:  {"direct",	  O_DIRECT},
+        -:  352:  {"directory",   O_DIRECTORY},
+        -:  353:  {"dsync",	  O_DSYNC},
+        -:  354:  {"noatime",	  O_NOATIME},
+        -:  355:  {"nocache",	  O_NOCACHE},   /* Discard cache.  */
+        -:  356:  {"noctty",	  O_NOCTTY},
+        -:  357:  {"nofollow",	  HAVE_WORKING_O_NOFOLLOW ? O_NOFOLLOW : 0},
+        -:  358:  {"nolinks",	  O_NOLINKS},
+        -:  359:  {"nonblock",	  O_NONBLOCK},
+        -:  360:  {"sync",	  O_SYNC},
+        -:  361:  {"text",	  O_TEXT},
+        -:  362:  {"fullblock",   O_FULLBLOCK}, /* Accumulate full blocks from input.  */
+        -:  363:  {"count_bytes", O_COUNT_BYTES},
+        -:  364:  {"skip_bytes",  O_SKIP_BYTES},
+        -:  365:  {"seek_bytes",  O_SEEK_BYTES},
+        -:  366:  {"",		0}
+        -:  367:};
+        -:  368:
+        -:  369:/* Status, for status="...".  */
+        -:  370:static struct symbol_value const statuses[] =
+        -:  371:{
+        -:  372:  {"noxfer",	STATUS_NOXFER},
+        -:  373:  {"",		0}
+        -:  374:};
+        -:  375:
+        -:  376:/* Translation table formed by applying successive transformations. */
+        -:  377:static unsigned char trans_table[256];
+        -:  378:
+        -:  379:static char const ascii_to_ebcdic[] =
+        -:  380:{
+        -:  381:  '\000', '\001', '\002', '\003', '\067', '\055', '\056', '\057',
+        -:  382:  '\026', '\005', '\045', '\013', '\014', '\015', '\016', '\017',
+        -:  383:  '\020', '\021', '\022', '\023', '\074', '\075', '\062', '\046',
+        -:  384:  '\030', '\031', '\077', '\047', '\034', '\035', '\036', '\037',
+        -:  385:  '\100', '\117', '\177', '\173', '\133', '\154', '\120', '\175',
+        -:  386:  '\115', '\135', '\134', '\116', '\153', '\140', '\113', '\141',
+        -:  387:  '\360', '\361', '\362', '\363', '\364', '\365', '\366', '\367',
+        -:  388:  '\370', '\371', '\172', '\136', '\114', '\176', '\156', '\157',
+        -:  389:  '\174', '\301', '\302', '\303', '\304', '\305', '\306', '\307',
+        -:  390:  '\310', '\311', '\321', '\322', '\323', '\324', '\325', '\326',
+        -:  391:  '\327', '\330', '\331', '\342', '\343', '\344', '\345', '\346',
+        -:  392:  '\347', '\350', '\351', '\112', '\340', '\132', '\137', '\155',
+        -:  393:  '\171', '\201', '\202', '\203', '\204', '\205', '\206', '\207',
+        -:  394:  '\210', '\211', '\221', '\222', '\223', '\224', '\225', '\226',
+        -:  395:  '\227', '\230', '\231', '\242', '\243', '\244', '\245', '\246',
+        -:  396:  '\247', '\250', '\251', '\300', '\152', '\320', '\241', '\007',
+        -:  397:  '\040', '\041', '\042', '\043', '\044', '\025', '\006', '\027',
+        -:  398:  '\050', '\051', '\052', '\053', '\054', '\011', '\012', '\033',
+        -:  399:  '\060', '\061', '\032', '\063', '\064', '\065', '\066', '\010',
+        -:  400:  '\070', '\071', '\072', '\073', '\004', '\024', '\076', '\341',
+        -:  401:  '\101', '\102', '\103', '\104', '\105', '\106', '\107', '\110',
+        -:  402:  '\111', '\121', '\122', '\123', '\124', '\125', '\126', '\127',
+        -:  403:  '\130', '\131', '\142', '\143', '\144', '\145', '\146', '\147',
+        -:  404:  '\150', '\151', '\160', '\161', '\162', '\163', '\164', '\165',
+        -:  405:  '\166', '\167', '\170', '\200', '\212', '\213', '\214', '\215',
+        -:  406:  '\216', '\217', '\220', '\232', '\233', '\234', '\235', '\236',
+        -:  407:  '\237', '\240', '\252', '\253', '\254', '\255', '\256', '\257',
+        -:  408:  '\260', '\261', '\262', '\263', '\264', '\265', '\266', '\267',
+        -:  409:  '\270', '\271', '\272', '\273', '\274', '\275', '\276', '\277',
+        -:  410:  '\312', '\313', '\314', '\315', '\316', '\317', '\332', '\333',
+        -:  411:  '\334', '\335', '\336', '\337', '\352', '\353', '\354', '\355',
+        -:  412:  '\356', '\357', '\372', '\373', '\374', '\375', '\376', '\377'
+        -:  413:};
+        -:  414:
+        -:  415:static char const ascii_to_ibm[] =
+        -:  416:{
+        -:  417:  '\000', '\001', '\002', '\003', '\067', '\055', '\056', '\057',
+        -:  418:  '\026', '\005', '\045', '\013', '\014', '\015', '\016', '\017',
+        -:  419:  '\020', '\021', '\022', '\023', '\074', '\075', '\062', '\046',
+        -:  420:  '\030', '\031', '\077', '\047', '\034', '\035', '\036', '\037',
+        -:  421:  '\100', '\132', '\177', '\173', '\133', '\154', '\120', '\175',
+        -:  422:  '\115', '\135', '\134', '\116', '\153', '\140', '\113', '\141',
+        -:  423:  '\360', '\361', '\362', '\363', '\364', '\365', '\366', '\367',
+        -:  424:  '\370', '\371', '\172', '\136', '\114', '\176', '\156', '\157',
+        -:  425:  '\174', '\301', '\302', '\303', '\304', '\305', '\306', '\307',
+        -:  426:  '\310', '\311', '\321', '\322', '\323', '\324', '\325', '\326',
+        -:  427:  '\327', '\330', '\331', '\342', '\343', '\344', '\345', '\346',
+        -:  428:  '\347', '\350', '\351', '\255', '\340', '\275', '\137', '\155',
+        -:  429:  '\171', '\201', '\202', '\203', '\204', '\205', '\206', '\207',
+        -:  430:  '\210', '\211', '\221', '\222', '\223', '\224', '\225', '\226',
+        -:  431:  '\227', '\230', '\231', '\242', '\243', '\244', '\245', '\246',
+        -:  432:  '\247', '\250', '\251', '\300', '\117', '\320', '\241', '\007',
+        -:  433:  '\040', '\041', '\042', '\043', '\044', '\025', '\006', '\027',
+        -:  434:  '\050', '\051', '\052', '\053', '\054', '\011', '\012', '\033',
+        -:  435:  '\060', '\061', '\032', '\063', '\064', '\065', '\066', '\010',
+        -:  436:  '\070', '\071', '\072', '\073', '\004', '\024', '\076', '\341',
+        -:  437:  '\101', '\102', '\103', '\104', '\105', '\106', '\107', '\110',
+        -:  438:  '\111', '\121', '\122', '\123', '\124', '\125', '\126', '\127',
+        -:  439:  '\130', '\131', '\142', '\143', '\144', '\145', '\146', '\147',
+        -:  440:  '\150', '\151', '\160', '\161', '\162', '\163', '\164', '\165',
+        -:  441:  '\166', '\167', '\170', '\200', '\212', '\213', '\214', '\215',
+        -:  442:  '\216', '\217', '\220', '\232', '\233', '\234', '\235', '\236',
+        -:  443:  '\237', '\240', '\252', '\253', '\254', '\255', '\256', '\257',
+        -:  444:  '\260', '\261', '\262', '\263', '\264', '\265', '\266', '\267',
+        -:  445:  '\270', '\271', '\272', '\273', '\274', '\275', '\276', '\277',
+        -:  446:  '\312', '\313', '\314', '\315', '\316', '\317', '\332', '\333',
+        -:  447:  '\334', '\335', '\336', '\337', '\352', '\353', '\354', '\355',
+        -:  448:  '\356', '\357', '\372', '\373', '\374', '\375', '\376', '\377'
+        -:  449:};
+        -:  450:
+        -:  451:static char const ebcdic_to_ascii[] =
+        -:  452:{
+        -:  453:  '\000', '\001', '\002', '\003', '\234', '\011', '\206', '\177',
+        -:  454:  '\227', '\215', '\216', '\013', '\014', '\015', '\016', '\017',
+        -:  455:  '\020', '\021', '\022', '\023', '\235', '\205', '\010', '\207',
+        -:  456:  '\030', '\031', '\222', '\217', '\034', '\035', '\036', '\037',
+        -:  457:  '\200', '\201', '\202', '\203', '\204', '\012', '\027', '\033',
+        -:  458:  '\210', '\211', '\212', '\213', '\214', '\005', '\006', '\007',
+        -:  459:  '\220', '\221', '\026', '\223', '\224', '\225', '\226', '\004',
+        -:  460:  '\230', '\231', '\232', '\233', '\024', '\025', '\236', '\032',
+        -:  461:  '\040', '\240', '\241', '\242', '\243', '\244', '\245', '\246',
+        -:  462:  '\247', '\250', '\133', '\056', '\074', '\050', '\053', '\041',
+        -:  463:  '\046', '\251', '\252', '\253', '\254', '\255', '\256', '\257',
+        -:  464:  '\260', '\261', '\135', '\044', '\052', '\051', '\073', '\136',
+        -:  465:  '\055', '\057', '\262', '\263', '\264', '\265', '\266', '\267',
+        -:  466:  '\270', '\271', '\174', '\054', '\045', '\137', '\076', '\077',
+        -:  467:  '\272', '\273', '\274', '\275', '\276', '\277', '\300', '\301',
+        -:  468:  '\302', '\140', '\072', '\043', '\100', '\047', '\075', '\042',
+        -:  469:  '\303', '\141', '\142', '\143', '\144', '\145', '\146', '\147',
+        -:  470:  '\150', '\151', '\304', '\305', '\306', '\307', '\310', '\311',
+        -:  471:  '\312', '\152', '\153', '\154', '\155', '\156', '\157', '\160',
+        -:  472:  '\161', '\162', '\313', '\314', '\315', '\316', '\317', '\320',
+        -:  473:  '\321', '\176', '\163', '\164', '\165', '\166', '\167', '\170',
+        -:  474:  '\171', '\172', '\322', '\323', '\324', '\325', '\326', '\327',
+        -:  475:  '\330', '\331', '\332', '\333', '\334', '\335', '\336', '\337',
+        -:  476:  '\340', '\341', '\342', '\343', '\344', '\345', '\346', '\347',
+        -:  477:  '\173', '\101', '\102', '\103', '\104', '\105', '\106', '\107',
+        -:  478:  '\110', '\111', '\350', '\351', '\352', '\353', '\354', '\355',
+        -:  479:  '\175', '\112', '\113', '\114', '\115', '\116', '\117', '\120',
+        -:  480:  '\121', '\122', '\356', '\357', '\360', '\361', '\362', '\363',
+        -:  481:  '\134', '\237', '\123', '\124', '\125', '\126', '\127', '\130',
+        -:  482:  '\131', '\132', '\364', '\365', '\366', '\367', '\370', '\371',
+        -:  483:  '\060', '\061', '\062', '\063', '\064', '\065', '\066', '\067',
+        -:  484:  '\070', '\071', '\372', '\373', '\374', '\375', '\376', '\377'
+        -:  485:};
+        -:  486:
+        -:  487:/* True if we need to close the standard output *stream*.  */
+        -:  488:static bool close_stdout_required = true;
+        -:  489:
+        -:  490:/* The only reason to close the standard output *stream* is if
+        -:  491:   parse_long_options fails (as it does for --help or --version).
+        -:  492:   In any other case, dd uses only the STDOUT_FILENO file descriptor,
+        -:  493:   and the "cleanup" function calls "close (STDOUT_FILENO)".
+        -:  494:   Closing the file descriptor and then letting the usual atexit-run
+        -:  495:   close_stdout function call "fclose (stdout)" would result in a
+        -:  496:   harmless failure of the close syscall (with errno EBADF).
+        -:  497:   This function serves solely to avoid the unnecessary close_stdout
+        -:  498:   call, once parse_long_options has succeeded.
+        -:  499:   Meanwhile, we guarantee that the standard error stream is flushed,
+        -:  500:   by inlining the last half of close_stdout as needed.  */
+        -:  501:static void
+        2:  502:maybe_close_stdout (void)
+        -:  503:{
+        2:  504:  if (close_stdout_required)
+    #####:  505:    close_stdout ();
+        2:  506:  else if (close_stream (stderr) != 0)
+    #####:  507:    _exit (EXIT_FAILURE);
+        2:  508:}
+        -:  509:
+        -:  510:void
+    #####:  511:usage (int status)
+        -:  512:{
+    #####:  513:  if (status != EXIT_SUCCESS)
+    #####:  514:    emit_try_help ();
+        -:  515:  else
+        -:  516:    {
+    #####:  517:      printf (_("\
+        -:  518:Usage: %s [OPERAND]...\n\
+        -:  519:  or:  %s OPTION\n\
+        -:  520:"),
+        -:  521:              program_name, program_name);
+    #####:  522:      fputs (_("\
+        -:  523:Copy a file, converting and formatting according to the operands.\n\
+        -:  524:\n\
+        -:  525:  bs=BYTES        read and write up to BYTES bytes at a time\n\
+        -:  526:  cbs=BYTES       convert BYTES bytes at a time\n\
+        -:  527:  conv=CONVS      convert the file as per the comma separated symbol list\n\
+        -:  528:  count=N         copy only N input blocks\n\
+        -:  529:  ibs=BYTES       read up to BYTES bytes at a time (default: 512)\n\
+        -:  530:"), stdout);
+    #####:  531:      fputs (_("\
+        -:  532:  if=FILE         read from FILE instead of stdin\n\
+        -:  533:  iflag=FLAGS     read as per the comma separated symbol list\n\
+        -:  534:  obs=BYTES       write BYTES bytes at a time (default: 512)\n\
+        -:  535:  of=FILE         write to FILE instead of stdout\n\
+        -:  536:  oflag=FLAGS     write as per the comma separated symbol list\n\
+        -:  537:  seek=N          skip N obs-sized blocks at start of output\n\
+        -:  538:  skip=N          skip N ibs-sized blocks at start of input\n\
+        -:  539:  status=noxfer   suppress transfer statistics\n\
+        -:  540:"), stdout);
+    #####:  541:      fputs (_("\
+        -:  542:\n\
+        -:  543:BLOCKS and BYTES may be followed by the following multiplicative suffixes:\n\
+        -:  544:c =1, w =2, b =512, kB =1000, K =1024, MB =1000*1000, M =1024*1024, xM =M\n\
+        -:  545:GB =1000*1000*1000, G =1024*1024*1024, and so on for T, P, E, Z, Y.\n\
+        -:  546:\n\
+        -:  547:Each CONV symbol may be:\n\
+        -:  548:\n\
+        -:  549:"), stdout);
+    #####:  550:      fputs (_("\
+        -:  551:  ascii     from EBCDIC to ASCII\n\
+        -:  552:  ebcdic    from ASCII to EBCDIC\n\
+        -:  553:  ibm       from ASCII to alternate EBCDIC\n\
+        -:  554:  block     pad newline-terminated records with spaces to cbs-size\n\
+        -:  555:  unblock   replace trailing spaces in cbs-size records with newline\n\
+        -:  556:  lcase     change upper case to lower case\n\
+        -:  557:  ucase     change lower case to upper case\n\
+        -:  558:  sparse    try to seek rather than write the output for NUL input blocks\n\
+        -:  559:  swab      swap every pair of input bytes\n\
+        -:  560:  sync      pad every input block with NULs to ibs-size; when used\n\
+        -:  561:            with block or unblock, pad with spaces rather than NULs\n\
+        -:  562:"), stdout);
+    #####:  563:      fputs (_("\
+        -:  564:  excl      fail if the output file already exists\n\
+        -:  565:  nocreat   do not create the output file\n\
+        -:  566:  notrunc   do not truncate the output file\n\
+        -:  567:  noerror   continue after read errors\n\
+        -:  568:  fdatasync  physically write output file data before finishing\n\
+        -:  569:  fsync     likewise, but also write metadata\n\
+        -:  570:"), stdout);
+    #####:  571:      fputs (_("\
+        -:  572:\n\
+        -:  573:Each FLAG symbol may be:\n\
+        -:  574:\n\
+        -:  575:  append    append mode (makes sense only for output; conv=notrunc suggested)\n\
+        -:  576:"), stdout);
+        -:  577:      if (O_CIO)
+        -:  578:        fputs (_("  cio       use concurrent I/O for data\n"), stdout);
+        -:  579:      if (O_DIRECT)
+    #####:  580:        fputs (_("  direct    use direct I/O for data\n"), stdout);
+        -:  581:      if (O_DIRECTORY)
+    #####:  582:        fputs (_("  directory  fail unless a directory\n"), stdout);
+        -:  583:      if (O_DSYNC)
+    #####:  584:        fputs (_("  dsync     use synchronized I/O for data\n"), stdout);
+        -:  585:      if (O_SYNC)
+    #####:  586:        fputs (_("  sync      likewise, but also for metadata\n"), stdout);
+    #####:  587:      fputs (_("  fullblock  accumulate full blocks of input (iflag only)\n"),
+        -:  588:             stdout);
+        -:  589:      if (O_NONBLOCK)
+    #####:  590:        fputs (_("  nonblock  use non-blocking I/O\n"), stdout);
+        -:  591:      if (O_NOATIME)
+    #####:  592:        fputs (_("  noatime   do not update access time\n"), stdout);
+        -:  593:#if HAVE_POSIX_FADVISE
+        -:  594:      if (O_NOCACHE)
+    #####:  595:        fputs (_("  nocache   discard cached data\n"), stdout);
+        -:  596:#endif
+        -:  597:      if (O_NOCTTY)
+    #####:  598:        fputs (_("  noctty    do not assign controlling terminal from file\n"),
+        -:  599:               stdout);
+        -:  600:      if (HAVE_WORKING_O_NOFOLLOW)
+    #####:  601:        fputs (_("  nofollow  do not follow symlinks\n"), stdout);
+        -:  602:      if (O_NOLINKS)
+        -:  603:        fputs (_("  nolinks   fail if multiply-linked\n"), stdout);
+        -:  604:      if (O_BINARY)
+        -:  605:        fputs (_("  binary    use binary I/O for data\n"), stdout);
+        -:  606:      if (O_TEXT)
+        -:  607:        fputs (_("  text      use text I/O for data\n"), stdout);
+        -:  608:      if (O_COUNT_BYTES)
+    #####:  609:        fputs (_("  count_bytes  treat 'count=N' as a byte count (iflag only)\n\
+        -:  610:"), stdout);
+        -:  611:      if (O_SKIP_BYTES)
+    #####:  612:        fputs (_("  skip_bytes  treat 'skip=N' as a byte count (iflag only)\n\
+        -:  613:"), stdout);
+        -:  614:      if (O_SEEK_BYTES)
+    #####:  615:        fputs (_("  seek_bytes  treat 'seek=N' as a byte count (oflag only)\n\
+        -:  616:"), stdout);
+        -:  617:
+        -:  618:      {
+    #####:  619:        char const *siginfo_name = (SIGINFO == SIGUSR1 ? "USR1" : "INFO");
+    #####:  620:        printf (_("\
+        -:  621:\n\
+        -:  622:Sending a %s signal to a running 'dd' process makes it\n\
+        -:  623:print I/O statistics to standard error and then resume copying.\n\
+        -:  624:\n\
+        -:  625:  $ dd if=/dev/zero of=/dev/null& pid=$!\n\
+        -:  626:  $ kill -%s $pid; sleep 1; kill $pid\n\
+        -:  627:  18335302+0 records in\n\
+        -:  628:  18335302+0 records out\n\
+        -:  629:  9387674624 bytes (9.4 GB) copied, 34.6279 seconds, 271 MB/s\n\
+        -:  630:\n\
+        -:  631:Options are:\n\
+        -:  632:\n\
+        -:  633:"),
+        -:  634:                siginfo_name, siginfo_name);
+        -:  635:      }
+        -:  636:
+    #####:  637:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  638:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  639:      emit_ancillary_info ();
+        -:  640:    }
+    #####:  641:  exit (status);
+        -:  642:}
+        -:  643:
+        -:  644:static void
+    #####:  645:translate_charset (char const *new_trans)
+        -:  646:{
+        -:  647:  int i;
+        -:  648:
+    #####:  649:  for (i = 0; i < 256; i++)
+    #####:  650:    trans_table[i] = new_trans[trans_table[i]];
+    #####:  651:  translation_needed = true;
+    #####:  652:}
+        -:  653:
+        -:  654:/* Return true if I has more than one bit set.  I must be nonnegative.  */
+        -:  655:
+        -:  656:static inline bool
+       12:  657:multiple_bits_set (int i)
+        -:  658:{
+       12:  659:  return MULTIPLE_BITS_SET (i);
+        -:  660:}
+        -:  661:
+        -:  662:/* Print transfer statistics.  */
+        -:  663:
+        -:  664:static void
+        2:  665:print_stats (void)
+        -:  666:{
+        2:  667:  xtime_t now = gethrxtime ();
+        -:  668:  char hbuf[LONGEST_HUMAN_READABLE + 1];
+        2:  669:  int human_opts =
+        -:  670:    (human_autoscale | human_round_to_nearest
+        -:  671:     | human_space_before_unit | human_SI | human_B);
+        -:  672:  double delta_s;
+        -:  673:  char const *bytes_per_second;
+        -:  674:
+        2:  675:  fprintf (stderr,
+        -:  676:           _("%"PRIuMAX"+%"PRIuMAX" records in\n"
+        -:  677:             "%"PRIuMAX"+%"PRIuMAX" records out\n"),
+        -:  678:           r_full, r_partial, w_full, w_partial);
+        -:  679:
+        2:  680:  if (r_truncate != 0)
+    #####:  681:    fprintf (stderr,
+    #####:  682:             ngettext ("%"PRIuMAX" truncated record\n",
+        -:  683:                       "%"PRIuMAX" truncated records\n",
+        -:  684:                       select_plural (r_truncate)),
+        -:  685:             r_truncate);
+        -:  686:
+        2:  687:  if (status_flags & STATUS_NOXFER)
+        2:  688:    return;
+        -:  689:
+        -:  690:  /* Use integer arithmetic to compute the transfer rate,
+        -:  691:     since that makes it easy to use SI abbreviations.  */
+        -:  692:
+        4:  693:  fprintf (stderr,
+        2:  694:           ngettext ("%"PRIuMAX" byte (%s) copied",
+        -:  695:                     "%"PRIuMAX" bytes (%s) copied",
+        -:  696:                     select_plural (w_bytes)),
+        -:  697:           w_bytes,
+        -:  698:           human_readable (w_bytes, hbuf, human_opts, 1, 1));
+        -:  699:
+        2:  700:  if (start_time < now)
+        -:  701:    {
+        2:  702:      double XTIME_PRECISIONe0 = XTIME_PRECISION;
+        2:  703:      uintmax_t delta_xtime = now;
+        2:  704:      delta_xtime -= start_time;
+        2:  705:      delta_s = delta_xtime / XTIME_PRECISIONe0;
+        2:  706:      bytes_per_second = human_readable (w_bytes, hbuf, human_opts,
+        -:  707:                                         XTIME_PRECISION, delta_xtime);
+        -:  708:    }
+        -:  709:  else
+        -:  710:    {
+    #####:  711:      delta_s = 0;
+    #####:  712:      bytes_per_second = _("Infinity B");
+        -:  713:    }
+        -:  714:
+        -:  715:  /* TRANSLATORS: The two instances of "s" in this string are the SI
+        -:  716:     symbol "s" (meaning second), and should not be translated.
+        -:  717:
+        -:  718:     This format used to be:
+        -:  719:
+        -:  720:     ngettext (", %g second, %s/s\n", ", %g seconds, %s/s\n", delta_s == 1)
+        -:  721:
+        -:  722:     but that was incorrect for languages like Polish.  To fix this
+        -:  723:     bug we now use SI symbols even though they're a bit more
+        -:  724:     confusing in English.  */
+        2:  725:  fprintf (stderr, _(", %g s, %s/s\n"), delta_s, bytes_per_second);
+        -:  726:}
+        -:  727:
+        -:  728:/* An ordinary signal was received; arrange for the program to exit.  */
+        -:  729:
+        -:  730:static void
+    #####:  731:interrupt_handler (int sig)
+        -:  732:{
+        -:  733:  if (! SA_RESETHAND)
+        -:  734:    signal (sig, SIG_DFL);
+    #####:  735:  interrupt_signal = sig;
+    #####:  736:}
+        -:  737:
+        -:  738:/* An info signal was received; arrange for the program to print status.  */
+        -:  739:
+        -:  740:static void
+    #####:  741:siginfo_handler (int sig)
+        -:  742:{
+        -:  743:  if (! SA_NOCLDSTOP)
+        -:  744:    signal (sig, siginfo_handler);
+    #####:  745:  info_signal_count++;
+    #####:  746:}
+        -:  747:
+        -:  748:/* Install the signal handlers.  */
+        -:  749:
+        -:  750:static void
+        2:  751:install_signal_handlers (void)
+        -:  752:{
+        2:  753:  bool catch_siginfo = ! (SIGINFO == SIGUSR1 && getenv ("POSIXLY_CORRECT"));
+        -:  754:
+        -:  755:#if SA_NOCLDSTOP
+        -:  756:
+        -:  757:  struct sigaction act;
+        2:  758:  sigemptyset (&caught_signals);
+        2:  759:  if (catch_siginfo)
+        -:  760:    {
+        2:  761:      sigaction (SIGINFO, NULL, &act);
+        2:  762:      if (act.sa_handler != SIG_IGN)
+        2:  763:        sigaddset (&caught_signals, SIGINFO);
+        -:  764:    }
+        2:  765:  sigaction (SIGINT, NULL, &act);
+        2:  766:  if (act.sa_handler != SIG_IGN)
+        2:  767:    sigaddset (&caught_signals, SIGINT);
+        2:  768:  act.sa_mask = caught_signals;
+        -:  769:
+        2:  770:  if (sigismember (&caught_signals, SIGINFO))
+        -:  771:    {
+        2:  772:      act.sa_handler = siginfo_handler;
+        2:  773:      act.sa_flags = 0;
+        2:  774:      sigaction (SIGINFO, &act, NULL);
+        -:  775:    }
+        -:  776:
+        2:  777:  if (sigismember (&caught_signals, SIGINT))
+        -:  778:    {
+        2:  779:      act.sa_handler = interrupt_handler;
+        2:  780:      act.sa_flags = SA_NODEFER | SA_RESETHAND;
+        2:  781:      sigaction (SIGINT, &act, NULL);
+        -:  782:    }
+        -:  783:
+        -:  784:#else
+        -:  785:
+        -:  786:  if (catch_siginfo && signal (SIGINFO, SIG_IGN) != SIG_IGN)
+        -:  787:    {
+        -:  788:      signal (SIGINFO, siginfo_handler);
+        -:  789:      siginterrupt (SIGINFO, 1);
+        -:  790:    }
+        -:  791:  if (signal (SIGINT, SIG_IGN) != SIG_IGN)
+        -:  792:    {
+        -:  793:      signal (SIGINT, interrupt_handler);
+        -:  794:      siginterrupt (SIGINT, 1);
+        -:  795:    }
+        -:  796:#endif
+        2:  797:}
+        -:  798:
+        -:  799:static void
+        2:  800:cleanup (void)
+        -:  801:{
+        2:  802:  if (close (STDIN_FILENO) < 0)
+    #####:  803:    error (EXIT_FAILURE, errno,
+        -:  804:           _("closing input file %s"), quote (input_file));
+        -:  805:
+        -:  806:  /* Don't remove this call to close, even though close_stdout
+        -:  807:     closes standard output.  This close is necessary when cleanup
+        -:  808:     is called as part of a signal handler.  */
+        2:  809:  if (close (STDOUT_FILENO) < 0)
+    #####:  810:    error (EXIT_FAILURE, errno,
+        -:  811:           _("closing output file %s"), quote (output_file));
+        2:  812:}
+        -:  813:
+        -:  814:/* Process any pending signals.  If signals are caught, this function
+        -:  815:   should be called periodically.  Ideally there should never be an
+        -:  816:   unbounded amount of time when signals are not being processed.  */
+        -:  817:
+        -:  818:static void
+        4:  819:process_signals (void)
+        -:  820:{
+        8:  821:  while (interrupt_signal || info_signal_count)
+        -:  822:    {
+        -:  823:      int interrupt;
+        -:  824:      int infos;
+        -:  825:      sigset_t oldset;
+        -:  826:
+    #####:  827:      sigprocmask (SIG_BLOCK, &caught_signals, &oldset);
+        -:  828:
+        -:  829:      /* Reload interrupt_signal and info_signal_count, in case a new
+        -:  830:         signal was handled before sigprocmask took effect.  */
+    #####:  831:      interrupt = interrupt_signal;
+    #####:  832:      infos = info_signal_count;
+        -:  833:
+    #####:  834:      if (infos)
+    #####:  835:        info_signal_count = infos - 1;
+        -:  836:
+    #####:  837:      sigprocmask (SIG_SETMASK, &oldset, NULL);
+        -:  838:
+    #####:  839:      if (interrupt)
+    #####:  840:        cleanup ();
+    #####:  841:      print_stats ();
+    #####:  842:      if (interrupt)
+    #####:  843:        raise (interrupt);
+        -:  844:    }
+        4:  845:}
+        -:  846:
+        -:  847:static void ATTRIBUTE_NORETURN
+        2:  848:quit (int code)
+        -:  849:{
+        2:  850:  cleanup ();
+        2:  851:  print_stats ();
+        2:  852:  process_signals ();
+        2:  853:  exit (code);
+        -:  854:}
+        -:  855:
+        -:  856:/* Return LEN rounded down to a multiple of PAGE_SIZE
+        -:  857:   while storing the remainder internally per FD.
+        -:  858:   Pass LEN == 0 to get the current remainder.  */
+        -:  859:
+        -:  860:static off_t
+    #####:  861:cache_round (int fd, off_t len)
+        -:  862:{
+        -:  863:  static off_t i_pending, o_pending;
+    #####:  864:  off_t *pending = (fd == STDIN_FILENO ? &i_pending : &o_pending);
+        -:  865:
+    #####:  866:  if (len)
+        -:  867:    {
+    #####:  868:      off_t c_pending = *pending + len;
+    #####:  869:      *pending = c_pending % page_size;
+    #####:  870:      if (c_pending > *pending)
+    #####:  871:        len = c_pending - *pending;
+        -:  872:      else
+    #####:  873:        len = 0;
+        -:  874:    }
+        -:  875:  else
+    #####:  876:    len = *pending;
+        -:  877:
+    #####:  878:  return len;
+        -:  879:}
+        -:  880:
+        -:  881:/* Discard the cache from the current offset of either
+        -:  882:   STDIN_FILENO or STDOUT_FILENO.
+        -:  883:   Return true on success.  */
+        -:  884:
+        -:  885:static bool
+    #####:  886:invalidate_cache (int fd, off_t len)
+        -:  887:{
+    #####:  888:  int adv_ret = -1;
+        -:  889:
+        -:  890:  /* Minimize syscalls.  */
+    #####:  891:  off_t clen = cache_round (fd, len);
+    #####:  892:  if (len && !clen)
+    #####:  893:    return true; /* Don't advise this time.  */
+    #####:  894:  if (!len && !clen && max_records)
+    #####:  895:    return true; /* Nothing pending.  */
+    #####:  896:  off_t pending = len ? cache_round (fd, 0) : 0;
+        -:  897:
+    #####:  898:  if (fd == STDIN_FILENO)
+        -:  899:    {
+    #####:  900:      if (input_seekable)
+        -:  901:        {
+        -:  902:          /* Note we're being careful here to only invalidate what
+        -:  903:             we've read, so as not to dump any read ahead cache.  */
+        -:  904:#if HAVE_POSIX_FADVISE
+    #####:  905:            adv_ret = posix_fadvise (fd, input_offset - clen - pending, clen,
+        -:  906:                                     POSIX_FADV_DONTNEED);
+        -:  907:#else
+        -:  908:            errno = ENOTSUP;
+        -:  909:#endif
+        -:  910:        }
+        -:  911:      else
+    #####:  912:        errno = ESPIPE;
+        -:  913:    }
+    #####:  914:  else if (fd == STDOUT_FILENO)
+        -:  915:    {
+        -:  916:      static off_t output_offset = -2;
+        -:  917:
+    #####:  918:      if (output_offset != -1)
+        -:  919:        {
+    #####:  920:          if (0 > output_offset)
+        -:  921:            {
+    #####:  922:              output_offset = lseek (fd, 0, SEEK_CUR);
+    #####:  923:              output_offset -= clen + pending;
+        -:  924:            }
+    #####:  925:          if (0 <= output_offset)
+        -:  926:            {
+        -:  927:#if HAVE_POSIX_FADVISE
+    #####:  928:              adv_ret = posix_fadvise (fd, output_offset, clen,
+        -:  929:                                       POSIX_FADV_DONTNEED);
+        -:  930:#else
+        -:  931:              errno = ENOTSUP;
+        -:  932:#endif
+    #####:  933:              output_offset += clen + pending;
+        -:  934:            }
+        -:  935:        }
+        -:  936:    }
+        -:  937:
+    #####:  938:  return adv_ret != -1 ? true : false;
+        -:  939:}
+        -:  940:
+        -:  941:/* Read from FD into the buffer BUF of size SIZE, processing any
+        -:  942:   signals that arrive before bytes are read.  Return the number of
+        -:  943:   bytes read if successful, -1 (setting errno) on failure.  */
+        -:  944:
+        -:  945:static ssize_t
+        2:  946:iread (int fd, char *buf, size_t size)
+        -:  947:{
+        -:  948:  ssize_t nread;
+        -:  949:
+        -:  950:  do
+        -:  951:    {
+        2:  952:      process_signals ();
+        2:  953:      nread = read (fd, buf, size);
+        -:  954:    }
+        2:  955:  while (nread < 0 && errno == EINTR);
+        -:  956:
+        2:  957:  if (0 < nread && warn_partial_read)
+        -:  958:    {
+        -:  959:      static ssize_t prev_nread;
+        -:  960:
+    #####:  961:      if (0 < prev_nread && prev_nread < size)
+        -:  962:        {
+    #####:  963:          uintmax_t prev = prev_nread;
+    #####:  964:          error (0, 0, ngettext (("warning: partial read (%"PRIuMAX" byte); "
+        -:  965:                                  "suggest iflag=fullblock"),
+        -:  966:                                 ("warning: partial read (%"PRIuMAX" bytes); "
+        -:  967:                                  "suggest iflag=fullblock"),
+        -:  968:                                 select_plural (prev)),
+        -:  969:                 prev);
+    #####:  970:          warn_partial_read = false;
+        -:  971:        }
+        -:  972:
+    #####:  973:      prev_nread = nread;
+        -:  974:    }
+        -:  975:
+        2:  976:  return nread;
+        -:  977:}
+        -:  978:
+        -:  979:/* Wrapper around iread function to accumulate full blocks.  */
+        -:  980:static ssize_t
+    #####:  981:iread_fullblock (int fd, char *buf, size_t size)
+        -:  982:{
+    #####:  983:  ssize_t nread = 0;
+        -:  984:
+    #####:  985:  while (0 < size)
+        -:  986:    {
+    #####:  987:      ssize_t ncurr = iread (fd, buf, size);
+    #####:  988:      if (ncurr < 0)
+    #####:  989:        return ncurr;
+    #####:  990:      if (ncurr == 0)
+    #####:  991:        break;
+    #####:  992:      nread += ncurr;
+    #####:  993:      buf   += ncurr;
+    #####:  994:      size  -= ncurr;
+        -:  995:    }
+        -:  996:
+    #####:  997:  return nread;
+        -:  998:}
+        -:  999:
+        -: 1000:/* Write to FD the buffer BUF of size SIZE, processing any signals
+        -: 1001:   that arrive.  Return the number of bytes written, setting errno if
+        -: 1002:   this is less than SIZE.  Keep trying if there are partial
+        -: 1003:   writes.  */
+        -: 1004:
+        -: 1005:static size_t
+    #####: 1006:iwrite (int fd, char const *buf, size_t size)
+        -: 1007:{
+    #####: 1008:  size_t total_written = 0;
+        -: 1009:
+    #####: 1010:  if ((output_flags & O_DIRECT) && size < output_blocksize)
+        -: 1011:    {
+    #####: 1012:      int old_flags = fcntl (STDOUT_FILENO, F_GETFL);
+    #####: 1013:      if (fcntl (STDOUT_FILENO, F_SETFL, old_flags & ~O_DIRECT) != 0)
+    #####: 1014:        error (0, errno, _("failed to turn off O_DIRECT: %s"),
+        -: 1015:               quote (output_file));
+        -: 1016:
+        -: 1017:      /* Since we have just turned off O_DIRECT for the final write,
+        -: 1018:         here we try to preserve some of its semantics.  First, use
+        -: 1019:         posix_fadvise to tell the system not to pollute the buffer
+        -: 1020:         cache with this data.  Don't bother to diagnose lseek or
+        -: 1021:         posix_fadvise failure. */
+    #####: 1022:      invalidate_cache (STDOUT_FILENO, 0);
+        -: 1023:
+        -: 1024:      /* Attempt to ensure that that final block is committed
+        -: 1025:         to disk as quickly as possible.  */
+    #####: 1026:      conversions_mask |= C_FSYNC;
+        -: 1027:    }
+        -: 1028:
+    #####: 1029:  while (total_written < size)
+        -: 1030:    {
+    #####: 1031:      ssize_t nwritten = 0;
+    #####: 1032:      process_signals ();
+        -: 1033:
+        -: 1034:      /* Perform a seek for a NUL block if sparse output is enabled.  */
+    #####: 1035:      final_op_was_seek = false;
+    #####: 1036:      if ((conversions_mask & C_SPARSE) && is_nul (buf, size))
+        -: 1037:        {
+    #####: 1038:          if (lseek (fd, size, SEEK_CUR) < 0)
+        -: 1039:            {
+    #####: 1040:              conversions_mask &= ~C_SPARSE;
+        -: 1041:              /* Don't warn about the advisory sparse request.  */
+        -: 1042:            }
+        -: 1043:          else
+        -: 1044:            {
+    #####: 1045:              final_op_was_seek = true;
+    #####: 1046:              nwritten = size;
+        -: 1047:            }
+        -: 1048:        }
+        -: 1049:
+    #####: 1050:      if (!nwritten)
+    #####: 1051:        nwritten = write (fd, buf + total_written, size - total_written);
+        -: 1052:
+    #####: 1053:      if (nwritten < 0)
+        -: 1054:        {
+    #####: 1055:          if (errno != EINTR)
+    #####: 1056:            break;
+        -: 1057:        }
+    #####: 1058:      else if (nwritten == 0)
+        -: 1059:        {
+        -: 1060:          /* Some buggy drivers return 0 when one tries to write beyond
+        -: 1061:             a device's end.  (Example: Linux kernel 1.2.13 on /dev/fd0.)
+        -: 1062:             Set errno to ENOSPC so they get a sensible diagnostic.  */
+    #####: 1063:          errno = ENOSPC;
+    #####: 1064:          break;
+        -: 1065:        }
+        -: 1066:      else
+    #####: 1067:        total_written += nwritten;
+        -: 1068:    }
+        -: 1069:
+    #####: 1070:  if (o_nocache && total_written)
+    #####: 1071:    invalidate_cache (fd, total_written);
+        -: 1072:
+    #####: 1073:  return total_written;
+        -: 1074:}
+        -: 1075:
+        -: 1076:/* Write, then empty, the output buffer 'obuf'. */
+        -: 1077:
+        -: 1078:static void
+    #####: 1079:write_output (void)
+        -: 1080:{
+    #####: 1081:  size_t nwritten = iwrite (STDOUT_FILENO, obuf, output_blocksize);
+    #####: 1082:  w_bytes += nwritten;
+    #####: 1083:  if (nwritten != output_blocksize)
+        -: 1084:    {
+    #####: 1085:      error (0, errno, _("writing to %s"), quote (output_file));
+    #####: 1086:      if (nwritten != 0)
+    #####: 1087:        w_partial++;
+    #####: 1088:      quit (EXIT_FAILURE);
+        -: 1089:    }
+        -: 1090:  else
+    #####: 1091:    w_full++;
+    #####: 1092:  oc = 0;
+    #####: 1093:}
+        -: 1094:
+        -: 1095:/* Return true if STR is of the form "PATTERN" or "PATTERNDELIM...".  */
+        -: 1096:
+        -: 1097:static bool _GL_ATTRIBUTE_PURE
+       46: 1098:operand_matches (char const *str, char const *pattern, char delim)
+        -: 1099:{
+      112: 1100:  while (*pattern)
+       60: 1101:    if (*str++ != *pattern++)
+       40: 1102:      return false;
+        6: 1103:  return !*str || *str == delim;
+        -: 1104:}
+        -: 1105:
+        -: 1106:/* Interpret one "conv=..." or similar operand STR according to the
+        -: 1107:   symbols in TABLE, returning the flags specified.  If the operand
+        -: 1108:   cannot be parsed, use ERROR_MSGID to generate a diagnostic.  */
+        -: 1109:
+        -: 1110:static int
+    #####: 1111:parse_symbols (char const *str, struct symbol_value const *table,
+        -: 1112:               char const *error_msgid)
+        -: 1113:{
+    #####: 1114:  int value = 0;
+        -: 1115:
+        -: 1116:  while (true)
+        -: 1117:    {
+    #####: 1118:      char const *strcomma = strchr (str, ',');
+        -: 1119:      struct symbol_value const *entry;
+        -: 1120:
+    #####: 1121:      for (entry = table;
+    #####: 1122:           ! (operand_matches (str, entry->symbol, ',') && entry->value);
+    #####: 1123:           entry++)
+        -: 1124:        {
+    #####: 1125:          if (! entry->symbol[0])
+        -: 1126:            {
+    #####: 1127:              size_t slen = strcomma ? strcomma - str : strlen (str);
+    #####: 1128:              error (0, 0, "%s: %s", _(error_msgid),
+        -: 1129:                     quotearg_n_style_mem (0, locale_quoting_style, str, slen));
+    #####: 1130:              usage (EXIT_FAILURE);
+        -: 1131:            }
+        -: 1132:        }
+        -: 1133:
+    #####: 1134:      value |= entry->value;
+    #####: 1135:      if (!strcomma)
+    #####: 1136:        break;
+    #####: 1137:      str = strcomma + 1;
+    #####: 1138:    }
+        -: 1139:
+    #####: 1140:  return value;
+        -: 1141:}
+        -: 1142:
+        -: 1143:/* Return the value of STR, interpreted as a non-negative decimal integer,
+        -: 1144:   optionally multiplied by various values.
+        -: 1145:   Set *INVALID if STR does not represent a number in this format.  */
+        -: 1146:
+        -: 1147:static uintmax_t
+        4: 1148:parse_integer (const char *str, bool *invalid)
+        -: 1149:{
+        -: 1150:  uintmax_t n;
+        -: 1151:  char *suffix;
+        4: 1152:  enum strtol_error e = xstrtoumax (str, &suffix, 10, &n, "bcEGkKMPTwYZ0");
+        -: 1153:
+        4: 1154:  if (e == LONGINT_INVALID_SUFFIX_CHAR && *suffix == 'x')
+    #####: 1155:    {
+    #####: 1156:      uintmax_t multiplier = parse_integer (suffix + 1, invalid);
+        -: 1157:
+    #####: 1158:      if (multiplier != 0 && n * multiplier / multiplier != n)
+        -: 1159:        {
+    #####: 1160:          *invalid = true;
+    #####: 1161:          return 0;
+        -: 1162:        }
+        -: 1163:
+    #####: 1164:      n *= multiplier;
+        -: 1165:    }
+        4: 1166:  else if (e != LONGINT_OK)
+        -: 1167:    {
+    #####: 1168:      *invalid = true;
+    #####: 1169:      return 0;
+        -: 1170:    }
+        -: 1171:
+        4: 1172:  return n;
+        -: 1173:}
+        -: 1174:
+        -: 1175:/* OPERAND is of the form "X=...".  Return true if X is NAME.  */
+        -: 1176:
+        -: 1177:static bool _GL_ATTRIBUTE_PURE
+       46: 1178:operand_is (char const *operand, char const *name)
+        -: 1179:{
+       46: 1180:  return operand_matches (operand, name, '=');
+        -: 1181:}
+        -: 1182:
+        -: 1183:static void
+        2: 1184:scanargs (int argc, char *const *argv)
+        -: 1185:{
+        -: 1186:  int i;
+        2: 1187:  size_t blocksize = 0;
+        2: 1188:  uintmax_t count = (uintmax_t) -1;
+        2: 1189:  uintmax_t skip = 0;
+        2: 1190:  uintmax_t seek = 0;
+        -: 1191:
+        8: 1192:  for (i = optind; i < argc; i++)
+        -: 1193:    {
+        6: 1194:      char const *name = argv[i];
+        6: 1195:      char const *val = strchr (name, '=');
+        -: 1196:
+        6: 1197:      if (val == NULL)
+        -: 1198:        {
+    #####: 1199:          error (0, 0, _("unrecognized operand %s"), quote (name));
+    #####: 1200:          usage (EXIT_FAILURE);
+        -: 1201:        }
+        6: 1202:      val++;
+        -: 1203:
+        6: 1204:      if (operand_is (name, "if"))
+    #####: 1205:        input_file = val;
+        6: 1206:      else if (operand_is (name, "of"))
+        2: 1207:        output_file = val;
+        4: 1208:      else if (operand_is (name, "conv"))
+    #####: 1209:        conversions_mask |= parse_symbols (val, conversions,
+        -: 1210:                                           N_("invalid conversion"));
+        4: 1211:      else if (operand_is (name, "iflag"))
+    #####: 1212:        input_flags |= parse_symbols (val, flags,
+        -: 1213:                                      N_("invalid input flag"));
+        4: 1214:      else if (operand_is (name, "oflag"))
+    #####: 1215:        output_flags |= parse_symbols (val, flags,
+        -: 1216:                                       N_("invalid output flag"));
+        4: 1217:      else if (operand_is (name, "status"))
+    #####: 1218:        status_flags |= parse_symbols (val, statuses,
+        -: 1219:                                       N_("invalid status flag"));
+        -: 1220:      else
+        -: 1221:        {
+        4: 1222:          bool invalid = false;
+        4: 1223:          uintmax_t n = parse_integer (val, &invalid);
+        -: 1224:
+        4: 1225:          if (operand_is (name, "ibs"))
+        -: 1226:            {
+    #####: 1227:              invalid |= ! (0 < n && n <= MAX_BLOCKSIZE (INPUT_BLOCK_SLOP));
+    #####: 1228:              input_blocksize = n;
+        -: 1229:            }
+        4: 1230:          else if (operand_is (name, "obs"))
+        -: 1231:            {
+    #####: 1232:              invalid |= ! (0 < n && n <= MAX_BLOCKSIZE (OUTPUT_BLOCK_SLOP));
+    #####: 1233:              output_blocksize = n;
+        -: 1234:            }
+        4: 1235:          else if (operand_is (name, "bs"))
+        -: 1236:            {
+        2: 1237:              invalid |= ! (0 < n && n <= MAX_BLOCKSIZE (INPUT_BLOCK_SLOP));
+        2: 1238:              blocksize = n;
+        -: 1239:            }
+        2: 1240:          else if (operand_is (name, "cbs"))
+        -: 1241:            {
+    #####: 1242:              invalid |= ! (0 < n && n <= SIZE_MAX);
+    #####: 1243:              conversion_blocksize = n;
+        -: 1244:            }
+        2: 1245:          else if (operand_is (name, "skip"))
+    #####: 1246:            skip = n;
+        2: 1247:          else if (operand_is (name, "seek"))
+        2: 1248:            seek = n;
+    #####: 1249:          else if (operand_is (name, "count"))
+    #####: 1250:            count = n;
+        -: 1251:          else
+        -: 1252:            {
+    #####: 1253:              error (0, 0, _("unrecognized operand %s"), quote (name));
+    #####: 1254:              usage (EXIT_FAILURE);
+        -: 1255:            }
+        -: 1256:
+        4: 1257:          if (invalid)
+    #####: 1258:            error (EXIT_FAILURE, 0, _("invalid number %s"), quote (val));
+        -: 1259:        }
+        -: 1260:    }
+        -: 1261:
+        2: 1262:  if (blocksize)
+        2: 1263:    input_blocksize = output_blocksize = blocksize;
+        -: 1264:  else
+        -: 1265:    {
+        -: 1266:      /* POSIX says dd aggregates partial reads into
+        -: 1267:         output_blocksize if bs= is not specified.  */
+    #####: 1268:      conversions_mask |= C_TWOBUFS;
+        -: 1269:    }
+        -: 1270:
+        2: 1271:  if (input_blocksize == 0)
+    #####: 1272:    input_blocksize = DEFAULT_BLOCKSIZE;
+        2: 1273:  if (output_blocksize == 0)
+    #####: 1274:    output_blocksize = DEFAULT_BLOCKSIZE;
+        2: 1275:  if (conversion_blocksize == 0)
+        2: 1276:    conversions_mask &= ~(C_BLOCK | C_UNBLOCK);
+        -: 1277:
+        2: 1278:  if (input_flags & (O_DSYNC | O_SYNC))
+    #####: 1279:    input_flags |= O_RSYNC;
+        -: 1280:
+        2: 1281:  if (output_flags & O_FULLBLOCK)
+        -: 1282:    {
+    #####: 1283:      error (0, 0, "%s: %s", _("invalid output flag"), "'fullblock'");
+    #####: 1284:      usage (EXIT_FAILURE);
+        -: 1285:    }
+        -: 1286:
+        2: 1287:  if (input_flags & O_SEEK_BYTES)
+        -: 1288:    {
+    #####: 1289:      error (0, 0, "%s: %s", _("invalid input flag"), "'seek_bytes'");
+    #####: 1290:      usage (EXIT_FAILURE);
+        -: 1291:    }
+        -: 1292:
+        2: 1293:  if (output_flags & (O_COUNT_BYTES | O_SKIP_BYTES))
+        -: 1294:    {
+    #####: 1295:      error (0, 0, "%s: %s", _("invalid output flag"),
+    #####: 1296:             output_flags & O_COUNT_BYTES ? "'count_bytes'" : "'skip_bytes'");
+    #####: 1297:      usage (EXIT_FAILURE);
+        -: 1298:    }
+        -: 1299:
+        2: 1300:  if (input_flags & O_SKIP_BYTES && skip != 0)
+        -: 1301:    {
+    #####: 1302:      skip_records = skip / input_blocksize;
+    #####: 1303:      skip_bytes = skip % input_blocksize;
+        -: 1304:    }
+        2: 1305:  else if (skip != 0)
+    #####: 1306:    skip_records = skip;
+        -: 1307:
+        2: 1308:  if (input_flags & O_COUNT_BYTES && count != (uintmax_t) -1)
+        -: 1309:    {
+    #####: 1310:      max_records = count / input_blocksize;
+    #####: 1311:      max_bytes = count % input_blocksize;
+        -: 1312:    }
+        2: 1313:  else if (count != (uintmax_t) -1)
+    #####: 1314:    max_records = count;
+        -: 1315:
+        2: 1316:  if (output_flags & O_SEEK_BYTES && seek != 0)
+        -: 1317:    {
+    #####: 1318:      seek_records = seek / output_blocksize;
+    #####: 1319:      seek_bytes = seek % output_blocksize;
+        -: 1320:    }
+        2: 1321:  else if (seek != 0)
+        2: 1322:    seek_records = seek;
+        -: 1323:
+        -: 1324:  /* Warn about partial reads if bs=SIZE is given and iflag=fullblock
+        -: 1325:     is not, and if counting or skipping bytes or using direct I/O.
+        -: 1326:     This helps to avoid confusion with miscounts, and to avoid issues
+        -: 1327:     with direct I/O on GNU/Linux.  */
+        2: 1328:  warn_partial_read =
+        4: 1329:    (! (conversions_mask & C_TWOBUFS) && ! (input_flags & O_FULLBLOCK)
+        4: 1330:     && (skip_records
+        2: 1331:         || (0 < max_records && max_records < (uintmax_t) -1)
+        2: 1332:         || (input_flags | output_flags) & O_DIRECT));
+        -: 1333:
+        4: 1334:  iread_fnc = ((input_flags & O_FULLBLOCK)
+        -: 1335:               ? iread_fullblock
+        2: 1336:               : iread);
+        2: 1337:  input_flags &= ~O_FULLBLOCK;
+        -: 1338:
+        2: 1339:  if (multiple_bits_set (conversions_mask & (C_ASCII | C_EBCDIC | C_IBM)))
+    #####: 1340:    error (EXIT_FAILURE, 0, _("cannot combine any two of {ascii,ebcdic,ibm}"));
+        2: 1341:  if (multiple_bits_set (conversions_mask & (C_BLOCK | C_UNBLOCK)))
+    #####: 1342:    error (EXIT_FAILURE, 0, _("cannot combine block and unblock"));
+        2: 1343:  if (multiple_bits_set (conversions_mask & (C_LCASE | C_UCASE)))
+    #####: 1344:    error (EXIT_FAILURE, 0, _("cannot combine lcase and ucase"));
+        2: 1345:  if (multiple_bits_set (conversions_mask & (C_EXCL | C_NOCREAT)))
+    #####: 1346:    error (EXIT_FAILURE, 0, _("cannot combine excl and nocreat"));
+        2: 1347:  if (multiple_bits_set (input_flags & (O_DIRECT | O_NOCACHE))
+        2: 1348:      || multiple_bits_set (output_flags & (O_DIRECT | O_NOCACHE)))
+    #####: 1349:    error (EXIT_FAILURE, 0, _("cannot combine direct and nocache"));
+        -: 1350:
+        2: 1351:  if (input_flags & O_NOCACHE)
+        -: 1352:    {
+    #####: 1353:      i_nocache = true;
+    #####: 1354:      input_flags &= ~O_NOCACHE;
+        -: 1355:    }
+        2: 1356:  if (output_flags & O_NOCACHE)
+        -: 1357:    {
+    #####: 1358:      o_nocache = true;
+    #####: 1359:      output_flags &= ~O_NOCACHE;
+        -: 1360:    }
+        2: 1361:}
+        -: 1362:
+        -: 1363:/* Fix up translation table. */
+        -: 1364:
+        -: 1365:static void
+        2: 1366:apply_translations (void)
+        -: 1367:{
+        -: 1368:  int i;
+        -: 1369:
+        2: 1370:  if (conversions_mask & C_ASCII)
+    #####: 1371:    translate_charset (ebcdic_to_ascii);
+        -: 1372:
+        2: 1373:  if (conversions_mask & C_UCASE)
+        -: 1374:    {
+    #####: 1375:      for (i = 0; i < 256; i++)
+    #####: 1376:        trans_table[i] = toupper (trans_table[i]);
+    #####: 1377:      translation_needed = true;
+        -: 1378:    }
+        2: 1379:  else if (conversions_mask & C_LCASE)
+        -: 1380:    {
+    #####: 1381:      for (i = 0; i < 256; i++)
+    #####: 1382:        trans_table[i] = tolower (trans_table[i]);
+    #####: 1383:      translation_needed = true;
+        -: 1384:    }
+        -: 1385:
+        2: 1386:  if (conversions_mask & C_EBCDIC)
+        -: 1387:    {
+    #####: 1388:      translate_charset (ascii_to_ebcdic);
+    #####: 1389:      newline_character = ascii_to_ebcdic['\n'];
+    #####: 1390:      space_character = ascii_to_ebcdic[' '];
+        -: 1391:    }
+        2: 1392:  else if (conversions_mask & C_IBM)
+        -: 1393:    {
+    #####: 1394:      translate_charset (ascii_to_ibm);
+    #####: 1395:      newline_character = ascii_to_ibm['\n'];
+    #####: 1396:      space_character = ascii_to_ibm[' '];
+        -: 1397:    }
+        2: 1398:}
+        -: 1399:
+        -: 1400:/* Apply the character-set translations specified by the user
+        -: 1401:   to the NREAD bytes in BUF.  */
+        -: 1402:
+        -: 1403:static void
+    #####: 1404:translate_buffer (char *buf, size_t nread)
+        -: 1405:{
+        -: 1406:  char *cp;
+        -: 1407:  size_t i;
+        -: 1408:
+    #####: 1409:  for (i = nread, cp = buf; i; i--, cp++)
+    #####: 1410:    *cp = trans_table[to_uchar (*cp)];
+    #####: 1411:}
+        -: 1412:
+        -: 1413:/* If true, the last char from the previous call to 'swab_buffer'
+        -: 1414:   is saved in 'saved_char'.  */
+        -: 1415:static bool char_is_saved = false;
+        -: 1416:
+        -: 1417:/* Odd char from previous call.  */
+        -: 1418:static char saved_char;
+        -: 1419:
+        -: 1420:/* Swap NREAD bytes in BUF, plus possibly an initial char from the
+        -: 1421:   previous call.  If NREAD is odd, save the last char for the
+        -: 1422:   next call.   Return the new start of the BUF buffer.  */
+        -: 1423:
+        -: 1424:static char *
+    #####: 1425:swab_buffer (char *buf, size_t *nread)
+        -: 1426:{
+    #####: 1427:  char *bufstart = buf;
+        -: 1428:  char *cp;
+        -: 1429:  size_t i;
+        -: 1430:
+        -: 1431:  /* Is a char left from last time?  */
+    #####: 1432:  if (char_is_saved)
+        -: 1433:    {
+    #####: 1434:      *--bufstart = saved_char;
+    #####: 1435:      (*nread)++;
+    #####: 1436:      char_is_saved = false;
+        -: 1437:    }
+        -: 1438:
+    #####: 1439:  if (*nread & 1)
+        -: 1440:    {
+        -: 1441:      /* An odd number of chars are in the buffer.  */
+    #####: 1442:      saved_char = bufstart[--*nread];
+    #####: 1443:      char_is_saved = true;
+        -: 1444:    }
+        -: 1445:
+        -: 1446:  /* Do the byte-swapping by moving every second character two
+        -: 1447:     positions toward the end, working from the end of the buffer
+        -: 1448:     toward the beginning.  This way we only move half of the data.  */
+        -: 1449:
+    #####: 1450:  cp = bufstart + *nread;	/* Start one char past the last.  */
+    #####: 1451:  for (i = *nread / 2; i; i--, cp -= 2)
+    #####: 1452:    *cp = *(cp - 2);
+        -: 1453:
+    #####: 1454:  return ++bufstart;
+        -: 1455:}
+        -: 1456:
+        -: 1457:/* Add OFFSET to the input offset, setting the overflow flag if
+        -: 1458:   necessary.  */
+        -: 1459:
+        -: 1460:static void
+    #####: 1461:advance_input_offset (uintmax_t offset)
+        -: 1462:{
+    #####: 1463:  input_offset += offset;
+    #####: 1464:  if (input_offset < offset)
+    #####: 1465:    input_offset_overflow = true;
+    #####: 1466:}
+        -: 1467:
+        -: 1468:/* This is a wrapper for lseek.  It detects and warns about a kernel
+        -: 1469:   bug that makes lseek a no-op for tape devices, even though the kernel
+        -: 1470:   lseek return value suggests that the function succeeded.
+        -: 1471:
+        -: 1472:   The parameters are the same as those of the lseek function, but
+        -: 1473:   with the addition of FILENAME, the name of the file associated with
+        -: 1474:   descriptor FDESC.  The file name is used solely in the warning that's
+        -: 1475:   printed when the bug is detected.  Return the same value that lseek
+        -: 1476:   would have returned, but when the lseek bug is detected, return -1
+        -: 1477:   to indicate that lseek failed.
+        -: 1478:
+        -: 1479:   The offending behavior has been confirmed with an Exabyte SCSI tape
+        -: 1480:   drive accessed via /dev/nst0 on both Linux 2.2.17 and 2.4.16 kernels.  */
+        -: 1481:
+        -: 1482:#ifdef __linux__
+        -: 1483:
+        -: 1484:# include <sys/mtio.h>
+        -: 1485:
+        -: 1486:# define MT_SAME_POSITION(P, Q) \
+        -: 1487:   ((P).mt_resid == (Q).mt_resid \
+        -: 1488:    && (P).mt_fileno == (Q).mt_fileno \
+        -: 1489:    && (P).mt_blkno == (Q).mt_blkno)
+        -: 1490:
+        -: 1491:static off_t
+        2: 1492:skip_via_lseek (char const *filename, int fdesc, off_t offset, int whence)
+        -: 1493:{
+        -: 1494:  struct mtget s1;
+        -: 1495:  struct mtget s2;
+        2: 1496:  bool got_original_tape_position = (ioctl (fdesc, MTIOCGET, &s1) == 0);
+        -: 1497:  /* known bad device type */
+        -: 1498:  /* && s.mt_type == MT_ISSCSI2 */
+        -: 1499:
+        2: 1500:  off_t new_position = lseek (fdesc, offset, whence);
+        2: 1501:  if (0 <= new_position
+        2: 1502:      && got_original_tape_position
+    #####: 1503:      && ioctl (fdesc, MTIOCGET, &s2) == 0
+    #####: 1504:      && MT_SAME_POSITION (s1, s2))
+        -: 1505:    {
+    #####: 1506:      error (0, 0, _("warning: working around lseek kernel bug for file (%s)\n\
+        -: 1507:  of mt_type=0x%0lx -- see <sys/mtio.h> for the list of types"),
+        -: 1508:             filename, s2.mt_type);
+    #####: 1509:      errno = 0;
+    #####: 1510:      new_position = -1;
+        -: 1511:    }
+        -: 1512:
+        2: 1513:  return new_position;
+        -: 1514:}
+        -: 1515:#else
+        -: 1516:# define skip_via_lseek(Filename, Fd, Offset, Whence) lseek (Fd, Offset, Whence)
+        -: 1517:#endif
+        -: 1518:
+        -: 1519:/* Throw away RECORDS blocks of BLOCKSIZE bytes plus BYTES bytes on
+        -: 1520:   file descriptor FDESC, which is open with read permission for FILE.
+        -: 1521:   Store up to BLOCKSIZE bytes of the data at a time in BUF, if
+        -: 1522:   necessary. RECORDS or BYTES must be nonzero. If FDESC is
+        -: 1523:   STDIN_FILENO, advance the input offset. Return the number of
+        -: 1524:   records remaining, i.e., that were not skipped because EOF was
+        -: 1525:   reached.  If FDESC is STDOUT_FILENO, on return, BYTES is the
+        -: 1526:   remaining bytes in addition to the remaining records.  */
+        -: 1527:
+        -: 1528:static uintmax_t
+        2: 1529:skip (int fdesc, char const *file, uintmax_t records, size_t blocksize,
+        -: 1530:      size_t *bytes, char *buf)
+        -: 1531:{
+        2: 1532:  uintmax_t offset = records * blocksize + *bytes;
+        -: 1533:
+        -: 1534:  /* Try lseek and if an error indicates it was an inappropriate operation --
+        -: 1535:     or if the file offset is not representable as an off_t --
+        -: 1536:     fall back on using read.  */
+        -: 1537:
+        2: 1538:  errno = 0;
+        2: 1539:  if (records <= OFF_T_MAX / blocksize
+        2: 1540:      && 0 <= skip_via_lseek (file, fdesc, offset, SEEK_CUR))
+        -: 1541:    {
+        2: 1542:      if (fdesc == STDIN_FILENO)
+        -: 1543:        {
+        -: 1544:           struct stat st;
+    #####: 1545:           if (fstat (STDIN_FILENO, &st) != 0)
+    #####: 1546:             error (EXIT_FAILURE, errno, _("cannot fstat %s"), quote (file));
+    #####: 1547:           if (S_ISREG (st.st_mode) && st.st_size < (input_offset + offset))
+        -: 1548:             {
+        -: 1549:               /* When skipping past EOF, return the number of _full_ blocks
+        -: 1550:                * that are not skipped, and set offset to EOF, so the caller
+        -: 1551:                * can determine the requested skip was not satisfied.  */
+    #####: 1552:               records = ( offset - st.st_size ) / blocksize;
+    #####: 1553:               offset = st.st_size - input_offset;
+        -: 1554:             }
+        -: 1555:           else
+    #####: 1556:             records = 0;
+    #####: 1557:           advance_input_offset (offset);
+        -: 1558:        }
+        -: 1559:      else
+        -: 1560:        {
+        2: 1561:          records = 0;
+        2: 1562:          *bytes = 0;
+        -: 1563:        }
+        2: 1564:      return records;
+        -: 1565:    }
+        -: 1566:  else
+        -: 1567:    {
+    #####: 1568:      int lseek_errno = errno;
+        -: 1569:
+        -: 1570:      /* The seek request may have failed above if it was too big
+        -: 1571:         (> device size, > max file size, etc.)
+        -: 1572:         Or it may not have been done at all (> OFF_T_MAX).
+        -: 1573:         Therefore try to seek to the end of the file,
+        -: 1574:         to avoid redundant reading.  */
+    #####: 1575:      if ((skip_via_lseek (file, fdesc, 0, SEEK_END)) >= 0)
+        -: 1576:        {
+        -: 1577:          /* File is seekable, and we're at the end of it, and
+        -: 1578:             size <= OFF_T_MAX. So there's no point using read to advance.  */
+        -: 1579:
+    #####: 1580:          if (!lseek_errno)
+        -: 1581:            {
+        -: 1582:              /* The original seek was not attempted as offset > OFF_T_MAX.
+        -: 1583:                 We should error for write as can't get to the desired
+        -: 1584:                 location, even if OFF_T_MAX < max file size.
+        -: 1585:                 For read we're not going to read any data anyway,
+        -: 1586:                 so we should error for consistency.
+        -: 1587:                 It would be nice to not error for /dev/{zero,null}
+        -: 1588:                 for any offset, but that's not a significant issue.  */
+    #####: 1589:              lseek_errno = EOVERFLOW;
+        -: 1590:            }
+        -: 1591:
+    #####: 1592:          if (fdesc == STDIN_FILENO)
+    #####: 1593:            error (0, lseek_errno, _("%s: cannot skip"), quote (file));
+        -: 1594:          else
+    #####: 1595:            error (0, lseek_errno, _("%s: cannot seek"), quote (file));
+        -: 1596:          /* If the file has a specific size and we've asked
+        -: 1597:             to skip/seek beyond the max allowable, then quit.  */
+    #####: 1598:          quit (EXIT_FAILURE);
+        -: 1599:        }
+        -: 1600:      /* else file_size && offset > OFF_T_MAX or file ! seekable */
+        -: 1601:
+        -: 1602:      do
+        -: 1603:        {
+    #####: 1604:          ssize_t nread = iread_fnc (fdesc, buf, records ? blocksize : *bytes);
+    #####: 1605:          if (nread < 0)
+        -: 1606:            {
+    #####: 1607:              if (fdesc == STDIN_FILENO)
+        -: 1608:                {
+    #####: 1609:                  error (0, errno, _("reading %s"), quote (file));
+    #####: 1610:                  if (conversions_mask & C_NOERROR)
+    #####: 1611:                    print_stats ();
+        -: 1612:                }
+        -: 1613:              else
+    #####: 1614:                error (0, lseek_errno, _("%s: cannot seek"), quote (file));
+    #####: 1615:              quit (EXIT_FAILURE);
+        -: 1616:            }
+    #####: 1617:          else if (nread == 0)
+    #####: 1618:            break;
+    #####: 1619:          else if (fdesc == STDIN_FILENO)
+    #####: 1620:            advance_input_offset (nread);
+        -: 1621:
+    #####: 1622:          if (records != 0)
+    #####: 1623:            records--;
+        -: 1624:          else
+    #####: 1625:            *bytes = 0;
+        -: 1626:        }
+    #####: 1627:      while (records || *bytes);
+        -: 1628:
+    #####: 1629:      return records;
+        -: 1630:    }
+        -: 1631:}
+        -: 1632:
+        -: 1633:/* Advance the input by NBYTES if possible, after a read error.
+        -: 1634:   The input file offset may or may not have advanced after the failed
+        -: 1635:   read; adjust it to point just after the bad record regardless.
+        -: 1636:   Return true if successful, or if the input is already known to not
+        -: 1637:   be seekable.  */
+        -: 1638:
+        -: 1639:static bool
+    #####: 1640:advance_input_after_read_error (size_t nbytes)
+        -: 1641:{
+    #####: 1642:  if (! input_seekable)
+        -: 1643:    {
+    #####: 1644:      if (input_seek_errno == ESPIPE)
+    #####: 1645:        return true;
+    #####: 1646:      errno = input_seek_errno;
+        -: 1647:    }
+        -: 1648:  else
+        -: 1649:    {
+        -: 1650:      off_t offset;
+    #####: 1651:      advance_input_offset (nbytes);
+    #####: 1652:      input_offset_overflow |= (OFF_T_MAX < input_offset);
+    #####: 1653:      if (input_offset_overflow)
+        -: 1654:        {
+    #####: 1655:          error (0, 0, _("offset overflow while reading file %s"),
+        -: 1656:                 quote (input_file));
+    #####: 1657:          return false;
+        -: 1658:        }
+    #####: 1659:      offset = lseek (STDIN_FILENO, 0, SEEK_CUR);
+    #####: 1660:      if (0 <= offset)
+        -: 1661:        {
+        -: 1662:          off_t diff;
+    #####: 1663:          if (offset == input_offset)
+    #####: 1664:            return true;
+    #####: 1665:          diff = input_offset - offset;
+    #####: 1666:          if (! (0 <= diff && diff <= nbytes))
+    #####: 1667:            error (0, 0, _("warning: invalid file offset after failed read"));
+    #####: 1668:          if (0 <= skip_via_lseek (input_file, STDIN_FILENO, diff, SEEK_CUR))
+    #####: 1669:            return true;
+    #####: 1670:          if (errno == 0)
+    #####: 1671:            error (0, 0, _("cannot work around kernel bug after all"));
+        -: 1672:        }
+        -: 1673:    }
+        -: 1674:
+    #####: 1675:  error (0, errno, _("%s: cannot seek"), quote (input_file));
+    #####: 1676:  return false;
+        -: 1677:}
+        -: 1678:
+        -: 1679:/* Copy NREAD bytes of BUF, with no conversions.  */
+        -: 1680:
+        -: 1681:static void
+    #####: 1682:copy_simple (char const *buf, size_t nread)
+        -: 1683:{
+    #####: 1684:  const char *start = buf;	/* First uncopied char in BUF.  */
+        -: 1685:
+        -: 1686:  do
+        -: 1687:    {
+    #####: 1688:      size_t nfree = MIN (nread, output_blocksize - oc);
+        -: 1689:
+    #####: 1690:      memcpy (obuf + oc, start, nfree);
+        -: 1691:
+    #####: 1692:      nread -= nfree;		/* Update the number of bytes left to copy. */
+    #####: 1693:      start += nfree;
+    #####: 1694:      oc += nfree;
+    #####: 1695:      if (oc >= output_blocksize)
+    #####: 1696:        write_output ();
+        -: 1697:    }
+    #####: 1698:  while (nread != 0);
+    #####: 1699:}
+        -: 1700:
+        -: 1701:/* Copy NREAD bytes of BUF, doing conv=block
+        -: 1702:   (pad newline-terminated records to 'conversion_blocksize',
+        -: 1703:   replacing the newline with trailing spaces).  */
+        -: 1704:
+        -: 1705:static void
+    #####: 1706:copy_with_block (char const *buf, size_t nread)
+        -: 1707:{
+        -: 1708:  size_t i;
+        -: 1709:
+    #####: 1710:  for (i = nread; i; i--, buf++)
+        -: 1711:    {
+    #####: 1712:      if (*buf == newline_character)
+        -: 1713:        {
+    #####: 1714:          if (col < conversion_blocksize)
+        -: 1715:            {
+        -: 1716:              size_t j;
+    #####: 1717:              for (j = col; j < conversion_blocksize; j++)
+    #####: 1718:                output_char (space_character);
+        -: 1719:            }
+    #####: 1720:          col = 0;
+        -: 1721:        }
+        -: 1722:      else
+        -: 1723:        {
+    #####: 1724:          if (col == conversion_blocksize)
+    #####: 1725:            r_truncate++;
+    #####: 1726:          else if (col < conversion_blocksize)
+    #####: 1727:            output_char (*buf);
+    #####: 1728:          col++;
+        -: 1729:        }
+        -: 1730:    }
+    #####: 1731:}
+        -: 1732:
+        -: 1733:/* Copy NREAD bytes of BUF, doing conv=unblock
+        -: 1734:   (replace trailing spaces in 'conversion_blocksize'-sized records
+        -: 1735:   with a newline).  */
+        -: 1736:
+        -: 1737:static void
+    #####: 1738:copy_with_unblock (char const *buf, size_t nread)
+        -: 1739:{
+        -: 1740:  size_t i;
+        -: 1741:  char c;
+        -: 1742:  static size_t pending_spaces = 0;
+        -: 1743:
+    #####: 1744:  for (i = 0; i < nread; i++)
+        -: 1745:    {
+    #####: 1746:      c = buf[i];
+        -: 1747:
+    #####: 1748:      if (col++ >= conversion_blocksize)
+        -: 1749:        {
+    #####: 1750:          col = pending_spaces = 0; /* Wipe out any pending spaces.  */
+    #####: 1751:          i--;			/* Push the char back; get it later. */
+    #####: 1752:          output_char (newline_character);
+        -: 1753:        }
+    #####: 1754:      else if (c == space_character)
+    #####: 1755:        pending_spaces++;
+        -: 1756:      else
+        -: 1757:        {
+        -: 1758:          /* 'c' is the character after a run of spaces that were not
+        -: 1759:             at the end of the conversion buffer.  Output them.  */
+    #####: 1760:          while (pending_spaces)
+        -: 1761:            {
+    #####: 1762:              output_char (space_character);
+    #####: 1763:              --pending_spaces;
+        -: 1764:            }
+    #####: 1765:          output_char (c);
+        -: 1766:        }
+        -: 1767:    }
+    #####: 1768:}
+        -: 1769:
+        -: 1770:/* Set the file descriptor flags for FD that correspond to the nonzero bits
+        -: 1771:   in ADD_FLAGS.  The file's name is NAME.  */
+        -: 1772:
+        -: 1773:static void
+        2: 1774:set_fd_flags (int fd, int add_flags, char const *name)
+        -: 1775:{
+        -: 1776:  /* Ignore file creation flags that are no-ops on file descriptors.  */
+        2: 1777:  add_flags &= ~ (O_NOCTTY | O_NOFOLLOW);
+        -: 1778:
+        2: 1779:  if (add_flags)
+        -: 1780:    {
+    #####: 1781:      int old_flags = fcntl (fd, F_GETFL);
+    #####: 1782:      int new_flags = old_flags | add_flags;
+    #####: 1783:      bool ok = true;
+    #####: 1784:      if (old_flags < 0)
+    #####: 1785:        ok = false;
+    #####: 1786:      else if (old_flags != new_flags)
+        -: 1787:        {
+    #####: 1788:          if (new_flags & (O_DIRECTORY | O_NOLINKS))
+        -: 1789:            {
+        -: 1790:              /* NEW_FLAGS contains at least one file creation flag that
+        -: 1791:                 requires some checking of the open file descriptor.  */
+        -: 1792:              struct stat st;
+    #####: 1793:              if (fstat (fd, &st) != 0)
+    #####: 1794:                ok = false;
+    #####: 1795:              else if ((new_flags & O_DIRECTORY) && ! S_ISDIR (st.st_mode))
+        -: 1796:                {
+    #####: 1797:                  errno = ENOTDIR;
+    #####: 1798:                  ok = false;
+        -: 1799:                }
+        -: 1800:              else if ((new_flags & O_NOLINKS) && 1 < st.st_nlink)
+        -: 1801:                {
+        -: 1802:                  errno = EMLINK;
+        -: 1803:                  ok = false;
+        -: 1804:                }
+    #####: 1805:              new_flags &= ~ (O_DIRECTORY | O_NOLINKS);
+        -: 1806:            }
+        -: 1807:
+    #####: 1808:          if (ok && old_flags != new_flags
+    #####: 1809:              && fcntl (fd, F_SETFL, new_flags) == -1)
+    #####: 1810:            ok = false;
+        -: 1811:        }
+        -: 1812:
+    #####: 1813:      if (!ok)
+    #####: 1814:        error (EXIT_FAILURE, errno, _("setting flags for %s"), quote (name));
+        -: 1815:    }
+        2: 1816:}
+        -: 1817:
+        -: 1818:static char *
+    #####: 1819:human_size (size_t n)
+        -: 1820:{
+        -: 1821:  static char hbuf[LONGEST_HUMAN_READABLE + 1];
+    #####: 1822:  int human_opts =
+        -: 1823:    (human_autoscale | human_round_to_nearest | human_base_1024
+        -: 1824:     | human_space_before_unit | human_SI | human_B);
+    #####: 1825:  return human_readable (n, hbuf, human_opts, 1, 1);
+        -: 1826:}
+        -: 1827:
+        -: 1828:/* The main loop.  */
+        -: 1829:
+        -: 1830:static int
+        2: 1831:dd_copy (void)
+        -: 1832:{
+        -: 1833:  char *ibuf, *bufstart;	/* Input buffer. */
+        -: 1834:  /* These are declared static so that even though we don't free the
+        -: 1835:     buffers, valgrind will recognize that there is no "real" leak.  */
+        -: 1836:  static char *real_buf;	/* real buffer address before alignment */
+        -: 1837:  static char *real_obuf;
+        -: 1838:  ssize_t nread;		/* Bytes read in the current block.  */
+        -: 1839:
+        -: 1840:  /* If nonzero, then the previously read block was partial and
+        -: 1841:     PARTREAD was its size.  */
+        2: 1842:  size_t partread = 0;
+        -: 1843:
+        2: 1844:  int exit_status = EXIT_SUCCESS;
+        -: 1845:  size_t n_bytes_read;
+        -: 1846:
+        -: 1847:  /* Leave at least one extra byte at the beginning and end of 'ibuf'
+        -: 1848:     for conv=swab, but keep the buffer address even.  But some peculiar
+        -: 1849:     device drivers work only with word-aligned buffers, so leave an
+        -: 1850:     extra two bytes.  */
+        -: 1851:
+        -: 1852:  /* Some devices require alignment on a sector or page boundary
+        -: 1853:     (e.g. character disk devices).  Align the input buffer to a
+        -: 1854:     page boundary to cover all bases.  Note that due to the swab
+        -: 1855:     algorithm, we must have at least one byte in the page before
+        -: 1856:     the input buffer;  thus we allocate 2 pages of slop in the
+        -: 1857:     real buffer.  8k above the blocksize shouldn't bother anyone.
+        -: 1858:
+        -: 1859:     The page alignment is necessary on any Linux kernel that supports
+        -: 1860:     either the SGI raw I/O patch or Steven Tweedies raw I/O patch.
+        -: 1861:     It is necessary when accessing raw (i.e. character special) disk
+        -: 1862:     devices on Unixware or other SVR4-derived system.  */
+        -: 1863:
+        2: 1864:  real_buf = malloc (input_blocksize + INPUT_BLOCK_SLOP);
+        2: 1865:  if (!real_buf)
+    #####: 1866:    error (EXIT_FAILURE, 0,
+        -: 1867:           _("memory exhausted by input buffer of size %zu bytes (%s)"),
+        -: 1868:           input_blocksize, human_size (input_blocksize));
+        -: 1869:
+        2: 1870:  ibuf = real_buf;
+        2: 1871:  ibuf += SWAB_ALIGN_OFFSET;	/* allow space for swab */
+        -: 1872:
+        2: 1873:  ibuf = ptr_align (ibuf, page_size);
+        -: 1874:
+        2: 1875:  if (conversions_mask & C_TWOBUFS)
+        -: 1876:    {
+        -: 1877:      /* Page-align the output buffer, too.  */
+    #####: 1878:      real_obuf = malloc (output_blocksize + OUTPUT_BLOCK_SLOP);
+    #####: 1879:      if (!real_obuf)
+    #####: 1880:        error (EXIT_FAILURE, 0,
+        -: 1881:               _("memory exhausted by output buffer of size %zu bytes (%s)"),
+        -: 1882:               output_blocksize, human_size (output_blocksize));
+    #####: 1883:      obuf = ptr_align (real_obuf, page_size);
+        -: 1884:    }
+        -: 1885:  else
+        -: 1886:    {
+        2: 1887:      real_obuf = NULL;
+        2: 1888:      obuf = ibuf;
+        -: 1889:    }
+        -: 1890:
+        -: 1891:  /* Write a sentinel to the slop after the buffer,
+        -: 1892:     to allow efficient checking for NUL blocks.  */
+        2: 1893:  assert (sizeof (uintptr_t) <= OUTPUT_BLOCK_SLOP);
+        2: 1894:  memset (obuf + output_blocksize, 1, sizeof (uintptr_t));
+        -: 1895:
+        2: 1896:  if (skip_records != 0 || skip_bytes != 0)
+        -: 1897:    {
+    #####: 1898:      uintmax_t us_bytes = input_offset + (skip_records * input_blocksize)
+    #####: 1899:                           + skip_bytes;
+    #####: 1900:      uintmax_t us_blocks = skip (STDIN_FILENO, input_file,
+        -: 1901:                                  skip_records, input_blocksize, &skip_bytes,
+        -: 1902:                                  ibuf);
+    #####: 1903:      us_bytes -= input_offset;
+        -: 1904:
+        -: 1905:      /* POSIX doesn't say what to do when dd detects it has been
+        -: 1906:         asked to skip past EOF, so I assume it's non-fatal.
+        -: 1907:         There are 3 reasons why there might be unskipped blocks/bytes:
+        -: 1908:             1. file is too small
+        -: 1909:             2. pipe has not enough data
+        -: 1910:             3. partial reads  */
+    #####: 1911:      if (us_blocks || (!input_offset_overflow && us_bytes))
+        -: 1912:        {
+    #####: 1913:          error (0, 0,
+        -: 1914:                 _("%s: cannot skip to specified offset"), quote (input_file));
+        -: 1915:        }
+        -: 1916:    }
+        -: 1917:
+        2: 1918:  if (seek_records != 0 || seek_bytes != 0)
+        -: 1919:    {
+        2: 1920:      size_t bytes = seek_bytes;
+        2: 1921:      uintmax_t write_records = skip (STDOUT_FILENO, output_file,
+        -: 1922:                                      seek_records, output_blocksize, &bytes,
+        -: 1923:                                      obuf);
+        -: 1924:
+        2: 1925:      if (write_records != 0 || bytes != 0)
+        -: 1926:        {
+    #####: 1927:          memset (obuf, 0, write_records ? output_blocksize : bytes);
+        -: 1928:
+        -: 1929:          do
+        -: 1930:            {
+    #####: 1931:              size_t size = write_records ? output_blocksize : bytes;
+    #####: 1932:              if (iwrite (STDOUT_FILENO, obuf, size) != size)
+        -: 1933:                {
+    #####: 1934:                  error (0, errno, _("writing to %s"), quote (output_file));
+    #####: 1935:                  quit (EXIT_FAILURE);
+        -: 1936:                }
+        -: 1937:
+    #####: 1938:              if (write_records != 0)
+    #####: 1939:                write_records--;
+        -: 1940:              else
+    #####: 1941:                bytes = 0;
+        -: 1942:            }
+    #####: 1943:          while (write_records || bytes);
+        -: 1944:        }
+        -: 1945:    }
+        -: 1946:
+        2: 1947:  if (max_records == 0 && max_bytes == 0)
+    #####: 1948:    return exit_status;
+        -: 1949:
+        -: 1950:  while (1)
+        -: 1951:    {
+        2: 1952:      if (r_partial + r_full >= max_records + !!max_bytes)
+    #####: 1953:        break;
+        -: 1954:
+        -: 1955:      /* Zero the buffer before reading, so that if we get a read error,
+        -: 1956:         whatever data we are able to read is followed by zeros.
+        -: 1957:         This minimizes data loss. */
+        2: 1958:      if ((conversions_mask & C_SYNC) && (conversions_mask & C_NOERROR))
+    #####: 1959:        memset (ibuf,
+    #####: 1960:                (conversions_mask & (C_BLOCK | C_UNBLOCK)) ? ' ' : '\0',
+        -: 1961:                input_blocksize);
+        -: 1962:
+        2: 1963:      if (r_partial + r_full >= max_records)
+    #####: 1964:        nread = iread_fnc (STDIN_FILENO, ibuf, max_bytes);
+        -: 1965:      else
+        2: 1966:        nread = iread_fnc (STDIN_FILENO, ibuf, input_blocksize);
+        -: 1967:
+        2: 1968:      if (nread >= 0 && i_nocache)
+    #####: 1969:        invalidate_cache (STDIN_FILENO, nread);
+        -: 1970:
+        2: 1971:      if (nread == 0)
+        2: 1972:        break;			/* EOF.  */
+        -: 1973:
+    #####: 1974:      if (nread < 0)
+        -: 1975:        {
+    #####: 1976:          error (0, errno, _("reading %s"), quote (input_file));
+    #####: 1977:          if (conversions_mask & C_NOERROR)
+        -: 1978:            {
+    #####: 1979:              print_stats ();
+    #####: 1980:              size_t bad_portion = input_blocksize - partread;
+        -: 1981:
+        -: 1982:              /* We already know this data is not cached,
+        -: 1983:                 but call this so that correct offsets are maintained.  */
+    #####: 1984:              invalidate_cache (STDIN_FILENO, bad_portion);
+        -: 1985:
+        -: 1986:              /* Seek past the bad block if possible. */
+    #####: 1987:              if (!advance_input_after_read_error (bad_portion))
+        -: 1988:                {
+    #####: 1989:                  exit_status = EXIT_FAILURE;
+        -: 1990:
+        -: 1991:                  /* Suppress duplicate diagnostics.  */
+    #####: 1992:                  input_seekable = false;
+    #####: 1993:                  input_seek_errno = ESPIPE;
+        -: 1994:                }
+    #####: 1995:              if ((conversions_mask & C_SYNC) && !partread)
+        -: 1996:                /* Replace the missing input with null bytes and
+        -: 1997:                   proceed normally.  */
+    #####: 1998:                nread = 0;
+        -: 1999:              else
+    #####: 2000:                continue;
+        -: 2001:            }
+        -: 2002:          else
+        -: 2003:            {
+        -: 2004:              /* Write any partial block. */
+    #####: 2005:              exit_status = EXIT_FAILURE;
+    #####: 2006:              break;
+        -: 2007:            }
+        -: 2008:        }
+        -: 2009:
+    #####: 2010:      n_bytes_read = nread;
+    #####: 2011:      advance_input_offset (nread);
+        -: 2012:
+    #####: 2013:      if (n_bytes_read < input_blocksize)
+        -: 2014:        {
+    #####: 2015:          r_partial++;
+    #####: 2016:          partread = n_bytes_read;
+    #####: 2017:          if (conversions_mask & C_SYNC)
+        -: 2018:            {
+    #####: 2019:              if (!(conversions_mask & C_NOERROR))
+        -: 2020:                /* If C_NOERROR, we zeroed the block before reading. */
+    #####: 2021:                memset (ibuf + n_bytes_read,
+    #####: 2022:                        (conversions_mask & (C_BLOCK | C_UNBLOCK)) ? ' ' : '\0',
+        -: 2023:                        input_blocksize - n_bytes_read);
+    #####: 2024:              n_bytes_read = input_blocksize;
+        -: 2025:            }
+        -: 2026:        }
+        -: 2027:      else
+        -: 2028:        {
+    #####: 2029:          r_full++;
+    #####: 2030:          partread = 0;
+        -: 2031:        }
+        -: 2032:
+    #####: 2033:      if (ibuf == obuf)		/* If not C_TWOBUFS. */
+        -: 2034:        {
+    #####: 2035:          size_t nwritten = iwrite (STDOUT_FILENO, obuf, n_bytes_read);
+    #####: 2036:          w_bytes += nwritten;
+    #####: 2037:          if (nwritten != n_bytes_read)
+        -: 2038:            {
+    #####: 2039:              error (0, errno, _("writing %s"), quote (output_file));
+    #####: 2040:              return EXIT_FAILURE;
+        -: 2041:            }
+    #####: 2042:          else if (n_bytes_read == input_blocksize)
+    #####: 2043:            w_full++;
+        -: 2044:          else
+    #####: 2045:            w_partial++;
+    #####: 2046:          continue;
+        -: 2047:        }
+        -: 2048:
+        -: 2049:      /* Do any translations on the whole buffer at once.  */
+        -: 2050:
+    #####: 2051:      if (translation_needed)
+    #####: 2052:        translate_buffer (ibuf, n_bytes_read);
+        -: 2053:
+    #####: 2054:      if (conversions_mask & C_SWAB)
+    #####: 2055:        bufstart = swab_buffer (ibuf, &n_bytes_read);
+        -: 2056:      else
+    #####: 2057:        bufstart = ibuf;
+        -: 2058:
+    #####: 2059:      if (conversions_mask & C_BLOCK)
+    #####: 2060:        copy_with_block (bufstart, n_bytes_read);
+    #####: 2061:      else if (conversions_mask & C_UNBLOCK)
+    #####: 2062:        copy_with_unblock (bufstart, n_bytes_read);
+        -: 2063:      else
+    #####: 2064:        copy_simple (bufstart, n_bytes_read);
+    #####: 2065:    }
+        -: 2066:
+        -: 2067:  /* If we have a char left as a result of conv=swab, output it.  */
+        2: 2068:  if (char_is_saved)
+        -: 2069:    {
+    #####: 2070:      if (conversions_mask & C_BLOCK)
+    #####: 2071:        copy_with_block (&saved_char, 1);
+    #####: 2072:      else if (conversions_mask & C_UNBLOCK)
+    #####: 2073:        copy_with_unblock (&saved_char, 1);
+        -: 2074:      else
+    #####: 2075:        output_char (saved_char);
+        -: 2076:    }
+        -: 2077:
+        2: 2078:  if ((conversions_mask & C_BLOCK) && col > 0)
+        -: 2079:    {
+        -: 2080:      /* If the final input line didn't end with a '\n', pad
+        -: 2081:         the output block to 'conversion_blocksize' chars.  */
+        -: 2082:      size_t i;
+    #####: 2083:      for (i = col; i < conversion_blocksize; i++)
+    #####: 2084:        output_char (space_character);
+        -: 2085:    }
+        -: 2086:
+        2: 2087:  if (col && (conversions_mask & C_UNBLOCK))
+        -: 2088:    {
+        -: 2089:      /* If there was any output, add a final '\n'.  */
+    #####: 2090:      output_char (newline_character);
+        -: 2091:    }
+        -: 2092:
+        -: 2093:  /* Write out the last block. */
+        2: 2094:  if (oc != 0)
+        -: 2095:    {
+    #####: 2096:      size_t nwritten = iwrite (STDOUT_FILENO, obuf, oc);
+    #####: 2097:      w_bytes += nwritten;
+    #####: 2098:      if (nwritten != 0)
+    #####: 2099:        w_partial++;
+    #####: 2100:      if (nwritten != oc)
+        -: 2101:        {
+    #####: 2102:          error (0, errno, _("writing %s"), quote (output_file));
+    #####: 2103:          return EXIT_FAILURE;
+        -: 2104:        }
+        -: 2105:    }
+        -: 2106:
+        -: 2107:  /* If the last write was converted to a seek, then for a regular file,
+        -: 2108:     ftruncate to extend the size.  */
+        2: 2109:  if (final_op_was_seek)
+        -: 2110:    {
+        -: 2111:      struct stat stdout_stat;
+    #####: 2112:      if (fstat (STDOUT_FILENO, &stdout_stat) != 0)
+        -: 2113:        {
+    #####: 2114:          error (0, errno, _("cannot fstat %s"), quote (output_file));
+    #####: 2115:          return EXIT_FAILURE;
+        -: 2116:        }
+    #####: 2117:      if (S_ISREG (stdout_stat.st_mode))
+        -: 2118:        {
+    #####: 2119:          off_t output_offset = lseek (STDOUT_FILENO, 0, SEEK_CUR);
+    #####: 2120:          if (output_offset > stdout_stat.st_size)
+        -: 2121:            {
+    #####: 2122:              if (ftruncate (STDOUT_FILENO, output_offset) != 0)
+        -: 2123:                {
+    #####: 2124:                  error (0, errno,
+        -: 2125:                         _("failed to truncate to %"PRIuMAX" bytes"
+        -: 2126:                           " in output file %s"),
+        -: 2127:                         output_offset, quote (output_file));
+    #####: 2128:                  return EXIT_FAILURE;
+        -: 2129:                }
+        -: 2130:            }
+        -: 2131:        }
+        -: 2132:    }
+        -: 2133:
+        2: 2134:  if ((conversions_mask & C_FDATASYNC) && fdatasync (STDOUT_FILENO) != 0)
+        -: 2135:    {
+    #####: 2136:      if (errno != ENOSYS && errno != EINVAL)
+        -: 2137:        {
+    #####: 2138:          error (0, errno, _("fdatasync failed for %s"), quote (output_file));
+    #####: 2139:          exit_status = EXIT_FAILURE;
+        -: 2140:        }
+    #####: 2141:      conversions_mask |= C_FSYNC;
+        -: 2142:    }
+        -: 2143:
+        2: 2144:  if (conversions_mask & C_FSYNC)
+    #####: 2145:    while (fsync (STDOUT_FILENO) != 0)
+    #####: 2146:      if (errno != EINTR)
+        -: 2147:        {
+    #####: 2148:          error (0, errno, _("fsync failed for %s"), quote (output_file));
+    #####: 2149:          return EXIT_FAILURE;
+        -: 2150:        }
+        -: 2151:
+        2: 2152:  return exit_status;
+        -: 2153:}
+        -: 2154:
+        -: 2155:int
+        2: 2156:main (int argc, char **argv)
+        -: 2157:{
+        -: 2158:  int i;
+        -: 2159:  int exit_status;
+        -: 2160:  off_t offset;
+        -: 2161:
+        2: 2162:  install_signal_handlers ();
+        -: 2163:
+        -: 2164:  initialize_main (&argc, &argv);
+        2: 2165:  set_program_name (argv[0]);
+        2: 2166:  setlocale (LC_ALL, "");
+        -: 2167:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -: 2168:  textdomain (PACKAGE);
+        -: 2169:
+        -: 2170:  /* Arrange to close stdout if parse_long_options exits.  */
+        2: 2171:  atexit (maybe_close_stdout);
+        -: 2172:
+        2: 2173:  page_size = getpagesize ();
+        -: 2174:
+        2: 2175:  parse_long_options (argc, argv, PROGRAM_NAME, PACKAGE, Version,
+        -: 2176:                      usage, AUTHORS, (char const *) NULL);
+        2: 2177:  close_stdout_required = false;
+        -: 2178:
+        2: 2179:  if (getopt_long (argc, argv, "", NULL, NULL) != -1)
+    #####: 2180:    usage (EXIT_FAILURE);
+        -: 2181:
+        -: 2182:  /* Initialize translation table to identity translation. */
+      514: 2183:  for (i = 0; i < 256; i++)
+      512: 2184:    trans_table[i] = i;
+        -: 2185:
+        -: 2186:  /* Decode arguments. */
+        2: 2187:  scanargs (argc, argv);
+        -: 2188:
+        2: 2189:  apply_translations ();
+        -: 2190:
+        2: 2191:  if (input_file == NULL)
+        -: 2192:    {
+        2: 2193:      input_file = _("standard input");
+        2: 2194:      set_fd_flags (STDIN_FILENO, input_flags, input_file);
+        -: 2195:    }
+        -: 2196:  else
+        -: 2197:    {
+    #####: 2198:      if (fd_reopen (STDIN_FILENO, input_file, O_RDONLY | input_flags, 0) < 0)
+    #####: 2199:        error (EXIT_FAILURE, errno, _("opening %s"), quote (input_file));
+        -: 2200:    }
+        -: 2201:
+        2: 2202:  offset = lseek (STDIN_FILENO, 0, SEEK_CUR);
+        2: 2203:  input_seekable = (0 <= offset);
+        2: 2204:  input_offset = MAX (0, offset);
+        2: 2205:  input_seek_errno = errno;
+        -: 2206:
+        2: 2207:  if (output_file == NULL)
+        -: 2208:    {
+    #####: 2209:      output_file = _("standard output");
+    #####: 2210:      set_fd_flags (STDOUT_FILENO, output_flags, output_file);
+        -: 2211:    }
+        -: 2212:  else
+        -: 2213:    {
+        2: 2214:      mode_t perms = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+        2: 2215:      int opts
+        -: 2216:        = (output_flags
+        2: 2217:           | (conversions_mask & C_NOCREAT ? 0 : O_CREAT)
+        2: 2218:           | (conversions_mask & C_EXCL ? O_EXCL : 0)
+        2: 2219:           | (seek_records || (conversions_mask & C_NOTRUNC) ? 0 : O_TRUNC));
+        -: 2220:
+        -: 2221:      /* Open the output file with *read* access only if we might
+        -: 2222:         need to read to satisfy a 'seek=' request.  If we can't read
+        -: 2223:         the file, go ahead with write-only access; it might work.  */
+        2: 2224:      if ((! seek_records
+        2: 2225:           || fd_reopen (STDOUT_FILENO, output_file, O_RDWR | opts, perms) < 0)
+    #####: 2226:          && (fd_reopen (STDOUT_FILENO, output_file, O_WRONLY | opts, perms)
+        -: 2227:              < 0))
+    #####: 2228:        error (EXIT_FAILURE, errno, _("opening %s"), quote (output_file));
+        -: 2229:
+        2: 2230:      if (seek_records != 0 && !(conversions_mask & C_NOTRUNC))
+        -: 2231:        {
+        2: 2232:          uintmax_t size = seek_records * output_blocksize + seek_bytes;
+        2: 2233:          unsigned long int obs = output_blocksize;
+        -: 2234:
+        2: 2235:          if (OFF_T_MAX / output_blocksize < seek_records)
+    #####: 2236:            error (EXIT_FAILURE, 0,
+        -: 2237:                   _("offset too large: "
+        -: 2238:                     "cannot truncate to a length of seek=%"PRIuMAX""
+        -: 2239:                     " (%lu-byte) blocks"),
+        -: 2240:                   seek_records, obs);
+        -: 2241:
+        2: 2242:          if (ftruncate (STDOUT_FILENO, size) != 0)
+        -: 2243:            {
+        -: 2244:              /* Complain only when ftruncate fails on a regular file, a
+        -: 2245:                 directory, or a shared memory object, as POSIX 1003.1-2004
+        -: 2246:                 specifies ftruncate's behavior only for these file types.
+        -: 2247:                 For example, do not complain when Linux kernel 2.4 ftruncate
+        -: 2248:                 fails on /dev/fd0.  */
+    #####: 2249:              int ftruncate_errno = errno;
+        -: 2250:              struct stat stdout_stat;
+    #####: 2251:              if (fstat (STDOUT_FILENO, &stdout_stat) != 0)
+    #####: 2252:                error (EXIT_FAILURE, errno, _("cannot fstat %s"),
+        -: 2253:                       quote (output_file));
+    #####: 2254:              if (S_ISREG (stdout_stat.st_mode)
+    #####: 2255:                  || S_ISDIR (stdout_stat.st_mode)
+    #####: 2256:                  || S_TYPEISSHM (&stdout_stat))
+    #####: 2257:                error (EXIT_FAILURE, ftruncate_errno,
+        -: 2258:                       _("failed to truncate to %"PRIuMAX" bytes"
+        -: 2259:                         " in output file %s"),
+        -: 2260:                       size, quote (output_file));
+        -: 2261:            }
+        -: 2262:        }
+        -: 2263:    }
+        -: 2264:
+        2: 2265:  start_time = gethrxtime ();
+        -: 2266:
+        2: 2267:  exit_status = dd_copy ();
+        -: 2268:
+        2: 2269:  if (max_records == 0 && max_bytes == 0)
+        -: 2270:    {
+        -: 2271:      /* Special case to invalidate cache to end of file.  */
+    #####: 2272:      if (i_nocache && !invalidate_cache (STDIN_FILENO, 0))
+        -: 2273:        {
+    #####: 2274:          error (0, errno, _("failed to discard cache for: %s"),
+        -: 2275:                 quote (input_file));
+    #####: 2276:          exit_status = EXIT_FAILURE;
+        -: 2277:        }
+    #####: 2278:      if (o_nocache && !invalidate_cache (STDOUT_FILENO, 0))
+        -: 2279:        {
+    #####: 2280:          error (0, errno, _("failed to discard cache for: %s"),
+        -: 2281:                 quote (output_file));
+    #####: 2282:          exit_status = EXIT_FAILURE;
+        -: 2283:        }
+        -: 2284:    }
+        2: 2285:  else if (max_records != (uintmax_t) -1)
+        -: 2286:    {
+        -: 2287:      /* Invalidate any pending region less than page size,
+        -: 2288:         in case the kernel might round up.  */
+    #####: 2289:      if (i_nocache)
+    #####: 2290:        invalidate_cache (STDIN_FILENO, 0);
+    #####: 2291:      if (o_nocache)
+    #####: 2292:        invalidate_cache (STDOUT_FILENO, 0);
+        -: 2293:    }
+        -: 2294:
+        2: 2295:  quit (exit_status);
+        -: 2296:}

@@ -1,0 +1,1516 @@
+        -:    0:Source:find.c
+        -:    0:Graph:find.gcno
+        -:    0:Data:find.gcda
+        -:    0:Runs:4
+        -:    0:Programs:1
+        -:    1:/* find -- search for files in a directory hierarchy
+        -:    2:   Copyright (C) 1990, 91, 92, 93, 94, 2000, 
+        -:    3:                 2003, 2004, 2005 Free Software Foundation, Inc.
+        -:    4:
+        -:    5:   This program is free software; you can redistribute it and/or modify
+        -:    6:   it under the terms of the GNU General Public License as published by
+        -:    7:   the Free Software Foundation; either version 2, or (at your option)
+        -:    8:   any later version.
+        -:    9:
+        -:   10:   This program is distributed in the hope that it will be useful,
+        -:   11:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   12:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   13:   GNU General Public License for more details.
+        -:   14:
+        -:   15:   You should have received a copy of the GNU General Public License
+        -:   16:   along with this program; if not, write to the Free Software
+        -:   17:   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
+        -:   18:   USA.*/
+        -:   19:
+        -:   20:/* GNU find was written by Eric Decker <cire@cisco.com>,
+        -:   21:   with enhancements by David MacKenzie <djm@gnu.org>,
+        -:   22:   Jay Plett <jay@silence.princeton.nj.us>,
+        -:   23:   and Tim Wood <axolotl!tim@toad.com>.
+        -:   24:   The idea for -print0 and xargs -0 came from
+        -:   25:   Dan Bernstein <brnstnd@kramden.acf.nyu.edu>.  
+        -:   26:   Improvements have been made by James Youngman <jay@gnu.org>.
+        -:   27:*/
+        -:   28:
+        -:   29:
+        -:   30:#include "defs.h"
+        -:   31:
+        -:   32:#define USE_SAFE_CHDIR 1
+        -:   33:#undef  STAT_MOUNTPOINTS
+        -:   34:
+        -:   35:
+        -:   36:#include <errno.h>
+        -:   37:#include <assert.h>
+        -:   38:
+        -:   39:
+        -:   40:#ifdef HAVE_FCNTL_H
+        -:   41:#include <fcntl.h>
+        -:   42:#else
+        -:   43:#include <sys/file.h>
+        -:   44:#endif
+        -:   45:#include <openat.h>
+        -:   46:
+        -:   47:#include "../gnulib/lib/xalloc.h"
+        -:   48:#include "../gnulib/lib/human.h"
+        -:   49:#include "../gnulib/lib/canonicalize.h"
+        -:   50:#include <modetype.h>
+        -:   51:
+        -:   52:#include "closeout.h"
+        -:   53:#include "savedirinfo.h"
+        -:   54:#include "buildcmd.h"
+        -:   55:#include "dirname.h"
+        -:   56:#include "quote.h"
+        -:   57:#include "quotearg.h"
+        -:   58:
+        -:   59:#ifdef HAVE_LOCALE_H
+        -:   60:#include <locale.h>
+        -:   61:#endif
+        -:   62:
+        -:   63:#if ENABLE_NLS
+        -:   64:# include <libintl.h>
+        -:   65:# define _(Text) gettext (Text)
+        -:   66:#else
+        -:   67:# define _(Text) Text
+        -:   68:#define textdomain(Domain)
+        -:   69:#define bindtextdomain(Package, Directory)
+        -:   70:#endif
+        -:   71:#ifdef gettext_noop
+        -:   72:# define N_(String) gettext_noop (String)
+        -:   73:#else
+        -:   74:/* See locate.c for explanation as to why not use (String) */
+        -:   75:# define N_(String) String
+        -:   76:#endif
+        -:   77:
+        -:   78:#define apply_predicate(pathname, stat_buf_ptr, node)	\
+        -:   79:  (*(node)->pred_func)((pathname), (stat_buf_ptr), (node))
+        -:   80:
+        -:   81:#ifdef STAT_MOUNTPOINTS
+        -:   82:static void init_mounted_dev_list(int mandatory);
+        -:   83:#endif
+        -:   84:
+        -:   85:static void process_top_path PARAMS((char *pathname, mode_t mode));
+        -:   86:static int process_path PARAMS((char *pathname, char *name, boolean leaf, char *parent, mode_t type));
+        -:   87:static void process_dir PARAMS((char *pathname, char *name, int pathlen, const struct stat *statp, char *parent));
+        -:   88:
+        -:   89:
+        -:   90:
+        -:   91:/* Name this program was run with. */
+        -:   92:char *program_name;
+        -:   93:
+        -:   94:/* A file descriptor open to the initial working directory.
+        -:   95:   Doing it this way allows us to work when the i.w.d. has
+        -:   96:   unreadable parents.  */
+        -:   97:int starting_desc;
+        -:   98:
+        -:   99:/* The stat buffer of the initial working directory. */
+        -:  100:static struct stat starting_stat_buf;
+        -:  101:
+        -:  102:enum ChdirSymlinkHandling
+        -:  103:  {
+        -:  104:    SymlinkHandleDefault,	/* Normally the right choice */
+        -:  105:    SymlinkFollowOk		/* see comment in process_top_path() */
+        -:  106:  };
+        -:  107:
+        -:  108:
+        -:  109:enum TraversalDirection
+        -:  110:  {
+        -:  111:    TraversingUp,
+        -:  112:    TraversingDown
+        -:  113:  };
+        -:  114:
+        -:  115:enum WdSanityCheckFatality
+        -:  116:  {
+        -:  117:    FATAL_IF_SANITY_CHECK_FAILS,
+        -:  118:    RETRY_IF_SANITY_CHECK_FAILS,
+        -:  119:    NON_FATAL_IF_SANITY_CHECK_FAILS
+        -:  120:  };
+        -:  121:
+        -:  122:
+       24:  123:int get_current_dirfd(void)
+        -:  124:{
+       24:  125:  return AT_FDCWD;
+        -:  126:}
+        -:  127:
+        -:  128:
+        -:  129:int
+        4:  130:main (int argc, char **argv)
+        -:  131:{
+        -:  132:  int i;
+        4:  133:  int end_of_leading_options = 0; /* First arg after any -H/-L etc. */
+        -:  134:  struct predicate *eval_tree;
+        -:  135:
+        4:  136:  program_name = argv[0];
+        4:  137:  state.exit_status = 0;
+        -:  138:
+        -:  139:  /* Set the option defaults before we do the the locale
+        -:  140:   * initialisation as check_nofollow() needs to be executed in the
+        -:  141:   * POSIX locale.
+        -:  142:   */
+        4:  143:  set_option_defaults(&options);
+        -:  144:
+        -:  145:#ifdef HAVE_SETLOCALE
+        4:  146:  setlocale (LC_ALL, "");
+        -:  147:#endif
+        -:  148:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  149:  textdomain (PACKAGE);
+        4:  150:  atexit (close_stdout);
+        -:  151:
+        -:  152:  /* Check for -P, -H or -L options. */
+        4:  153:  end_of_leading_options = process_leading_options(argc, argv);
+        -:  154:
+        4:  155:  if (options.debug_options & DebugStat)
+    #####:  156:    options.xstat = debug_stat;
+        -:  157:
+        -:  158:#ifdef DEBUG
+        -:  159:  fprintf (stderr, "cur_day_start = %s", ctime (&options.cur_day_start));
+        -:  160:#endif /* DEBUG */
+        -:  161:
+        -:  162:  /* state.cwd_dir_fd has to be initialised before we call build_expression_tree()
+        -:  163:   * because command-line parsing may lead us to stat some files.
+        -:  164:   */
+        4:  165:  state.cwd_dir_fd = AT_FDCWD;
+        -:  166:  
+        -:  167:  /* We are now processing the part of the "find" command line 
+        -:  168:   * after the -H/-L options (if any).
+        -:  169:   */
+        4:  170:  eval_tree = build_expression_tree(argc, argv, end_of_leading_options);
+        -:  171:
+        -:  172:  
+        -:  173:  /* safely_chdir() needs to check that it has ended up in the right place. 
+        -:  174:   * To avoid bailing out when something gets automounted, it checks if 
+        -:  175:   * the target directory appears to have had a directory mounted on it as
+        -:  176:   * we chdir()ed.  The problem with this is that in order to notice that 
+        -:  177:   * a filesystem was mounted, we would need to lstat() all the mount points.
+        -:  178:   * That strategy loses if our machine is a client of a dead NFS server.
+        -:  179:   *
+        -:  180:   * Hence if safely_chdir() and wd_sanity_check() can manage without needing 
+        -:  181:   * to know the mounted device list, we do that.  
+        -:  182:   */
+        4:  183:  if (!options.open_nofollow_available)
+        -:  184:    {
+        -:  185:#ifdef STAT_MOUNTPOINTS
+        -:  186:      init_mounted_dev_list(0);
+        -:  187:#endif
+        -:  188:    }
+        -:  189:  
+        -:  190:
+        4:  191:  starting_desc = open (".", O_RDONLY
+        -:  192:#if defined O_LARGEFILE
+        -:  193:			|O_LARGEFILE
+        -:  194:#endif
+        -:  195:			);
+        4:  196:  if (0 <= starting_desc && fchdir (starting_desc) != 0)
+        -:  197:    {
+    #####:  198:      close (starting_desc);
+    #####:  199:      starting_desc = -1;
+        -:  200:    }
+        4:  201:  assert(starting_desc >= 0);
+        -:  202:
+        4:  203:  if (starting_desc < 0)
+        -:  204:    {
+    #####:  205:      starting_dir = xgetcwd ();
+    #####:  206:      if (! starting_dir)
+    #####:  207:	error (1, errno, _("cannot get current directory"));
+        -:  208:    }
+        4:  209:  set_stat_placeholders(&starting_stat_buf);
+        4:  210:  if ((*options.xstat) (".", &starting_stat_buf) != 0)
+    #####:  211:    error (1, errno, _("cannot stat current directory"));
+        -:  212:
+        -:  213:  /* If no paths are given, default to ".".  */
+        8:  214:  for (i = end_of_leading_options; i < argc && !looks_like_expression(argv[i], true); i++)
+        -:  215:    {
+        4:  216:      process_top_path (argv[i], 0);
+        -:  217:    }
+        -:  218:
+        -:  219:  /* If there were no path arguments, default to ".". */
+        4:  220:  if (i == end_of_leading_options)
+        -:  221:    {
+        -:  222:      /* 
+        -:  223:       * We use a temporary variable here because some actions modify 
+        -:  224:       * the path temporarily.  Hence if we use a string constant, 
+        -:  225:       * we get a coredump.  The best example of this is if we say 
+        -:  226:       * "find -printf %H" (note, not "find . -printf %H").
+        -:  227:       */
+    #####:  228:      char defaultpath[2] = ".";
+    #####:  229:      process_top_path (defaultpath, 0);
+        -:  230:    }
+        -:  231:
+        -:  232:  /* If "-exec ... {} +" has been used, there may be some 
+        -:  233:   * partially-full command lines which have been built, 
+        -:  234:   * but which are not yet complete.   Execute those now.
+        -:  235:   */
+        4:  236:  cleanup();
+        4:  237:  return state.exit_status;
+        -:  238:}
+        -:  239:
+    #####:  240:boolean is_fts_enabled(int *ftsoptions)
+        -:  241:{
+        -:  242:  /* this version of find (i.e. this main()) does not use fts. */
+    #####:  243:  *ftsoptions = 0;
+    #####:  244:  return false;
+        -:  245:}
+        -:  246:
+        -:  247:
+        -:  248:static char *
+    #####:  249:specific_dirname(const char *dir)
+        -:  250:{
+        -:  251:  char dirbuf[1024];
+        -:  252:
+    #####:  253:  if (0 == strcmp(".", dir))
+        -:  254:    {
+        -:  255:      /* OK, what's '.'? */
+    #####:  256:      if (NULL != getcwd(dirbuf, sizeof(dirbuf)))
+        -:  257:	{
+    #####:  258:	  return strdup(dirbuf);
+        -:  259:	}
+        -:  260:      else
+        -:  261:	{
+    #####:  262:	  return strdup(dir);
+        -:  263:	}
+        -:  264:    }
+        -:  265:  else
+        -:  266:    {
+    #####:  267:      char *result = canonicalize_filename_mode(dir, CAN_EXISTING);
+    #####:  268:      if (NULL == result)
+    #####:  269:	return strdup(dir);
+        -:  270:      else
+    #####:  271:	return result;
+        -:  272:    }
+        -:  273:}
+        -:  274:
+        -:  275:
+        -:  276:
+        -:  277:/* Return non-zero if FS is the name of a filesystem that is likely to
+        -:  278: * be automounted
+        -:  279: */
+        -:  280:static int
+    #####:  281:fs_likely_to_be_automounted(const char *fs)
+        -:  282:{
+    #####:  283:  return ( (0==strcmp(fs, "nfs")) || (0==strcmp(fs, "autofs")) || (0==strcmp(fs, "subfs")));
+        -:  284:}
+        -:  285:
+        -:  286:
+        -:  287:
+        -:  288:#ifdef STAT_MOUNTPOINTS
+        -:  289:static dev_t *mounted_devices = NULL;
+        -:  290:static size_t num_mounted_devices = 0u;
+        -:  291:
+        -:  292:
+        -:  293:static void
+        -:  294:init_mounted_dev_list(int mandatory)
+        -:  295:{
+        -:  296:  assert(NULL == mounted_devices);
+        -:  297:  assert(0 == num_mounted_devices);
+        -:  298:  mounted_devices = get_mounted_devices(&num_mounted_devices);
+        -:  299:  if (mandatory && (NULL == mounted_devices))
+        -:  300:    {
+        -:  301:      error(1, 0, "Cannot read list of mounted devices.");
+        -:  302:    }
+        -:  303:}
+        -:  304:
+        -:  305:static void
+        -:  306:refresh_mounted_dev_list(void)
+        -:  307:{
+        -:  308:  if (mounted_devices)
+        -:  309:    {
+        -:  310:      free(mounted_devices);
+        -:  311:      mounted_devices = 0;
+        -:  312:    }
+        -:  313:  num_mounted_devices = 0u;
+        -:  314:  init_mounted_dev_list(1);
+        -:  315:}
+        -:  316:
+        -:  317:
+        -:  318:/* Search for device DEV in the array LIST, which is of size N. */
+        -:  319:static int
+        -:  320:dev_present(dev_t dev, const dev_t *list, size_t n)
+        -:  321:{
+        -:  322:  if (list)
+        -:  323:    {
+        -:  324:      while (n-- > 0u)
+        -:  325:	{
+        -:  326:	  if ( (*list++) == dev )
+        -:  327:	    return 1;
+        -:  328:	}
+        -:  329:    }
+        -:  330:  return 0;
+        -:  331:}
+        -:  332:
+        -:  333:enum MountPointStateChange
+        -:  334:  {
+        -:  335:    MountPointRecentlyMounted,
+        -:  336:    MountPointRecentlyUnmounted,
+        -:  337:    MountPointStateUnchanged
+        -:  338:  };
+        -:  339:
+        -:  340:
+        -:  341:
+        -:  342:static enum MountPointStateChange
+        -:  343:get_mount_state(dev_t newdev)
+        -:  344:{
+        -:  345:  int new_is_present, new_was_present;
+        -:  346:  
+        -:  347:  new_was_present = dev_present(newdev, mounted_devices, num_mounted_devices);
+        -:  348:  refresh_mounted_dev_list();
+        -:  349:  new_is_present  = dev_present(newdev, mounted_devices, num_mounted_devices);
+        -:  350:  
+        -:  351:  if (new_was_present == new_is_present)
+        -:  352:    return MountPointStateUnchanged;
+        -:  353:  else if (new_is_present)
+        -:  354:    return MountPointRecentlyMounted;
+        -:  355:  else
+        -:  356:    return MountPointRecentlyUnmounted;
+        -:  357:}
+        -:  358:
+        -:  359:
+        -:  360:
+        -:  361:/* We stat()ed a directory, chdir()ed into it (we know this 
+        -:  362: * since direction is TraversingDown), stat()ed it again,
+        -:  363: * and noticed that the device numbers are different.  Check
+        -:  364: * if the filesystem was recently mounted. 
+        -:  365: * 
+        -:  366: * If it was, it looks like chdir()ing into the directory
+        -:  367: * caused a filesystem to be mounted.  Maybe automount is
+        -:  368: * running.  Anyway, that's probably OK - but it happens
+        -:  369: * only when we are moving downward.
+        -:  370: *
+        -:  371: * We also allow for the possibility that a similar thing
+        -:  372: * has happened with the unmounting of a filesystem.  This
+        -:  373: * is much rarer, as it relies on an automounter timeout
+        -:  374: * occurring at exactly the wrong moment.
+        -:  375: */
+        -:  376:static enum WdSanityCheckFatality
+        -:  377:dirchange_is_fatal(const char *specific_what,
+        -:  378:		   enum WdSanityCheckFatality isfatal,
+        -:  379:		   int silent,
+        -:  380:		   struct stat *newinfo)
+        -:  381:{
+        -:  382:  enum MountPointStateChange transition = get_mount_state(newinfo->st_dev);
+        -:  383:  switch (transition)
+        -:  384:    {
+        -:  385:    case MountPointRecentlyUnmounted:
+        -:  386:      isfatal = NON_FATAL_IF_SANITY_CHECK_FAILS;
+        -:  387:      if (!silent)
+        -:  388:	{
+        -:  389:	  error (0, 0,
+        -:  390:		 _("Warning: filesystem %s has recently been unmounted."),
+        -:  391:		 specific_what);
+        -:  392:	}
+        -:  393:      break;
+        -:  394:	      
+        -:  395:    case MountPointRecentlyMounted:
+        -:  396:      isfatal = NON_FATAL_IF_SANITY_CHECK_FAILS;
+        -:  397:      if (!silent)
+        -:  398:	{
+        -:  399:	  error (0, 0,
+        -:  400:		 _("Warning: filesystem %s has recently been mounted."),
+        -:  401:		 specific_what);
+        -:  402:	}
+        -:  403:      break;
+        -:  404:
+        -:  405:    case MountPointStateUnchanged:
+        -:  406:      /* leave isfatal as it is */
+        -:  407:      break;
+        -:  408:    }
+        -:  409:  
+        -:  410:  return isfatal;
+        -:  411:}
+        -:  412:
+        -:  413:
+        -:  414:#endif
+        -:  415:
+        -:  416:
+        -:  417:
+        -:  418:/* Examine the results of the stat() of a directory from before we
+        -:  419: * entered or left it, with the results of stat()ing it afterward.  If
+        -:  420: * these are different, the filesystem tree has been modified while we
+        -:  421: * were traversing it.  That might be an attempt to use a race
+        -:  422: * condition to persuade find to do something it didn't intend
+        -:  423: * (e.g. an attempt by an ordinary user to exploit the fact that root
+        -:  424: * sometimes runs find on the whole filesystem).  However, this can
+        -:  425: * also happen if automount is running (certainly on Solaris).  With 
+        -:  426: * automount, moving into a directory can cause a filesystem to be 
+        -:  427: * mounted there.
+        -:  428: *
+        -:  429: * To cope sensibly with this, we will raise an error if we see the
+        -:  430: * device number change unless we are chdir()ing into a subdirectory,
+        -:  431: * and the directory we moved into has been mounted or unmounted "recently".  
+        -:  432: * Here "recently" means since we started "find" or we last re-read 
+        -:  433: * the /etc/mnttab file. 
+        -:  434: *
+        -:  435: * If the device number does not change but the inode does, that is a
+        -:  436: * problem.
+        -:  437: *
+        -:  438: * If the device number and inode are both the same, we are happy.
+        -:  439: *
+        -:  440: * If a filesystem is (un)mounted as we chdir() into the directory, that 
+        -:  441: * may mean that we're now examining a section of the filesystem that might 
+        -:  442: * have been excluded from consideration (via -prune or -quit for example).
+        -:  443: * Hence we print a warning message to indicate that the output of find 
+        -:  444: * might be inconsistent due to the change in the filesystem.
+        -:  445: */
+        -:  446:static boolean
+    #####:  447:wd_sanity_check(const char *thing_to_stat,
+        -:  448:		const char *progname,
+        -:  449:		const char *what,
+        -:  450:		dev_t old_dev,
+        -:  451:		ino_t old_ino,
+        -:  452:		struct stat *newinfo,
+        -:  453:		int parent,
+        -:  454:		int line_no,
+        -:  455:		enum TraversalDirection direction,
+        -:  456:		enum WdSanityCheckFatality isfatal,
+        -:  457:		boolean *changed) /* output parameter */
+        -:  458:{
+        -:  459:  const char *fstype;
+    #####:  460:  char *specific_what = NULL;
+    #####:  461:  int silent = 0;
+    #####:  462:  const char *current_dir = ".";
+        -:  463:  
+    #####:  464:  *changed = false;
+        -:  465:  
+    #####:  466:  set_stat_placeholders(newinfo);
+    #####:  467:  if ((*options.xstat) (current_dir, newinfo) != 0)
+    #####:  468:    error (1, errno, "%s", thing_to_stat);
+        -:  469:  
+    #####:  470:  if (old_dev != newinfo->st_dev)
+        -:  471:    {
+    #####:  472:      *changed = true;
+    #####:  473:      specific_what = specific_dirname(what);
+    #####:  474:      fstype = filesystem_type(newinfo, current_dir);
+    #####:  475:      silent = fs_likely_to_be_automounted(fstype);
+        -:  476:
+        -:  477:      /* This condition is rare, so once we are here it is 
+        -:  478:       * reasonable to perform an expensive computation to 
+        -:  479:       * determine if we should continue or fail. 
+        -:  480:       */
+    #####:  481:      if (TraversingDown == direction)
+        -:  482:	{
+        -:  483:#ifdef STAT_MOUNTPOINTS
+        -:  484:	  isfatal = dirchange_is_fatal(specific_what,isfatal,silent,newinfo);
+        -:  485:#else
+    #####:  486:	  isfatal = RETRY_IF_SANITY_CHECK_FAILS;
+        -:  487:#endif
+        -:  488:	}
+        -:  489:
+    #####:  490:      switch (isfatal)
+        -:  491:	{
+        -:  492:	case FATAL_IF_SANITY_CHECK_FAILS:
+        -:  493:	  {
+    #####:  494:	    fstype = filesystem_type(newinfo, current_dir);
+    #####:  495:	    error (1, 0,
+        -:  496:		   _("%s%s changed during execution of %s (old device number %ld, new device number %ld, filesystem type is %s) [ref %ld]"),
+        -:  497:		   specific_what,
+        -:  498:		   parent ? "/.." : "",
+        -:  499:		   progname,
+        -:  500:		   (long) old_dev,
+    #####:  501:		   (long) newinfo->st_dev,
+        -:  502:		   fstype,
+        -:  503:		   line_no);
+        -:  504:	    /*NOTREACHED*/
+    #####:  505:	    return false;
+        -:  506:	  }
+        -:  507:	  
+        -:  508:	case NON_FATAL_IF_SANITY_CHECK_FAILS:
+        -:  509:	  {
+        -:  510:	    /* Since the device has changed under us, the inode number 
+        -:  511:	     * will almost certainly also be different. However, we have 
+        -:  512:	     * already decided that this is not a problem.  Hence we return
+        -:  513:	     * without checking the inode number.
+        -:  514:	     */
+    #####:  515:	    free(specific_what);
+    #####:  516:	    return true;
+        -:  517:	  }
+        -:  518:
+        -:  519:	case RETRY_IF_SANITY_CHECK_FAILS:
+    #####:  520:	  return false;
+        -:  521:	}
+        -:  522:    }
+        -:  523:
+        -:  524:  /* Device number was the same, check if the inode has changed. */
+    #####:  525:  if (old_ino != newinfo->st_ino)
+        -:  526:    {
+    #####:  527:      *changed = true;
+    #####:  528:      specific_what = specific_dirname(what);
+    #####:  529:      fstype = filesystem_type(newinfo, current_dir);
+        -:  530:      
+    #####:  531:      error ((isfatal == FATAL_IF_SANITY_CHECK_FAILS) ? 1 : 0,
+        -:  532:	     0,			/* no relevant errno value */
+        -:  533:	     _("%s%s changed during execution of %s (old inode number %ld, new inode number %ld, filesystem type is %s) [ref %ld]"),
+        -:  534:	     specific_what, 
+        -:  535:	     parent ? "/.." : "",
+        -:  536:	     progname,
+        -:  537:	     (long) old_ino,
+    #####:  538:	     (long) newinfo->st_ino,
+        -:  539:	     fstype,
+        -:  540:	     line_no);
+    #####:  541:      free(specific_what);
+    #####:  542:      return false;
+        -:  543:    }
+        -:  544:  
+    #####:  545:  return true;
+        -:  546:}
+        -:  547:
+        -:  548:enum SafeChdirStatus
+        -:  549:  {
+        -:  550:    SafeChdirOK,
+        -:  551:    SafeChdirFailSymlink,
+        -:  552:    SafeChdirFailNotDir,
+        -:  553:    SafeChdirFailStat,
+        -:  554:    SafeChdirFailWouldBeUnableToReturn,
+        -:  555:    SafeChdirFailChdirFailed,
+        -:  556:    SafeChdirFailNonexistent,
+        -:  557:    SafeChdirFailDestUnreadable
+        -:  558:  };
+        -:  559:
+        -:  560:/* Safely perform a change in directory.  We do this by calling
+        -:  561: * lstat() on the subdirectory, using chdir() to move into it, and
+        -:  562: * then lstat()ing ".".  We compare the results of the two stat calls
+        -:  563: * to see if they are consistent.  If not, we sound the alarm.
+        -:  564: *
+        -:  565: * If following_links() is true, we do follow symbolic links.
+        -:  566: */
+        -:  567:static enum SafeChdirStatus
+    #####:  568:safely_chdir_lstat(const char *dest,
+        -:  569:		   enum TraversalDirection direction,
+        -:  570:		   struct stat *statbuf_dest,
+        -:  571:		   enum ChdirSymlinkHandling symlink_follow_option,
+        -:  572:		   boolean *did_stat)
+        -:  573:{
+        -:  574:  struct stat statbuf_arrived;
+    #####:  575:  int rv, dotfd=-1;
+        -:  576:  int saved_errno;		/* specific_dirname() changes errno. */
+    #####:  577:  boolean rv_set = false;
+    #####:  578:  boolean statflag = false;
+    #####:  579:  int tries = 0;
+    #####:  580:  enum WdSanityCheckFatality isfatal = RETRY_IF_SANITY_CHECK_FAILS;
+        -:  581:  
+    #####:  582:  saved_errno = errno = 0;
+        -:  583:
+    #####:  584:  dotfd = open(".", O_RDONLY
+        -:  585:#if defined O_LARGEFILE
+        -:  586:	       |O_LARGEFILE
+        -:  587:#endif
+        -:  588:	       );
+        -:  589:
+        -:  590:  /* We jump back to here if wd_sanity_check()
+        -:  591:   * recoverably triggers an alert.
+        -:  592:   */
+        -:  593: retry:
+    #####:  594:  ++tries;
+        -:  595:  
+    #####:  596:  if (dotfd >= 0)
+        -:  597:    {
+        -:  598:      /* Stat the directory we're going to. */
+    #####:  599:      set_stat_placeholders(statbuf_dest);
+    #####:  600:      if (0 == options.xstat(dest, statbuf_dest))
+        -:  601:	{
+    #####:  602:	  statflag = true;
+        -:  603:	  
+        -:  604:#ifdef S_ISLNK
+        -:  605:	  /* symlink_follow_option might be set to SymlinkFollowOk, which
+        -:  606:	   * would allow us to chdir() into a symbolic link.  This is
+        -:  607:	   * only useful for the case where the directory we're
+        -:  608:	   * chdir()ing into is the basename of a command line
+        -:  609:	   * argument, for example where "foo/bar/baz" is specified on
+        -:  610:	   * the command line.  When -P is in effect (the default),
+        -:  611:	   * baz will not be followed if it is a symlink, but if bar
+        -:  612:	   * is a symlink, it _should_ be followed.  Hence we need the
+        -:  613:	   * ability to override the policy set by following_links().
+        -:  614:	   */
+    #####:  615:	  if (!following_links() && S_ISLNK(statbuf_dest->st_mode))
+        -:  616:	    {
+        -:  617:	      /* We're not supposed to be following links, but this is 
+        -:  618:	       * a link.  Check symlink_follow_option to see if we should 
+        -:  619:	       * make a special exception.
+        -:  620:	       */
+    #####:  621:	      if (symlink_follow_option == SymlinkFollowOk)
+        -:  622:		{
+        -:  623:		  /* We need to re-stat() the file so that the 
+        -:  624:		   * sanity check can pass. 
+        -:  625:		   */
+    #####:  626:		  if (0 != stat(dest, statbuf_dest))
+        -:  627:		    {
+    #####:  628:		      rv = SafeChdirFailNonexistent;
+    #####:  629:		      rv_set = true;
+    #####:  630:		      saved_errno = errno;
+    #####:  631:		      goto fail;
+        -:  632:		    }
+    #####:  633:		  statflag = true;
+        -:  634:		}
+        -:  635:	      else
+        -:  636:		{
+        -:  637:		  /* Not following symlinks, so the attempt to
+        -:  638:		   * chdir() into a symlink should be prevented.
+        -:  639:		   */
+    #####:  640:		  rv = SafeChdirFailSymlink;
+    #####:  641:		  rv_set = true;
+    #####:  642:		  saved_errno = 0;	/* silence the error message */
+    #####:  643:		  goto fail;
+        -:  644:		}
+        -:  645:	    }
+        -:  646:#endif	  
+        -:  647:#ifdef S_ISDIR
+        -:  648:	  /* Although the immediately following chdir() would detect
+        -:  649:	   * the fact that this is not a directory for us, this would
+        -:  650:	   * result in an extra system call that fails.  Anybody
+        -:  651:	   * examining the system-call trace should ideally not be
+        -:  652:	   * concerned that something is actually failing.
+        -:  653:	   */
+    #####:  654:	  if (!S_ISDIR(statbuf_dest->st_mode))
+        -:  655:	    {
+    #####:  656:	      rv = SafeChdirFailNotDir;
+    #####:  657:	      rv_set = true;
+    #####:  658:	      saved_errno = 0;	/* silence the error message */
+    #####:  659:	      goto fail;
+        -:  660:	    }
+        -:  661:#endif
+        -:  662:	  
+    #####:  663:	  if (options.debug_options & DebugSearch)
+    #####:  664:	    fprintf(stderr, "safely_chdir(): chdir(\"%s\")\n", dest);
+        -:  665:
+    #####:  666:	  if (0 == chdir(dest))
+        -:  667:	    {
+        -:  668:	      /* check we ended up where we wanted to go */
+    #####:  669:	      boolean changed = false;
+    #####:  670:	      if (!wd_sanity_check(".", program_name, ".",
+        -:  671:				   statbuf_dest->st_dev,
+        -:  672:				   statbuf_dest->st_ino,
+        -:  673:				   &statbuf_arrived, 
+        -:  674:				   0, __LINE__, direction,
+        -:  675:				   isfatal,
+        -:  676:				   &changed))
+        -:  677:		{
+        -:  678:		  /* Only allow one failure. */
+    #####:  679:		  if (RETRY_IF_SANITY_CHECK_FAILS == isfatal)
+        -:  680:		    {
+    #####:  681:		      if (0 == fchdir(dotfd))
+        -:  682:			{
+    #####:  683:			  isfatal = FATAL_IF_SANITY_CHECK_FAILS;
+    #####:  684:			  goto retry;
+        -:  685:			}
+        -:  686:		      else
+        -:  687:			{
+        -:  688:			  /* Failed to return to original directory,
+        -:  689:			   * but we know that the current working
+        -:  690:			   * directory is not the one that we intend
+        -:  691:			   * to be in.  Since fchdir() failed, we
+        -:  692:			   * can't recover from this and so this error
+        -:  693:			   * is fatal.
+        -:  694:			   */
+    #####:  695:			  error(1, errno,
+        -:  696:				"failed to return to parent directory");
+        -:  697:			}
+        -:  698:		    }
+        -:  699:		  else
+        -:  700:		    {
+        -:  701:		      /* XXX: not sure what to use as an excuse here. */
+    #####:  702:		      rv = SafeChdirFailNonexistent;
+    #####:  703:		      rv_set = true;
+    #####:  704:		      saved_errno = 0;
+    #####:  705:		      goto fail;
+        -:  706:		    }
+        -:  707:		}
+        -:  708:
+    #####:  709:	      close(dotfd);
+    #####:  710:	      return SafeChdirOK;
+        -:  711:	    }
+        -:  712:	  else
+        -:  713:	    {
+    #####:  714:	      saved_errno = errno;
+    #####:  715:	      if (ENOENT == saved_errno)
+        -:  716:		{
+    #####:  717:		  rv = SafeChdirFailNonexistent;
+    #####:  718:		  rv_set = true;
+    #####:  719:		  if (options.ignore_readdir_race)
+    #####:  720:		    errno = 0;	/* don't issue err msg */
+        -:  721:		}
+    #####:  722:	      else if (ENOTDIR == saved_errno)
+        -:  723:		{
+        -:  724:		  /* This can happen if the we stat a directory,
+        -:  725:		   * and then filesystem activity changes it into 
+        -:  726:		   * a non-directory.
+        -:  727:		   */
+    #####:  728:		  saved_errno = 0;	/* don't issue err msg */
+    #####:  729:		  rv = SafeChdirFailNotDir;
+    #####:  730:		  rv_set = true;
+        -:  731:		}
+        -:  732:	      else
+        -:  733:		{
+    #####:  734:		  rv = SafeChdirFailChdirFailed;
+    #####:  735:		  rv_set = true;
+        -:  736:		}
+    #####:  737:	      goto fail;
+        -:  738:	    }
+        -:  739:	}
+        -:  740:      else
+        -:  741:	{
+    #####:  742:	  saved_errno = errno;
+    #####:  743:	  rv = SafeChdirFailStat;
+    #####:  744:	  rv_set = true;
+        -:  745:
+    #####:  746:	  if ( (ENOENT == saved_errno) || (0 == state.curdepth))
+    #####:  747:	    saved_errno = 0;	/* don't issue err msg */
+    #####:  748:	  goto fail;
+        -:  749:	}
+        -:  750:    }
+        -:  751:  else
+        -:  752:    {
+        -:  753:      /* We do not have read permissions on "." */
+    #####:  754:      rv = SafeChdirFailWouldBeUnableToReturn;
+    #####:  755:      rv_set = true;
+    #####:  756:      goto fail;
+        -:  757:    }
+        -:  758:
+        -:  759:  /* This is the success path, so we clear errno.  The caller probably
+        -:  760:   * won't be calling error() anyway.
+        -:  761:   */
+        -:  762:  saved_errno = 0;
+        -:  763:  
+        -:  764:  /* We use the same exit path for success or failure. 
+        -:  765:   * which has occurred is recorded in RV. 
+        -:  766:   */
+        -:  767: fail:
+        -:  768:  /* We do not call error() as this would result in a duplicate error
+        -:  769:   * message when the caller does the same thing.
+        -:  770:   */
+    #####:  771:  if (saved_errno)
+    #####:  772:    errno = saved_errno;
+        -:  773:  
+    #####:  774:  if (dotfd >= 0)
+        -:  775:    {
+    #####:  776:      close(dotfd);
+    #####:  777:      dotfd = -1;
+        -:  778:    }
+        -:  779:  
+    #####:  780:  *did_stat = statflag;
+    #####:  781:  assert(rv_set);
+    #####:  782:  return rv;
+        -:  783:}
+        -:  784:
+        -:  785:#if defined(O_NOFOLLOW)
+        -:  786:/* Safely change working directory to the specified subdirectory.  If
+        -:  787: * we are not allowed to follow symbolic links, we use open() with
+        -:  788: * O_NOFOLLOW, followed by fchdir().  This ensures that we don't
+        -:  789: * follow symbolic links (of course, we do follow them if the -L
+        -:  790: * option is in effect).
+        -:  791: */
+        -:  792:static enum SafeChdirStatus
+        8:  793:safely_chdir_nofollow(const char *dest,
+        -:  794:		      enum TraversalDirection direction,
+        -:  795:		      struct stat *statbuf_dest,
+        -:  796:		      enum ChdirSymlinkHandling symlink_follow_option,
+        -:  797:		      boolean *did_stat)
+        -:  798:{
+        -:  799:  int extraflags, fd;
+        -:  800:
+        -:  801:  (void) direction;
+        -:  802:  (void) statbuf_dest;
+        -:  803:  
+        8:  804:  extraflags = 0;
+        8:  805:  *did_stat = false;
+        -:  806:  
+        8:  807:  switch (symlink_follow_option)
+        -:  808:    {
+        -:  809:    case SymlinkFollowOk:
+    #####:  810:      extraflags = 0;
+    #####:  811:      break;
+        -:  812:      
+        -:  813:    case SymlinkHandleDefault:
+        8:  814:      if (following_links())
+        8:  815:	extraflags = 0;
+        -:  816:      else
+    #####:  817:	extraflags = O_NOFOLLOW;
+        8:  818:      break;
+        -:  819:    }
+        -:  820:  
+        8:  821:  errno = 0;
+        8:  822:  fd = open(dest, O_RDONLY
+        -:  823:#if defined O_LARGEFILE
+        -:  824:	    |O_LARGEFILE
+        -:  825:#endif
+        -:  826:	    |extraflags);
+        8:  827:  if (fd < 0)
+        -:  828:    {
+    #####:  829:      switch (errno)
+        -:  830:	{
+        -:  831:	case ELOOP:
+    #####:  832:	  return SafeChdirFailSymlink; /* This is why we use O_NOFOLLOW */
+        -:  833:	case ENOENT:
+    #####:  834:	  return SafeChdirFailNonexistent;
+        -:  835:	default:
+    #####:  836:	  return SafeChdirFailDestUnreadable;
+        -:  837:	}
+        -:  838:    }
+        -:  839:  
+        8:  840:  errno = 0;
+        8:  841:  if (0 == fchdir(fd))
+        -:  842:    {
+        8:  843:      close(fd);
+        8:  844:      return SafeChdirOK;
+        -:  845:    }
+        -:  846:  else
+        -:  847:    {
+    #####:  848:      int saved_errno = errno;
+    #####:  849:      close(fd);
+    #####:  850:      errno = saved_errno;
+        -:  851:      
+    #####:  852:      switch (errno)
+        -:  853:	{
+        -:  854:	case ENOTDIR:
+    #####:  855:	  return SafeChdirFailNotDir;
+        -:  856:	  
+        -:  857:	case EACCES:
+        -:  858:	case EBADF:		/* Shouldn't happen */
+        -:  859:	case EINTR:
+        -:  860:	case EIO:
+        -:  861:	default:
+    #####:  862:	  return SafeChdirFailChdirFailed;
+        -:  863:	}
+        -:  864:    }
+        -:  865:}
+        -:  866:#endif
+        -:  867:
+        -:  868:static enum SafeChdirStatus
+        8:  869:safely_chdir(const char *dest,
+        -:  870:	     enum TraversalDirection direction,
+        -:  871:	     struct stat *statbuf_dest,
+        -:  872:	     enum ChdirSymlinkHandling symlink_follow_option,
+        -:  873:	     boolean *did_stat)
+        -:  874:{
+        -:  875:  enum SafeChdirStatus result;
+        -:  876:  
+        -:  877:  /* We're about to leave a directory.  If there are any -execdir
+        -:  878:   * argument lists which have been built but have not yet been
+        -:  879:   * processed, do them now because they must be done in the same
+        -:  880:   * directory.
+        -:  881:   */
+        8:  882:  complete_pending_execdirs(get_current_dirfd());
+        -:  883:
+        -:  884:#if !defined(O_NOFOLLOW)
+        -:  885:  options.open_nofollow_available = false;
+        -:  886:#endif
+        8:  887:  if (options.open_nofollow_available)
+        8:  888:    result = safely_chdir_nofollow(dest, direction, statbuf_dest, symlink_follow_option, did_stat);
+        -:  889:  else
+    #####:  890:    result = safely_chdir_lstat(dest, direction, statbuf_dest, symlink_follow_option, did_stat);
+        8:  891:  return result;
+        -:  892:}
+        -:  893:
+        -:  894:
+        -:  895:
+        -:  896:/* Safely go back to the starting directory. */
+        -:  897:static void
+        4:  898:chdir_back (void)
+        -:  899:{
+        -:  900:  struct stat stat_buf;
+        -:  901:  boolean dummy;
+        -:  902:  
+        4:  903:  if (starting_desc < 0)
+        -:  904:    {
+    #####:  905:      if (options.debug_options & DebugSearch)
+    #####:  906:	fprintf(stderr, "chdir_back(): chdir(\"%s\")\n", starting_dir);
+        -:  907:      
+        -:  908:#ifdef STAT_MOUNTPOINTS
+        -:  909:      /* We will need the mounted device list.  Get it now if we don't
+        -:  910:       * already have it.
+        -:  911:       */
+        -:  912:      if (NULL == mounted_devices)
+        -:  913:	init_mounted_dev_list(1);
+        -:  914:#endif
+        -:  915:      
+    #####:  916:      if (chdir (starting_dir) != 0)
+    #####:  917:	error (1, errno, "%s", starting_dir);
+        -:  918:
+    #####:  919:      wd_sanity_check(starting_dir,
+        -:  920:		      program_name,
+        -:  921:		      starting_dir,
+        -:  922:		      starting_stat_buf.st_dev,
+        -:  923:		      starting_stat_buf.st_ino,
+        -:  924:		      &stat_buf, 0, __LINE__,
+        -:  925:		      TraversingUp,
+        -:  926:		      FATAL_IF_SANITY_CHECK_FAILS,
+        -:  927:		      &dummy);
+        -:  928:    }
+        -:  929:  else
+        -:  930:    {
+        4:  931:      if (options.debug_options & DebugSearch)
+    #####:  932:	fprintf(stderr, "chdir_back(): chdir(<starting-point>)\n");
+        -:  933:
+        4:  934:      if (fchdir (starting_desc) != 0)
+        -:  935:	{
+    #####:  936:	  error (1, errno, "%s", starting_dir);
+        -:  937:	}
+        -:  938:    }
+        4:  939:}
+        -:  940:
+        -:  941:/* Move to the parent of a given directory and then call a function,
+        -:  942: * restoring the cwd.  Don't bother changing directory if the
+        -:  943: * specified directory is a child of "." or is the root directory.
+        -:  944: */
+        -:  945:static void
+        4:  946:at_top (char *pathname,
+        -:  947:	mode_t mode,
+        -:  948:	struct stat *pstat,
+        -:  949:	void (*action)(char *pathname,
+        -:  950:		       char *basename,
+        -:  951:		       int mode,
+        -:  952:		       struct stat *pstat))
+        -:  953:{
+        -:  954:  int dirchange;
+        4:  955:  char *parent_dir = dir_name(pathname);
+        4:  956:  char *base = base_name(pathname);
+        -:  957:  
+        4:  958:  state.curdepth = 0;
+        4:  959:  state.starting_path_length = strlen (pathname);
+        -:  960:
+        4:  961:  if (0 == strcmp(pathname, parent_dir)
+        4:  962:      || 0 == strcmp(parent_dir, "."))
+        -:  963:    {
+        4:  964:      dirchange = 0;
+        4:  965:      base = pathname;
+        -:  966:    }
+        -:  967:  else
+        -:  968:    {
+        -:  969:      enum TraversalDirection direction;
+        -:  970:      enum SafeChdirStatus chdir_status;
+        -:  971:      struct stat st;
+    #####:  972:      boolean did_stat = false;
+        -:  973:      
+    #####:  974:      dirchange = 1;
+    #####:  975:      if (0 == strcmp(base, ".."))
+    #####:  976:	direction = TraversingUp;
+        -:  977:      else
+    #####:  978:	direction = TraversingDown;
+        -:  979:
+        -:  980:      /* We pass SymlinkFollowOk to safely_chdir(), which allows it to
+        -:  981:       * chdir() into a symbolic link.  This is only useful for the
+        -:  982:       * case where the directory we're chdir()ing into is the
+        -:  983:       * basename of a command line argument, for example where
+        -:  984:       * "foo/bar/baz" is specified on the command line.  When -P is
+        -:  985:       * in effect (the default), baz will not be followed if it is a
+        -:  986:       * symlink, but if bar is a symlink, it _should_ be followed.
+        -:  987:       * Hence we need the ability to override the policy set by
+        -:  988:       * following_links().
+        -:  989:       */
+    #####:  990:      chdir_status = safely_chdir(parent_dir, direction, &st, SymlinkFollowOk, &did_stat);
+    #####:  991:      if (SafeChdirOK != chdir_status)
+        -:  992:	{
+    #####:  993:	  const char *what = (SafeChdirFailWouldBeUnableToReturn == chdir_status) ? "." : parent_dir;
+    #####:  994:	  if (errno)
+    #####:  995:	    error (0, errno, "%s", what);
+        -:  996:	  else
+    #####:  997:	    error (0, 0, "Failed to safely change directory into `%s'",
+        -:  998:		   parent_dir);
+        -:  999:	    
+        -: 1000:	  /* We can't process this command-line argument. */
+    #####: 1001:	  state.exit_status = 1;
+        4: 1002:	  return;
+        -: 1003:	}
+        -: 1004:    }
+        -: 1005:
+        4: 1006:  free (parent_dir);
+        4: 1007:  parent_dir = NULL;
+        -: 1008:  
+        4: 1009:  action(pathname, base, mode, pstat);
+        -: 1010:  
+        4: 1011:  if (dirchange)
+        -: 1012:    {
+    #####: 1013:      chdir_back();
+        -: 1014:    }
+        -: 1015:}
+        -: 1016:
+        -: 1017:
+        4: 1018:static void do_process_top_dir(char *pathname,
+        -: 1019:			       char *base,
+        -: 1020:			       int mode,
+        -: 1021:			       struct stat *pstat)
+        -: 1022:{
+        -: 1023:  (void) pstat;
+        -: 1024:  
+        4: 1025:  process_path (pathname, base, false, ".", mode);
+        4: 1026:  complete_pending_execdirs(get_current_dirfd());
+        4: 1027:}
+        -: 1028:
+    #####: 1029:static void do_process_predicate(char *pathname,
+        -: 1030:				 char *base,
+        -: 1031:				 int mode,
+        -: 1032:				 struct stat *pstat)
+        -: 1033:{
+        -: 1034:  (void) mode;
+        -: 1035:  
+    #####: 1036:  state.rel_pathname = base;	/* cwd_dir_fd was already set by safely_chdir */
+    #####: 1037:  apply_predicate (pathname, pstat, get_eval_tree());
+    #####: 1038:}
+        -: 1039:
+        -: 1040:
+        -: 1041:
+        -: 1042:
+        -: 1043:/* Descend PATHNAME, which is a command-line argument.  
+        -: 1044:
+        -: 1045:   Actions like -execdir assume that we are in the 
+        -: 1046:   parent directory of the file we're examining, 
+        -: 1047:   and on entry to this function our working directory
+        -: 1048:   is whatever it was when find was invoked.  Therefore
+        -: 1049:   If PATHNAME is "." we just leave things as they are. 
+        -: 1050:   Otherwise, we figure out what the parent directory is, 
+        -: 1051:   and move to that.
+        -: 1052:*/
+        -: 1053:static void
+        4: 1054:process_top_path (char *pathname, mode_t mode)
+        -: 1055:{
+        4: 1056:  at_top(pathname, mode, NULL, do_process_top_dir);
+        4: 1057:}
+        -: 1058:
+        -: 1059:
+        -: 1060:/* Info on each directory in the current tree branch, to avoid
+        -: 1061:   getting stuck in symbolic link loops.  */
+        -: 1062:static struct dir_id *dir_ids = NULL;
+        -: 1063:/* Entries allocated in `dir_ids'.  */
+        -: 1064:static int dir_alloc = 0;
+        -: 1065:/* Index in `dir_ids' of directory currently being searched.
+        -: 1066:   This is always the last valid entry.  */
+        -: 1067:static int dir_curr = -1;
+        -: 1068:/* (Arbitrary) number of entries to grow `dir_ids' by.  */
+        -: 1069:#define DIR_ALLOC_STEP 32
+        -: 1070:
+        -: 1071:
+        -: 1072:
+        -: 1073:/* We've detected a filesystem loop.   This is caused by one of 
+        -: 1074: * two things:
+        -: 1075: *
+        -: 1076: * 1. Option -L is in effect and we've hit a symbolic link that 
+        -: 1077: *    points to an ancestor.  This is harmless.  We won't traverse the 
+        -: 1078: *    symbolic link.
+        -: 1079: *
+        -: 1080: * 2. We have hit a real cycle in the directory hierarchy.  In this 
+        -: 1081: *    case, we issue a diagnostic message (POSIX requires this) and we
+        -: 1082: *    skip that directory entry.
+        -: 1083: */
+        -: 1084:static void
+    #####: 1085:issue_loop_warning(const char *name, const char *pathname, int level)
+        -: 1086:{
+        -: 1087:  struct stat stbuf_link;
+    #####: 1088:  if (lstat(name, &stbuf_link) != 0)
+    #####: 1089:    stbuf_link.st_mode = S_IFREG;
+        -: 1090:  
+    #####: 1091:  if (S_ISLNK(stbuf_link.st_mode))
+        -: 1092:    {
+    #####: 1093:      error(0, 0,
+        -: 1094:	    _("Symbolic link `%s' is part of a loop in the directory hierarchy; we have already visited the directory to which it points."),
+        -: 1095:	    pathname);
+        -: 1096:    }
+        -: 1097:  else
+        -: 1098:    {
+    #####: 1099:      int distance = 1 + (dir_curr-level);
+        -: 1100:      /* We have found an infinite loop.  POSIX requires us to
+        -: 1101:       * issue a diagnostic.  Usually we won't get to here
+        -: 1102:       * because when the leaf optimisation is on, it will cause
+        -: 1103:       * the subdirectory to be skipped.  If /a/b/c/d is a hard
+        -: 1104:       * link to /a/b, then the link count of /a/b/c is 2,
+        -: 1105:       * because the ".." entry of /b/b/c/d points to /a, not
+        -: 1106:       * to /a/b/c.
+        -: 1107:       */
+    #####: 1108:      error(0, 0,
+        -: 1109:	    _("Filesystem loop detected; `%s' has the same device number and inode as a directory which is %d %s."),
+        -: 1110:	    pathname,
+        -: 1111:	    distance,
+        -: 1112:	    (distance == 1 ?
+        -: 1113:	     _("level higher in the filesystem hierarchy") :
+        -: 1114:	     _("levels higher in the filesystem hierarchy")));
+        -: 1115:    }
+    #####: 1116:}
+        -: 1117:
+        -: 1118:
+        -: 1119:
+        -: 1120:/* Recursively descend path PATHNAME, applying the predicates.
+        -: 1121:   LEAF is true if PATHNAME is known to be in a directory that has no
+        -: 1122:   more unexamined subdirectories, and therefore it is not a directory.
+        -: 1123:   Knowing this allows us to avoid calling stat as long as possible for
+        -: 1124:   leaf files.
+        -: 1125:
+        -: 1126:   NAME is PATHNAME relative to the current directory.  We access NAME
+        -: 1127:   but print PATHNAME.
+        -: 1128:
+        -: 1129:   PARENT is the path of the parent of NAME, relative to find's
+        -: 1130:   starting directory.
+        -: 1131:
+        -: 1132:   Return nonzero iff PATHNAME is a directory. */
+        -: 1133:
+        -: 1134:static int
+        4: 1135:process_path (char *pathname, char *name, boolean leaf, char *parent,
+        -: 1136:	      mode_t mode)
+        -: 1137:{
+        -: 1138:  struct stat stat_buf;
+        -: 1139:  static dev_t root_dev;	/* Device ID of current argument pathname. */
+        -: 1140:  int i;
+        -: 1141:  struct predicate *eval_tree;
+        -: 1142:
+        4: 1143:  eval_tree = get_eval_tree();
+        -: 1144:  /* Assume it is a non-directory initially. */
+        4: 1145:  stat_buf.st_mode = 0;
+        4: 1146:  state.rel_pathname = name;
+        4: 1147:  state.type = 0;
+        4: 1148:  state.have_stat = false;
+        4: 1149:  state.have_type = false;
+        -: 1150:
+        4: 1151:  if (!digest_mode(mode, pathname, name, &stat_buf, leaf))
+    #####: 1152:    return 0;
+        -: 1153:  
+        4: 1154:  if (!S_ISDIR (state.type))
+        -: 1155:    {
+    #####: 1156:      if (state.curdepth >= options.mindepth)
+    #####: 1157:	apply_predicate (pathname, &stat_buf, eval_tree);
+    #####: 1158:      return 0;
+        -: 1159:    }
+        -: 1160:
+        -: 1161:  /* From here on, we're working on a directory.  */
+        -: 1162:
+        -: 1163:  
+        -: 1164:  /* Now we really need to stat the directory, even if we know the
+        -: 1165:   * type, because we need information like struct stat.st_rdev.
+        -: 1166:   */
+        4: 1167:  if (get_statinfo(pathname, name, &stat_buf) != 0)
+    #####: 1168:    return 0;
+        -: 1169:
+        4: 1170:  state.have_stat = true;
+        4: 1171:  mode = state.type = stat_buf.st_mode;	/* use full info now that we have it. */
+        4: 1172:  state.stop_at_current_level =
+        4: 1173:    options.maxdepth >= 0
+        4: 1174:    && state.curdepth >= options.maxdepth;
+        -: 1175:
+        -: 1176:  /* If we've already seen this directory on this branch,
+        -: 1177:     don't descend it again.  */
+        4: 1178:  for (i = 0; i <= dir_curr; i++)
+    #####: 1179:    if (stat_buf.st_ino == dir_ids[i].ino &&
+    #####: 1180:	stat_buf.st_dev == dir_ids[i].dev)
+        -: 1181:      {
+    #####: 1182:	state.stop_at_current_level = true;
+    #####: 1183:	issue_loop_warning(name, pathname, i);
+        -: 1184:      }
+        -: 1185:  
+        4: 1186:  if (dir_alloc <= ++dir_curr)
+        -: 1187:    {
+        4: 1188:      dir_alloc += DIR_ALLOC_STEP;
+        4: 1189:      dir_ids = (struct dir_id *)
+        4: 1190:	xrealloc ((char *) dir_ids, dir_alloc * sizeof (struct dir_id));
+        -: 1191:    }
+        4: 1192:  dir_ids[dir_curr].ino = stat_buf.st_ino;
+        4: 1193:  dir_ids[dir_curr].dev = stat_buf.st_dev;
+        -: 1194:
+        4: 1195:  if (options.stay_on_filesystem)
+        -: 1196:    {
+    #####: 1197:      if (state.curdepth == 0)
+    #####: 1198:	root_dev = stat_buf.st_dev;
+    #####: 1199:      else if (stat_buf.st_dev != root_dev)
+    #####: 1200:	state.stop_at_current_level = true;
+        -: 1201:    }
+        -: 1202:
+        4: 1203:  if (options.do_dir_first && state.curdepth >= options.mindepth)
+        4: 1204:    apply_predicate (pathname, &stat_buf, eval_tree);
+        -: 1205:
+        4: 1206:  if (options.debug_options & DebugSearch)
+    #####: 1207:    fprintf(stderr, "pathname = %s, stop_at_current_level = %d\n",
+    #####: 1208:	    pathname, state.stop_at_current_level);
+        -: 1209:  
+        4: 1210:  if (state.stop_at_current_level == false)
+        -: 1211:    {
+        -: 1212:      /* Scan directory on disk. */
+        4: 1213:      process_dir (pathname, name, strlen (pathname), &stat_buf, parent);
+        -: 1214:    }
+        -: 1215:
+        4: 1216:  if (options.do_dir_first == false && state.curdepth >= options.mindepth)
+        -: 1217:    {
+        -: 1218:      /* The fields in 'state' are now out of date.  Correct them.
+        -: 1219:       */
+    #####: 1220:      if (!digest_mode(mode, pathname, name, &stat_buf, leaf))
+    #####: 1221:	return 0;
+        -: 1222:
+    #####: 1223:      if (0 == dir_curr)
+        -: 1224:	{
+    #####: 1225:	  at_top(pathname, mode, &stat_buf, do_process_predicate);
+        -: 1226:	}
+        -: 1227:      else
+        -: 1228:	{
+    #####: 1229:	  do_process_predicate(pathname, name, mode, &stat_buf);
+        -: 1230:	}
+        -: 1231:    }
+        -: 1232:
+        4: 1233:  dir_curr--;
+        -: 1234:
+        4: 1235:  return 1;
+        -: 1236:}
+        -: 1237:
+        -: 1238:
+        -: 1239:/* Scan directory PATHNAME and recurse through process_path for each entry.
+        -: 1240:
+        -: 1241:   PATHLEN is the length of PATHNAME.
+        -: 1242:
+        -: 1243:   NAME is PATHNAME relative to the current directory.
+        -: 1244:
+        -: 1245:   STATP is the results of *options.xstat on it.
+        -: 1246:
+        -: 1247:   PARENT is the path of the parent of NAME, relative to find's
+        -: 1248:   starting directory.  */
+        -: 1249:
+        -: 1250:static void
+        4: 1251:process_dir (char *pathname, char *name, int pathlen, const struct stat *statp, char *parent)
+        -: 1252:{
+        -: 1253:  int subdirs_left;		/* Number of unexamined subdirs in PATHNAME. */
+        -: 1254:  boolean subdirs_unreliable;	/* if true, cannot use dir link count as subdir limif (if false, it may STILL be unreliable) */
+        -: 1255:  unsigned int idx;		/* Which entry are we on? */
+        -: 1256:  struct stat stat_buf;
+        4: 1257:  size_t dircount = 0u;
+        -: 1258:  struct savedir_dirinfo *dirinfo;
+        -: 1259:#if 0
+        -: 1260:  printf("process_dir: pathname=%s name=%s statp->st_nlink=%d st_ino=%d\n",
+        -: 1261:	 pathname,
+        -: 1262:	 name,
+        -: 1263:	 (int)statp->st_nlink,
+        -: 1264:	 (int)statp->st_ino);
+        -: 1265:#endif  
+        4: 1266:  if (statp->st_nlink < 2)
+        -: 1267:    {
+    #####: 1268:      subdirs_unreliable = true;
+    #####: 1269:      subdirs_left = 0;
+        -: 1270:    }
+        -: 1271:  else
+        -: 1272:    {
+        4: 1273:      subdirs_unreliable = false; /* not necessarily right */
+        4: 1274:      subdirs_left = statp->st_nlink - 2; /* Account for name and ".". */
+        -: 1275:    }
+        -: 1276:  
+        4: 1277:  errno = 0;
+        4: 1278:  dirinfo = xsavedir(name, 0);
+        -: 1279:
+        -: 1280:  
+        4: 1281:  if (dirinfo == NULL)
+        -: 1282:    {
+    #####: 1283:      assert(errno != 0);
+    #####: 1284:      error (0, errno, "%s", pathname);
+    #####: 1285:      state.exit_status = 1;
+        -: 1286:    }
+        -: 1287:  else
+        -: 1288:    {
+        -: 1289:      register char *namep;	/* Current point in `name_space'. */
+        -: 1290:      char *cur_path;		/* Full path of each file to process. */
+        -: 1291:      char *cur_name;		/* Base name of each file to process. */
+        -: 1292:      unsigned cur_path_size;	/* Bytes allocated for `cur_path'. */
+        -: 1293:      register unsigned file_len; /* Length of each path to process. */
+        -: 1294:      register unsigned pathname_len; /* PATHLEN plus trailing '/'. */
+        4: 1295:      boolean did_stat = false;
+        -: 1296:      
+        4: 1297:      if (pathname[pathlen - 1] == '/')
+    #####: 1298:	pathname_len = pathlen + 1; /* For '\0'; already have '/'. */
+        -: 1299:      else
+        4: 1300:	pathname_len = pathlen + 2; /* For '/' and '\0'. */
+        4: 1301:      cur_path_size = 0;
+        4: 1302:      cur_path = NULL;
+        -: 1303:
+        -: 1304:      /* We're about to leave the directory.  If there are any
+        -: 1305:       * -execdir argument lists which have been built but have not
+        -: 1306:       * yet been processed, do them now because they must be done in
+        -: 1307:       * the same directory.
+        -: 1308:       */
+        4: 1309:      complete_pending_execdirs(get_current_dirfd());
+        -: 1310:      
+        4: 1311:      if (strcmp (name, "."))
+        -: 1312:	{
+        4: 1313:	  enum SafeChdirStatus status = safely_chdir (name, TraversingDown, &stat_buf, SymlinkHandleDefault, &did_stat);
+        4: 1314:	  switch (status)
+        -: 1315:	    {
+        -: 1316:	    case SafeChdirOK:
+        -: 1317:	      /* If there had been a change but wd_sanity_check()
+        -: 1318:	       * accepted it, we need to accept that on the 
+        -: 1319:	       * way back up as well, so modify our record 
+        -: 1320:	       * of what we think we should see later.
+        -: 1321:	       * If there was no change, the assignments are a no-op.
+        -: 1322:	       *
+        -: 1323:	       * However, before performing the assignment, we need to
+        -: 1324:	       * check that we have the stat information.   If O_NOFOLLOW
+        -: 1325:	       * is available, safely_chdir() will not have needed to use 
+        -: 1326:	       * stat(), and so stat_buf will just contain random data.
+        -: 1327:	       */
+        4: 1328:	      if (!did_stat)
+        -: 1329:		{
+        -: 1330:		  /* If there is a link we need to follow it.  Hence 
+        -: 1331:		   * the direct call to stat() not through (options.xstat)
+        -: 1332:		   */
+        4: 1333:		  set_stat_placeholders(&stat_buf);
+        4: 1334:		  if (0 != stat(".", &stat_buf))
+    #####: 1335:		    break;	/* skip the assignment. */
+        -: 1336:		}
+        4: 1337:	      dir_ids[dir_curr].dev = stat_buf.st_dev;
+        4: 1338:	      dir_ids[dir_curr].ino = stat_buf.st_ino;
+        -: 1339:	      
+        4: 1340:	      break;
+        -: 1341:      
+        -: 1342:	    case SafeChdirFailWouldBeUnableToReturn:
+    #####: 1343:	      error (0, errno, ".");
+    #####: 1344:	      state.exit_status = 1;
+    #####: 1345:	      break;
+        -: 1346:	      
+        -: 1347:	    case SafeChdirFailNonexistent:
+        -: 1348:	    case SafeChdirFailDestUnreadable:
+        -: 1349:	    case SafeChdirFailStat:
+        -: 1350:	    case SafeChdirFailNotDir:
+        -: 1351:	    case SafeChdirFailChdirFailed:
+    #####: 1352:	      error (0, errno, "%s", pathname);
+    #####: 1353:	      state.exit_status = 1;
+    #####: 1354:	      return;
+        -: 1355:	      
+        -: 1356:	    case SafeChdirFailSymlink:
+    #####: 1357:	      error (0, 0,
+        -: 1358:		     _("warning: not following the symbolic link %s"),
+        -: 1359:		     pathname);
+    #####: 1360:	      state.exit_status = 1;
+    #####: 1361:	      return;
+        -: 1362:	    }
+        -: 1363:	}
+        -: 1364:
+        4: 1365:      for (idx=0; idx < dirinfo->size; ++idx)
+        -: 1366:	{
+        -: 1367:	  /* savedirinfo() may return dirinfo=NULL if extended information 
+        -: 1368:	   * is not available. 
+        -: 1369:	   */
+    #####: 1370:	  mode_t mode = (dirinfo->entries[idx].flags & SavedirHaveFileType) ? 
+    #####: 1371:	    dirinfo->entries[idx].type_info : 0;
+    #####: 1372:	  namep = dirinfo->entries[idx].name;
+        -: 1373:
+        -: 1374:	  /* Append this directory entry's name to the path being searched. */
+    #####: 1375:	  file_len = pathname_len + strlen (namep);
+    #####: 1376:	  if (file_len > cur_path_size)
+        -: 1377:	    {
+    #####: 1378:	      while (file_len > cur_path_size)
+    #####: 1379:		cur_path_size += 1024;
+    #####: 1380:	      if (cur_path)
+    #####: 1381:		free (cur_path);
+    #####: 1382:	      cur_path = xmalloc (cur_path_size);
+    #####: 1383:	      strcpy (cur_path, pathname);
+    #####: 1384:	      cur_path[pathname_len - 2] = '/';
+        -: 1385:	    }
+    #####: 1386:	  cur_name = cur_path + pathname_len - 1;
+    #####: 1387:	  strcpy (cur_name, namep);
+        -: 1388:
+    #####: 1389:	  state.curdepth++;
+    #####: 1390:	  if (!options.no_leaf_check && !subdirs_unreliable)
+        -: 1391:	    {
+    #####: 1392:	      if (mode && S_ISDIR(mode) && (subdirs_left == 0))
+        -: 1393:		{
+        -: 1394:		  /* This is a subdirectory, but the number of directories we 
+        -: 1395:		   * have found now exceeds the number we would expect given 
+        -: 1396:		   * the hard link count on the parent.   This is likely to be 
+        -: 1397:		   * a bug in the filesystem driver (e.g. Linux's 
+        -: 1398:		   * /proc filesystem) or may just be a fact that the OS 
+        -: 1399:		   * doesn't really handle hard links with Unix semantics.
+        -: 1400:		   * In the latter case, -noleaf should be used routinely.
+        -: 1401:		   */
+    #####: 1402:		  error(0, 0, _("WARNING: Hard link count is wrong for %s (saw only st_nlink=%d but we already saw %d subdirectories): this may be a bug in your filesystem driver.  Automatically turning on find's -noleaf option.  Earlier results may have failed to include directories that should have been searched."),
+        -: 1403:			pathname,
+        -: 1404:			statp->st_nlink,
+        -: 1405:			dircount);
+    #####: 1406:		  state.exit_status = 1; /* We know the result is wrong, now */
+    #####: 1407:		  options.no_leaf_check = true;	/* Don't make same
+        -: 1408:						   mistake again */
+    #####: 1409:		  subdirs_unreliable = 1;
+    #####: 1410:		  subdirs_left = 1; /* band-aid for this iteration. */
+        -: 1411:		}
+        -: 1412:	      
+        -: 1413:	      /* Normal case optimization.  On normal Unix
+        -: 1414:		 filesystems, a directory that has no subdirectories
+        -: 1415:		 has two links: its name, and ".".  Any additional
+        -: 1416:		 links are to the ".." entries of its subdirectories.
+        -: 1417:		 Once we have processed as many subdirectories as
+        -: 1418:		 there are additional links, we know that the rest of
+        -: 1419:		 the entries are non-directories -- in other words,
+        -: 1420:		 leaf files. */
+    #####: 1421:	      {
+        -: 1422:		int count;
+    #####: 1423:		count = process_path (cur_path, cur_name,
+        -: 1424:					    subdirs_left == 0, pathname,
+        -: 1425:					    mode);
+    #####: 1426:		subdirs_left -= count;
+    #####: 1427:		dircount += count;
+        -: 1428:	      }
+        -: 1429:	    }
+        -: 1430:	  else
+        -: 1431:	    {
+        -: 1432:	      /* There might be weird (e.g., CD-ROM or MS-DOS) filesystems
+        -: 1433:		 mounted, which don't have Unix-like directory link counts. */
+    #####: 1434:	      process_path (cur_path, cur_name, false, pathname, mode);
+        -: 1435:	    }
+        -: 1436:	  
+    #####: 1437:	  state.curdepth--;
+        -: 1438:	}
+        -: 1439:
+        -: 1440:
+        -: 1441:      /* We're about to leave the directory.  If there are any
+        -: 1442:       * -execdir argument lists which have been built but have not
+        -: 1443:       * yet been processed, do them now because they must be done in
+        -: 1444:       * the same directory.
+        -: 1445:       */
+        4: 1446:      complete_pending_execdirs(get_current_dirfd()); 
+        -: 1447:
+        4: 1448:      if (strcmp (name, "."))
+        -: 1449:	{
+        -: 1450:	  enum SafeChdirStatus status;
+        -: 1451:	  struct dir_id did;
+        -: 1452:	  
+        -: 1453:	  /* We could go back and do the next command-line arg
+        -: 1454:	     instead, maybe using longjmp.  */
+        -: 1455:	  char const *dir;
+        4: 1456:	  boolean deref = following_links() ? true : false;
+        -: 1457:	  
+        4: 1458:	  if ( (state.curdepth>0) && !deref)
+    #####: 1459:	    dir = "..";
+        -: 1460:	  else
+        -: 1461:	    {
+        4: 1462:	      chdir_back ();
+        4: 1463:	      dir = parent;
+        -: 1464:	    }
+        -: 1465:	  
+        4: 1466:	  did_stat = false;
+        4: 1467:	  status = safely_chdir (dir, TraversingUp, &stat_buf, SymlinkHandleDefault, &did_stat);
+        4: 1468:	  switch (status)
+        -: 1469:	    {
+        -: 1470:	    case SafeChdirOK:
+        4: 1471:	      break;
+        -: 1472:      
+        -: 1473:	    case SafeChdirFailWouldBeUnableToReturn:
+    #####: 1474:	      error (1, errno, ".");
+    #####: 1475:	      return;
+        -: 1476:	      
+        -: 1477:	    case SafeChdirFailNonexistent:
+        -: 1478:	    case SafeChdirFailDestUnreadable:
+        -: 1479:	    case SafeChdirFailStat:
+        -: 1480:	    case SafeChdirFailSymlink:
+        -: 1481:	    case SafeChdirFailNotDir:
+        -: 1482:	    case SafeChdirFailChdirFailed:
+    #####: 1483:	      error (1, errno, "%s", pathname);
+    #####: 1484:	      return;
+        -: 1485:	    }
+        -: 1486:
+        4: 1487:	  if (dir_curr > 0)
+        -: 1488:	    {
+    #####: 1489:	      did.dev = dir_ids[dir_curr-1].dev;
+    #####: 1490:	      did.ino = dir_ids[dir_curr-1].ino;
+        -: 1491:	    }
+        -: 1492:	  else
+        -: 1493:	    {
+        4: 1494:	      did.dev = starting_stat_buf.st_dev;
+        4: 1495:	      did.ino = starting_stat_buf.st_ino;
+        -: 1496:	    }
+        -: 1497:	}
+        -: 1498:
+        4: 1499:      if (cur_path)
+    #####: 1500:	free (cur_path);
+        4: 1501:      free_dirinfo(dirinfo);
+        -: 1502:    }
+        -: 1503:
+        4: 1504:  if (subdirs_unreliable)
+        -: 1505:    {
+        -: 1506:      /* Make sure we hasn't used the variable subdirs_left if we knew
+        -: 1507:       * we shouldn't do so.
+        -: 1508:       */
+    #####: 1509:      assert(0 == subdirs_left || options.no_leaf_check);
+        -: 1510:    }
+        -: 1511:}

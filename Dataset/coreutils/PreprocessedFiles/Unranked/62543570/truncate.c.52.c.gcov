@@ -1,0 +1,430 @@
+        -:    0:Source:src/truncate.c
+        -:    0:Graph:src/truncate.gcno
+        -:    0:Data:src/truncate.gcda
+        -:    0:Runs:1
+        -:    0:Programs:1
+        -:    1:/* truncate -- truncate or extend the length of files.
+        -:    2:   Copyright (C) 2008-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by Pádraig Brady
+        -:   18:
+        -:   19:   This is backwards compatible with the FreeBSD utility, but is more
+        -:   20:   flexible wrt the size specifications and the use of long options,
+        -:   21:   to better fit the "GNU" environment.  */
+        -:   22:
+        -:   23:#include <config.h>             /* sets _FILE_OFFSET_BITS=64 etc. */
+        -:   24:#include <stdio.h>
+        -:   25:#include <getopt.h>
+        -:   26:#include <sys/types.h>
+        -:   27:
+        -:   28:#include "system.h"
+        -:   29:#include "error.h"
+        -:   30:#include "quote.h"
+        -:   31:#include "stat-size.h"
+        -:   32:#include "xstrtol.h"
+        -:   33:
+        -:   34:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   35:#define PROGRAM_NAME "truncate"
+        -:   36:
+        -:   37:#define AUTHORS proper_name_utf8 ("Padraig Brady", "P\303\241draig Brady")
+        -:   38:
+        -:   39:/* (-c) If true, don't create if not already there */
+        -:   40:static bool no_create;
+        -:   41:
+        -:   42:/* (-o) If true, --size refers to blocks not bytes */
+        -:   43:static bool block_mode;
+        -:   44:
+        -:   45:/* (-r) Reference file to use size from */
+        -:   46:static char const *ref_file;
+        -:   47:
+        -:   48:static struct option const longopts[] =
+        -:   49:{
+        -:   50:  {"no-create", no_argument, NULL, 'c'},
+        -:   51:  {"io-blocks", no_argument, NULL, 'o'},
+        -:   52:  {"reference", required_argument, NULL, 'r'},
+        -:   53:  {"size", required_argument, NULL, 's'},
+        -:   54:  {GETOPT_HELP_OPTION_DECL},
+        -:   55:  {GETOPT_VERSION_OPTION_DECL},
+        -:   56:  {NULL, 0, NULL, 0}
+        -:   57:};
+        -:   58:
+        -:   59:typedef enum
+        -:   60:{ rm_abs = 0, rm_rel, rm_min, rm_max, rm_rdn, rm_rup } rel_mode_t;
+        -:   61:
+        -:   62:/* Set size to the value of STR, interpreted as a decimal integer,
+        -:   63:   optionally multiplied by various values.
+        -:   64:   Return -1 on error, 0 on success.
+        -:   65:
+        -:   66:   This supports dd BLOCK size suffixes + lowercase g,t,m for bsd compat
+        -:   67:   Note we don't support dd's b=512, c=1, w=2 or 21x512MiB formats.  */
+        -:   68:static int
+        1:   69:parse_len (char const *str, off_t *size)
+        -:   70:{
+        -:   71:  enum strtol_error e;
+        -:   72:  intmax_t tmp_size;
+        1:   73:  e = xstrtoimax (str, NULL, 10, &tmp_size, "EgGkKmMPtTYZ0");
+        -:   74:  if (e == LONGINT_OK
+        -:   75:      && !(OFF_T_MIN <= tmp_size && tmp_size <= OFF_T_MAX))
+        -:   76:    e = LONGINT_OVERFLOW;
+        -:   77:
+        1:   78:  if (e == LONGINT_OK)
+        -:   79:    {
+        1:   80:      errno = 0;
+        1:   81:      *size = tmp_size;
+        1:   82:      return 0;
+        -:   83:    }
+        -:   84:
+    #####:   85:  errno = (e == LONGINT_OVERFLOW ? EOVERFLOW : 0);
+    #####:   86:  return -1;
+        -:   87:}
+        -:   88:
+        -:   89:void
+    #####:   90:usage (int status)
+        -:   91:{
+    #####:   92:  if (status != EXIT_SUCCESS)
+    #####:   93:    emit_try_help ();
+        -:   94:  else
+        -:   95:    {
+    #####:   96:      printf (_("Usage: %s OPTION... FILE...\n"), program_name);
+    #####:   97:      fputs (_("\
+        -:   98:Shrink or extend the size of each FILE to the specified size\n\
+        -:   99:\n\
+        -:  100:A FILE argument that does not exist is created.\n\
+        -:  101:\n\
+        -:  102:If a FILE is larger than the specified size, the extra data is lost.\n\
+        -:  103:If a FILE is shorter, it is extended and the extended part (hole)\n\
+        -:  104:reads as zero bytes.\n\
+        -:  105:\n\
+        -:  106:"), stdout);
+    #####:  107:      fputs (_("\
+        -:  108:Mandatory arguments to long options are mandatory for short options too.\n\
+        -:  109:"), stdout);
+    #####:  110:      fputs (_("\
+        -:  111:  -c, --no-create        do not create any files\n\
+        -:  112:"), stdout);
+    #####:  113:      fputs (_("\
+        -:  114:  -o, --io-blocks        treat SIZE as number of IO blocks instead of bytes\n\
+        -:  115:"), stdout);
+    #####:  116:      fputs (_("\
+        -:  117:  -r, --reference=RFILE  base size on RFILE\n\
+        -:  118:  -s, --size=SIZE        set or adjust the file size by SIZE\n"), stdout);
+    #####:  119:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  120:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  121:      emit_size_note ();
+    #####:  122:      fputs (_("\n\
+        -:  123:SIZE may also be prefixed by one of the following modifying characters:\n\
+        -:  124:'+' extend by, '-' reduce by, '<' at most, '>' at least,\n\
+        -:  125:'/' round down to multiple of, '%' round up to multiple of.\n"), stdout);
+    #####:  126:      emit_ancillary_info ();
+        -:  127:    }
+    #####:  128:  exit (status);
+        -:  129:}
+        -:  130:
+        -:  131:/* return true on success, false on error.  */
+        -:  132:static bool
+        1:  133:do_ftruncate (int fd, char const *fname, off_t ssize, off_t rsize,
+        -:  134:              rel_mode_t rel_mode)
+        -:  135:{
+        -:  136:  struct stat sb;
+        -:  137:  off_t nsize;
+        -:  138:
+        1:  139:  if ((block_mode || (rel_mode && rsize < 0)) && fstat (fd, &sb) != 0)
+        -:  140:    {
+    #####:  141:      error (0, errno, _("cannot fstat %s"), quote (fname));
+    #####:  142:      return false;
+        -:  143:    }
+        1:  144:  if (block_mode)
+        -:  145:    {
+    #####:  146:      off_t const blksize = ST_BLKSIZE (sb);
+    #####:  147:      if (ssize < OFF_T_MIN / blksize || ssize > OFF_T_MAX / blksize)
+        -:  148:        {
+    #####:  149:          error (0, 0,
+        -:  150:                 _("overflow in %" PRIdMAX
+        -:  151:                   " * %" PRIdMAX " byte blocks for file %s"),
+        -:  152:                 (intmax_t) ssize, (intmax_t) blksize,
+        -:  153:                 quote (fname));
+    #####:  154:          return false;
+        -:  155:        }
+    #####:  156:      ssize *= blksize;
+        -:  157:    }
+        1:  158:  if (rel_mode)
+        -:  159:    {
+        -:  160:      uintmax_t fsize;
+        -:  161:
+    #####:  162:      if (0 <= rsize)
+    #####:  163:        fsize = rsize;
+        -:  164:      else
+        -:  165:        {
+        -:  166:          off_t file_size;
+    #####:  167:          if (usable_st_size (&sb))
+        -:  168:            {
+    #####:  169:              file_size = sb.st_size;
+    #####:  170:              if (file_size < 0)
+        -:  171:                {
+        -:  172:                  /* Sanity check.  Overflow is the only reason I can think
+        -:  173:                     this would ever go negative. */
+    #####:  174:                  error (0, 0, _("%s has unusable, apparently negative size"),
+        -:  175:                         quote (fname));
+    #####:  176:                  return false;
+        -:  177:                }
+        -:  178:            }
+        -:  179:          else
+        -:  180:            {
+    #####:  181:              file_size = lseek (fd, 0, SEEK_END);
+    #####:  182:              if (file_size < 0)
+        -:  183:                {
+    #####:  184:                  error (0, errno, _("cannot get the size of %s"),
+        -:  185:                         quote (fname));
+    #####:  186:                  return false;
+        -:  187:                }
+        -:  188:            }
+    #####:  189:          fsize = file_size;
+        -:  190:        }
+        -:  191:
+    #####:  192:      if (rel_mode == rm_min)
+    #####:  193:        nsize = MAX (fsize, (uintmax_t) ssize);
+    #####:  194:      else if (rel_mode == rm_max)
+    #####:  195:        nsize = MIN (fsize, (uintmax_t) ssize);
+    #####:  196:      else if (rel_mode == rm_rdn)
+        -:  197:        /* 0..ssize-1 -> 0 */
+    #####:  198:        nsize = (fsize / ssize) * ssize;
+    #####:  199:      else if (rel_mode == rm_rup)
+        -:  200:        /* 1..ssize -> ssize */
+        -:  201:        {
+        -:  202:          /* Here ssize>=1 && fsize>=0 */
+    #####:  203:          uintmax_t const overflow = ((fsize + ssize - 1) / ssize) * ssize;
+    #####:  204:          if (overflow > OFF_T_MAX)
+        -:  205:            {
+    #####:  206:              error (0, 0, _("overflow rounding up size of file %s"),
+        -:  207:                     quote (fname));
+    #####:  208:              return false;
+        -:  209:            }
+    #####:  210:          nsize = overflow;
+        -:  211:        }
+        -:  212:      else
+        -:  213:        {
+    #####:  214:          if (ssize > OFF_T_MAX - (off_t)fsize)
+        -:  215:            {
+    #####:  216:              error (0, 0, _("overflow extending size of file %s"),
+        -:  217:                     quote (fname));
+    #####:  218:              return false;
+        -:  219:            }
+    #####:  220:          nsize = fsize + ssize;
+        -:  221:        }
+        -:  222:    }
+        -:  223:  else
+        1:  224:    nsize = ssize;
+        1:  225:  if (nsize < 0)
+    #####:  226:    nsize = 0;
+        -:  227:
+        1:  228:  if (ftruncate (fd, nsize) == -1)      /* note updates mtime & ctime */
+        -:  229:    {
+    #####:  230:      error (0, errno,
+        -:  231:             _("failed to truncate %s at %" PRIdMAX " bytes"), quote (fname),
+        -:  232:             (intmax_t) nsize);
+    #####:  233:      return false;
+        -:  234:    }
+        -:  235:
+        1:  236:  return true;
+        -:  237:}
+        -:  238:
+        -:  239:int
+        1:  240:main (int argc, char **argv)
+        -:  241:{
+        1:  242:  bool got_size = false;
+        1:  243:  bool errors = false;
+        1:  244:  off_t size IF_LINT ( = 0);
+        1:  245:  off_t rsize = -1;
+        1:  246:  rel_mode_t rel_mode = rm_abs;
+        1:  247:  int c, fd = -1, oflags;
+        -:  248:  char const *fname;
+        -:  249:
+        -:  250:  initialize_main (&argc, &argv);
+        1:  251:  set_program_name (argv[0]);
+        1:  252:  setlocale (LC_ALL, "");
+        -:  253:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  254:  textdomain (PACKAGE);
+        -:  255:
+        1:  256:  atexit (close_stdout);
+        -:  257:
+        1:  258:  while ((c = getopt_long (argc, argv, "cor:s:", longopts, NULL)) != -1)
+        -:  259:    {
+        1:  260:      switch (c)
+        -:  261:        {
+        -:  262:        case 'c':
+    #####:  263:          no_create = true;
+    #####:  264:          break;
+        -:  265:
+        -:  266:        case 'o':
+    #####:  267:          block_mode = true;
+    #####:  268:          break;
+        -:  269:
+        -:  270:        case 'r':
+    #####:  271:          ref_file = optarg;
+    #####:  272:          break;
+        -:  273:
+        -:  274:        case 's':
+        -:  275:          /* skip any whitespace */
+        2:  276:          while (isspace (to_uchar (*optarg)))
+    #####:  277:            optarg++;
+        1:  278:          switch (*optarg)
+        -:  279:            {
+        -:  280:            case '<':
+    #####:  281:              rel_mode = rm_max;
+    #####:  282:              optarg++;
+    #####:  283:              break;
+        -:  284:            case '>':
+    #####:  285:              rel_mode = rm_min;
+    #####:  286:              optarg++;
+    #####:  287:              break;
+        -:  288:            case '/':
+    #####:  289:              rel_mode = rm_rdn;
+    #####:  290:              optarg++;
+    #####:  291:              break;
+        -:  292:            case '%':
+    #####:  293:              rel_mode = rm_rup;
+    #####:  294:              optarg++;
+    #####:  295:              break;
+        -:  296:            }
+        -:  297:          /* skip any whitespace */
+        2:  298:          while (isspace (to_uchar (*optarg)))
+    #####:  299:            optarg++;
+        1:  300:          if (*optarg == '+' || *optarg == '-')
+        -:  301:            {
+    #####:  302:              if (rel_mode)
+        -:  303:                {
+    #####:  304:                  error (0, 0, _("multiple relative modifiers specified"));
+        -:  305:                  /* Note other combinations are flagged as invalid numbers */
+    #####:  306:                  usage (EXIT_FAILURE);
+        -:  307:                }
+    #####:  308:              rel_mode = rm_rel;
+        -:  309:            }
+        1:  310:          if (parse_len (optarg, &size) == -1)
+    #####:  311:            error (EXIT_FAILURE, errno, _("invalid number %s"),
+        -:  312:                   quote (optarg));
+        -:  313:          /* Rounding to multiple of 0 is nonsensical */
+        1:  314:          if ((rel_mode == rm_rup || rel_mode == rm_rdn) && size == 0)
+    #####:  315:            error (EXIT_FAILURE, 0, _("division by zero"));
+        1:  316:          got_size = true;
+        1:  317:          break;
+        -:  318:
+    #####:  319:        case_GETOPT_HELP_CHAR;
+        -:  320:
+    #####:  321:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  322:
+        -:  323:        default:
+    #####:  324:          usage (EXIT_FAILURE);
+        -:  325:        }
+        -:  326:    }
+        -:  327:
+        1:  328:  argv += optind;
+        1:  329:  argc -= optind;
+        -:  330:
+        -:  331:  /* must specify either size or reference file */
+        1:  332:  if (!ref_file && !got_size)
+        -:  333:    {
+    #####:  334:      error (0, 0, _("you must specify either %s or %s"),
+        -:  335:             quote_n (0, "--size"), quote_n (1, "--reference"));
+    #####:  336:      usage (EXIT_FAILURE);
+        -:  337:    }
+        -:  338:  /* must specify a relative size with a reference file */
+        1:  339:  if (ref_file && got_size && !rel_mode)
+        -:  340:    {
+    #####:  341:      error (0, 0, _("you must specify a relative %s with %s"),
+        -:  342:             quote_n (0, "--size"), quote_n (1, "--reference"));
+    #####:  343:      usage (EXIT_FAILURE);
+        -:  344:    }
+        -:  345:  /* block_mode without size is not valid */
+        1:  346:  if (block_mode && !got_size)
+        -:  347:    {
+    #####:  348:      error (0, 0, _("%s was specified but %s was not"),
+        -:  349:             quote_n (0, "--io-blocks"), quote_n (1, "--size"));
+    #####:  350:      usage (EXIT_FAILURE);
+        -:  351:    }
+        -:  352:  /* must specify at least 1 file */
+        1:  353:  if (argc < 1)
+        -:  354:    {
+    #####:  355:      error (0, 0, _("missing file operand"));
+    #####:  356:      usage (EXIT_FAILURE);
+        -:  357:    }
+        -:  358:
+        1:  359:  if (ref_file)
+        -:  360:    {
+        -:  361:      struct stat sb;
+    #####:  362:      off_t file_size = -1;
+    #####:  363:      if (stat (ref_file, &sb) != 0)
+    #####:  364:        error (EXIT_FAILURE, errno, _("cannot stat %s"), quote (ref_file));
+    #####:  365:      if (usable_st_size (&sb))
+    #####:  366:        file_size = sb.st_size;
+        -:  367:      else
+        -:  368:        {
+    #####:  369:          int ref_fd = open (ref_file, O_RDONLY);
+    #####:  370:          if (0 <= ref_fd)
+        -:  371:            {
+    #####:  372:              off_t file_end = lseek (ref_fd, 0, SEEK_END);
+    #####:  373:              int saved_errno = errno;
+    #####:  374:              close (ref_fd); /* ignore failure */
+    #####:  375:              if (0 <= file_end)
+    #####:  376:                file_size = file_end;
+        -:  377:              else
+        -:  378:                {
+        -:  379:                  /* restore, in case close clobbered it. */
+    #####:  380:                  errno = saved_errno;
+        -:  381:                }
+        -:  382:            }
+        -:  383:        }
+    #####:  384:      if (file_size < 0)
+    #####:  385:        error (EXIT_FAILURE, errno, _("cannot get the size of %s"),
+        -:  386:               quote (ref_file));
+    #####:  387:      if (!got_size)
+    #####:  388:        size = file_size;
+        -:  389:      else
+    #####:  390:        rsize = file_size;
+        -:  391:    }
+        -:  392:
+        1:  393:  oflags = O_WRONLY | (no_create ? 0 : O_CREAT) | O_NONBLOCK;
+        -:  394:
+        3:  395:  while ((fname = *argv++) != NULL)
+        -:  396:    {
+        1:  397:      if ((fd = open (fname, oflags, MODE_RW_UGO)) == -1)
+        -:  398:        {
+        -:  399:          /* 'truncate -s0 -c no-such-file'  shouldn't gen error
+        -:  400:             'truncate -s0 no-such-dir/file' should gen ENOENT error
+        -:  401:             'truncate -s0 no-such-dir/' should gen EISDIR error
+        -:  402:             'truncate -s0 .' should gen EISDIR error */
+    #####:  403:          if (!(no_create && errno == ENOENT))
+        -:  404:            {
+    #####:  405:              error (0, errno, _("cannot open %s for writing"),
+        -:  406:                     quote (fname));
+    #####:  407:              errors = true;
+        -:  408:            }
+    #####:  409:          continue;
+        -:  410:        }
+        -:  411:
+        -:  412:
+        1:  413:      if (fd != -1)
+        -:  414:        {
+        1:  415:          errors |= !do_ftruncate (fd, fname, size, rsize, rel_mode);
+        1:  416:          if (close (fd) != 0)
+        -:  417:            {
+    #####:  418:              error (0, errno, _("closing %s"), quote (fname));
+    #####:  419:              errors = true;
+        -:  420:            }
+        -:  421:        }
+        -:  422:    }
+        -:  423:
+        1:  424:  return errors ? EXIT_FAILURE : EXIT_SUCCESS;
+        -:  425:}

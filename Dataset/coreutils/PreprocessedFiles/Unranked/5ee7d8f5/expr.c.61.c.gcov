@@ -1,0 +1,974 @@
+        -:    0:Source:src/expr.c
+        -:    0:Graph:src/expr.gcno
+        -:    0:Data:src/expr.gcda
+        -:    0:Runs:6
+        -:    0:Programs:1
+        -:    1:/* expr -- evaluate expressions.
+        -:    2:   Copyright (C) 1986-2013 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Author: Mike Parker.
+        -:   18:   Modified for arbitrary-precision calculation by James Youngman.
+        -:   19:
+        -:   20:   This program evaluates expressions.  Each token (operator, operand,
+        -:   21:   parenthesis) of the expression must be a separate argument.  The
+        -:   22:   parser used is a reasonably general one, though any incarnation of
+        -:   23:   it is language-specific.  It is especially nice for expressions.
+        -:   24:
+        -:   25:   No parse tree is needed; a new node is evaluated immediately.
+        -:   26:   One function can handle multiple operators all of equal precedence,
+        -:   27:   provided they all associate ((x op x) op x).
+        -:   28:
+        -:   29:   Define EVAL_TRACE to print an evaluation trace.  */
+        -:   30:
+        -:   31:#include <config.h>
+        -:   32:#include <stdio.h>
+        -:   33:#include <sys/types.h>
+        -:   34:#include "system.h"
+        -:   35:
+        -:   36:#include <regex.h>
+        -:   37:#include "error.h"
+        -:   38:#include "long-options.h"
+        -:   39:#include "quotearg.h"
+        -:   40:#include "strnumcmp.h"
+        -:   41:#include "xstrtol.h"
+        -:   42:
+        -:   43:/* Various parts of this code assume size_t fits into unsigned long
+        -:   44:   int, the widest unsigned type that GMP supports.  */
+        -:   45:verify (SIZE_MAX <= ULONG_MAX);
+        -:   46:
+        -:   47:#ifndef HAVE_GMP
+        -:   48:# define HAVE_GMP 0
+        -:   49:#endif
+        -:   50:
+        -:   51:#if HAVE_GMP
+        -:   52:# include <gmp.h>
+        -:   53:#else
+        -:   54:static void integer_overflow (char) ATTRIBUTE_NORETURN;
+        -:   55:/* Approximate gmp.h well enough for expr.c's purposes.  */
+        -:   56:typedef intmax_t mpz_t[1];
+        5:   57:static void mpz_clear (mpz_t z) { (void) z; }
+    #####:   58:static void mpz_init_set_ui (mpz_t z, unsigned long int i) { z[0] = i; }
+        -:   59:static int
+       10:   60:mpz_init_set_str (mpz_t z, char *s, int base)
+        -:   61:{
+       10:   62:  return xstrtoimax (s, NULL, base, z, NULL) == LONGINT_OK ? 0 : -1;
+        -:   63:}
+        -:   64:static void
+        5:   65:mpz_add (mpz_t r, mpz_t a0, mpz_t b0)
+        -:   66:{
+        5:   67:  intmax_t a = a0[0];
+        5:   68:  intmax_t b = b0[0];
+        5:   69:  intmax_t val = a + b;
+        5:   70:  if ((val < a) != (b < 0))
+    #####:   71:    integer_overflow ('+');
+        5:   72:  r[0] = val;
+        5:   73:}
+        -:   74:static void
+    #####:   75:mpz_sub (mpz_t r, mpz_t a0, mpz_t b0)
+        -:   76:{
+    #####:   77:  intmax_t a = a0[0];
+    #####:   78:  intmax_t b = b0[0];
+    #####:   79:  intmax_t val = a - b;
+    #####:   80:  if ((a < val) != (b < 0))
+    #####:   81:    integer_overflow ('-');
+    #####:   82:  r[0] = val;
+    #####:   83:}
+        -:   84:static void
+    #####:   85:mpz_mul (mpz_t r, mpz_t a0, mpz_t b0)
+        -:   86:{
+    #####:   87:  intmax_t a = a0[0];
+    #####:   88:  intmax_t b = b0[0];
+    #####:   89:  intmax_t val = a * b;
+    #####:   90:  if (! (a == 0 || b == 0
+    #####:   91:         || ((val < 0) == ((a < 0) ^ (b < 0)) && val / a == b)))
+    #####:   92:    integer_overflow ('*');
+    #####:   93:  r[0] = val;
+    #####:   94:}
+        -:   95:static void
+    #####:   96:mpz_tdiv_q (mpz_t r, mpz_t a0, mpz_t b0)
+        -:   97:{
+    #####:   98:  intmax_t a = a0[0];
+    #####:   99:  intmax_t b = b0[0];
+        -:  100:
+        -:  101:  /* Some x86-style hosts raise an exception for INT_MIN / -1.  */
+    #####:  102:  if (a < - INTMAX_MAX && b == -1)
+    #####:  103:    integer_overflow ('/');
+    #####:  104:  r[0] = a / b;
+    #####:  105:}
+        -:  106:static void
+    #####:  107:mpz_tdiv_r (mpz_t r, mpz_t a0, mpz_t b0)
+        -:  108:{
+    #####:  109:  intmax_t a = a0[0];
+    #####:  110:  intmax_t b = b0[0];
+        -:  111:
+        -:  112:  /* Some x86-style hosts raise an exception for INT_MIN % -1.  */
+    #####:  113:  r[0] = a < - INTMAX_MAX && b == -1 ? 0 : a % b;
+    #####:  114:}
+        -:  115:static char *
+    #####:  116:mpz_get_str (char const *str, int base, mpz_t z)
+        -:  117:{
+        -:  118:  (void) str; (void) base;
+        -:  119:  char buf[INT_BUFSIZE_BOUND (intmax_t)];
+    #####:  120:  return xstrdup (imaxtostr (z[0], buf));
+        -:  121:}
+        -:  122:static int
+        5:  123:mpz_sgn (mpz_t z)
+        -:  124:{
+        5:  125:  return z[0] < 0 ? -1 : 0 < z[0];
+        -:  126:}
+        -:  127:static int
+    #####:  128:mpz_fits_ulong_p (mpz_t z)
+        -:  129:{
+    #####:  130:  return 0 <= z[0] && z[0] <= ULONG_MAX;
+        -:  131:}
+        -:  132:static unsigned long int
+    #####:  133:mpz_get_ui (mpz_t z)
+        -:  134:{
+    #####:  135:  return z[0];
+        -:  136:}
+        -:  137:static int
+        5:  138:mpz_out_str (FILE *stream, int base, mpz_t z)
+        -:  139:{
+        -:  140:  (void) base;
+        -:  141:  char buf[INT_BUFSIZE_BOUND (intmax_t)];
+        5:  142:  return fputs (imaxtostr (z[0], buf), stream) != EOF;
+        -:  143:}
+        -:  144:#endif
+        -:  145:
+        -:  146:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:  147:#define PROGRAM_NAME "expr"
+        -:  148:
+        -:  149:#define AUTHORS \
+        -:  150:  proper_name ("Mike Parker"), \
+        -:  151:  proper_name ("James Youngman"), \
+        -:  152:  proper_name ("Paul Eggert")
+        -:  153:
+        -:  154:/* Exit statuses.  */
+        -:  155:enum
+        -:  156:  {
+        -:  157:    /* Invalid expression: e.g., its form does not conform to the
+        -:  158:       grammar for expressions.  Our grammar is an extension of the
+        -:  159:       POSIX grammar.  */
+        -:  160:    EXPR_INVALID = 2,
+        -:  161:
+        -:  162:    /* An internal error occurred, e.g., arithmetic overflow, storage
+        -:  163:       exhaustion.  */
+        -:  164:    EXPR_FAILURE
+        -:  165:  };
+        -:  166:
+        -:  167:/* The kinds of value we can have.  */
+        -:  168:enum valtype
+        -:  169:{
+        -:  170:  integer,
+        -:  171:  string
+        -:  172:};
+        -:  173:typedef enum valtype TYPE;
+        -:  174:
+        -:  175:/* A value is.... */
+        -:  176:struct valinfo
+        -:  177:{
+        -:  178:  TYPE type;			/* Which kind. */
+        -:  179:  union
+        -:  180:  {				/* The value itself. */
+        -:  181:    mpz_t i;
+        -:  182:    char *s;
+        -:  183:  } u;
+        -:  184:};
+        -:  185:typedef struct valinfo VALUE;
+        -:  186:
+        -:  187:/* The arguments given to the program, minus the program name.  */
+        -:  188:static char **args;
+        -:  189:
+        -:  190:static VALUE *eval (bool);
+        -:  191:static bool nomoreargs (void);
+        -:  192:static bool null (VALUE *v);
+        -:  193:static void printv (VALUE *v);
+        -:  194:
+        -:  195:void
+    #####:  196:usage (int status)
+        -:  197:{
+    #####:  198:  if (status != EXIT_SUCCESS)
+    #####:  199:    emit_try_help ();
+        -:  200:  else
+        -:  201:    {
+    #####:  202:      printf (_("\
+        -:  203:Usage: %s EXPRESSION\n\
+        -:  204:  or:  %s OPTION\n\
+        -:  205:"),
+        -:  206:              program_name, program_name);
+    #####:  207:      putchar ('\n');
+    #####:  208:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  209:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  210:      fputs (_("\
+        -:  211:\n\
+        -:  212:Print the value of EXPRESSION to standard output.  A blank line below\n\
+        -:  213:separates increasing precedence groups.  EXPRESSION may be:\n\
+        -:  214:\n\
+        -:  215:  ARG1 | ARG2       ARG1 if it is neither null nor 0, otherwise ARG2\n\
+        -:  216:\n\
+        -:  217:  ARG1 & ARG2       ARG1 if neither argument is null or 0, otherwise 0\n\
+        -:  218:"), stdout);
+    #####:  219:      fputs (_("\
+        -:  220:\n\
+        -:  221:  ARG1 < ARG2       ARG1 is less than ARG2\n\
+        -:  222:  ARG1 <= ARG2      ARG1 is less than or equal to ARG2\n\
+        -:  223:  ARG1 = ARG2       ARG1 is equal to ARG2\n\
+        -:  224:  ARG1 != ARG2      ARG1 is unequal to ARG2\n\
+        -:  225:  ARG1 >= ARG2      ARG1 is greater than or equal to ARG2\n\
+        -:  226:  ARG1 > ARG2       ARG1 is greater than ARG2\n\
+        -:  227:"), stdout);
+    #####:  228:      fputs (_("\
+        -:  229:\n\
+        -:  230:  ARG1 + ARG2       arithmetic sum of ARG1 and ARG2\n\
+        -:  231:  ARG1 - ARG2       arithmetic difference of ARG1 and ARG2\n\
+        -:  232:"), stdout);
+        -:  233:      /* Tell xgettext that the "% A" below is not a printf-style
+        -:  234:         format string:  xgettext:no-c-format */
+    #####:  235:      fputs (_("\
+        -:  236:\n\
+        -:  237:  ARG1 * ARG2       arithmetic product of ARG1 and ARG2\n\
+        -:  238:  ARG1 / ARG2       arithmetic quotient of ARG1 divided by ARG2\n\
+        -:  239:  ARG1 % ARG2       arithmetic remainder of ARG1 divided by ARG2\n\
+        -:  240:"), stdout);
+    #####:  241:      fputs (_("\
+        -:  242:\n\
+        -:  243:  STRING : REGEXP   anchored pattern match of REGEXP in STRING\n\
+        -:  244:\n\
+        -:  245:  match STRING REGEXP        same as STRING : REGEXP\n\
+        -:  246:  substr STRING POS LENGTH   substring of STRING, POS counted from 1\n\
+        -:  247:  index STRING CHARS         index in STRING where any CHARS is found, or 0\n\
+        -:  248:  length STRING              length of STRING\n\
+        -:  249:"), stdout);
+    #####:  250:      fputs (_("\
+        -:  251:  + TOKEN                    interpret TOKEN as a string, even if it is a\n\
+        -:  252:                               keyword like 'match' or an operator like '/'\n\
+        -:  253:\n\
+        -:  254:  ( EXPRESSION )             value of EXPRESSION\n\
+        -:  255:"), stdout);
+    #####:  256:      fputs (_("\
+        -:  257:\n\
+        -:  258:Beware that many operators need to be escaped or quoted for shells.\n\
+        -:  259:Comparisons are arithmetic if both ARGs are numbers, else lexicographical.\n\
+        -:  260:Pattern matches return the string matched between \\( and \\) or null; if\n\
+        -:  261:\\( and \\) are not used, they return the number of characters matched or 0.\n\
+        -:  262:"), stdout);
+    #####:  263:      fputs (_("\
+        -:  264:\n\
+        -:  265:Exit status is 0 if EXPRESSION is neither null nor 0, 1 if EXPRESSION is null\n\
+        -:  266:or 0, 2 if EXPRESSION is syntactically invalid, and 3 if an error occurred.\n\
+        -:  267:"), stdout);
+    #####:  268:      emit_ancillary_info ();
+        -:  269:    }
+    #####:  270:  exit (status);
+        -:  271:}
+        -:  272:
+        -:  273:/* Report a syntax error and exit.  */
+        -:  274:static void
+    #####:  275:syntax_error (void)
+        -:  276:{
+    #####:  277:  error (EXPR_INVALID, 0, _("syntax error"));
+    #####:  278:}
+        -:  279:
+        -:  280:#if ! HAVE_GMP
+        -:  281:/* Report an integer overflow for operation OP and exit.  */
+        -:  282:static void
+    #####:  283:integer_overflow (char op)
+        -:  284:{
+    #####:  285:  error (EXPR_FAILURE, ERANGE, "%c", op);
+    #####:  286:  abort (); /* notreached */
+        -:  287:}
+        -:  288:#endif
+        -:  289:
+        -:  290:int
+        6:  291:main (int argc, char **argv)
+        -:  292:{
+        -:  293:  VALUE *v;
+        -:  294:
+        -:  295:  initialize_main (&argc, &argv);
+        6:  296:  set_program_name (argv[0]);
+        6:  297:  setlocale (LC_ALL, "");
+        -:  298:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  299:  textdomain (PACKAGE);
+        -:  300:
+        6:  301:  initialize_exit_failure (EXPR_FAILURE);
+        6:  302:  atexit (close_stdout);
+        -:  303:
+        6:  304:  parse_long_options (argc, argv, PROGRAM_NAME, PACKAGE_NAME, VERSION,
+        -:  305:                      usage, AUTHORS, (char const *) NULL);
+        -:  306:
+        -:  307:  /* The above handles --help and --version.
+        -:  308:     Since there is no other invocation of getopt, handle '--' here.  */
+        6:  309:  unsigned int u_argc = argc;
+        6:  310:  if (1 < u_argc && STREQ (argv[1], "--"))
+        -:  311:    {
+    #####:  312:      --u_argc;
+    #####:  313:      ++argv;
+        -:  314:    }
+        -:  315:
+        6:  316:  if (u_argc <= 1)
+        -:  317:    {
+    #####:  318:      error (0, 0, _("missing operand"));
+    #####:  319:      usage (EXPR_INVALID);
+        -:  320:    }
+        -:  321:
+        6:  322:  args = argv + 1;
+        -:  323:
+        6:  324:  v = eval (true);
+        6:  325:  if (!nomoreargs ())
+    #####:  326:    syntax_error ();
+        6:  327:  printv (v);
+        -:  328:
+        6:  329:  exit (null (v));
+        -:  330:}
+        -:  331:
+        -:  332:/* Return a VALUE for I.  */
+        -:  333:
+        -:  334:static VALUE *
+    #####:  335:int_value (unsigned long int i)
+        -:  336:{
+    #####:  337:  VALUE *v = xmalloc (sizeof *v);
+    #####:  338:  v->type = integer;
+    #####:  339:  mpz_init_set_ui (v->u.i, i);
+    #####:  340:  return v;
+        -:  341:}
+        -:  342:
+        -:  343:/* Return a VALUE for S.  */
+        -:  344:
+        -:  345:static VALUE *
+       13:  346:str_value (char const *s)
+        -:  347:{
+       13:  348:  VALUE *v = xmalloc (sizeof *v);
+       13:  349:  v->type = string;
+       13:  350:  v->u.s = xstrdup (s);
+       13:  351:  return v;
+        -:  352:}
+        -:  353:
+        -:  354:/* Free VALUE V, including structure components.  */
+        -:  355:
+        -:  356:static void
+        7:  357:freev (VALUE *v)
+        -:  358:{
+        7:  359:  if (v->type == string)
+        2:  360:    free (v->u.s);
+        -:  361:  else
+        5:  362:    mpz_clear (v->u.i);
+        7:  363:  free (v);
+        7:  364:}
+        -:  365:
+        -:  366:/* Print VALUE V.  */
+        -:  367:
+        -:  368:static void
+        6:  369:printv (VALUE *v)
+        -:  370:{
+        6:  371:  switch (v->type)
+        -:  372:    {
+        -:  373:    case integer:
+        5:  374:      mpz_out_str (stdout, 10, v->u.i);
+        5:  375:      putchar ('\n');
+        5:  376:      break;
+        -:  377:    case string:
+        1:  378:      puts (v->u.s);
+        1:  379:      break;
+        -:  380:    default:
+    #####:  381:      abort ();
+        -:  382:    }
+        6:  383:}
+        -:  384:
+        -:  385:/* Return true if V is a null-string or zero-number.  */
+        -:  386:
+        -:  387:static bool _GL_ATTRIBUTE_PURE
+        6:  388:null (VALUE *v)
+        -:  389:{
+        6:  390:  switch (v->type)
+        -:  391:    {
+        -:  392:    case integer:
+        5:  393:      return mpz_sgn (v->u.i) == 0;
+        -:  394:    case string:
+        -:  395:      {
+        1:  396:        char const *cp = v->u.s;
+        1:  397:        if (*cp == '\0')
+    #####:  398:          return true;
+        -:  399:
+        1:  400:        cp += (*cp == '-');
+        -:  401:
+        -:  402:        do
+        -:  403:          {
+        1:  404:            if (*cp != '0')
+        1:  405:              return false;
+        -:  406:          }
+    #####:  407:        while (*++cp);
+        -:  408:
+    #####:  409:        return true;
+        -:  410:      }
+        -:  411:    default:
+    #####:  412:      abort ();
+        -:  413:    }
+        -:  414:}
+        -:  415:
+        -:  416:/* Return true if CP takes the form of an integer.  */
+        -:  417:
+        -:  418:static bool _GL_ATTRIBUTE_PURE
+       10:  419:looks_like_integer (char const *cp)
+        -:  420:{
+       10:  421:  cp += (*cp == '-');
+        -:  422:
+        -:  423:  do
+       22:  424:    if (! ISDIGIT (*cp))
+    #####:  425:      return false;
+       22:  426:  while (*++cp);
+        -:  427:
+       10:  428:  return true;
+        -:  429:}
+        -:  430:
+        -:  431:/* Coerce V to a string value (can't fail).  */
+        -:  432:
+        -:  433:static void
+        2:  434:tostring (VALUE *v)
+        -:  435:{
+        2:  436:  switch (v->type)
+        -:  437:    {
+        -:  438:    case integer:
+        -:  439:      {
+    #####:  440:        char *s = mpz_get_str (NULL, 10, v->u.i);
+    #####:  441:        mpz_clear (v->u.i);
+    #####:  442:        v->u.s = s;
+    #####:  443:        v->type = string;
+        -:  444:      }
+    #####:  445:      break;
+        -:  446:    case string:
+        2:  447:      break;
+        -:  448:    default:
+    #####:  449:      abort ();
+        -:  450:    }
+        2:  451:}
+        -:  452:
+        -:  453:/* Coerce V to an integer value.  Return true on success, false on failure.  */
+        -:  454:
+        -:  455:static bool
+       10:  456:toarith (VALUE *v)
+        -:  457:{
+       10:  458:  switch (v->type)
+        -:  459:    {
+        -:  460:    case integer:
+    #####:  461:      return true;
+        -:  462:    case string:
+        -:  463:      {
+       10:  464:        char *s = v->u.s;
+        -:  465:
+       10:  466:        if (! looks_like_integer (s))
+    #####:  467:          return false;
+       10:  468:        if (mpz_init_set_str (v->u.i, s, 10) != 0 && !HAVE_GMP)
+    #####:  469:          error (EXPR_FAILURE, ERANGE, "%s", s);
+       10:  470:        free (s);
+       10:  471:        v->type = integer;
+       10:  472:        return true;
+        -:  473:      }
+        -:  474:    default:
+    #####:  475:      abort ();
+        -:  476:    }
+        -:  477:}
+        -:  478:
+        -:  479:/* Extract a size_t value from an integer value I.
+        -:  480:   If the value is negative, return SIZE_MAX.
+        -:  481:   If the value is too large, return SIZE_MAX - 1.  */
+        -:  482:static size_t
+    #####:  483:getsize (mpz_t i)
+        -:  484:{
+    #####:  485:  if (mpz_sgn (i) < 0)
+    #####:  486:    return SIZE_MAX;
+    #####:  487:  if (mpz_fits_ulong_p (i))
+        -:  488:    {
+    #####:  489:      unsigned long int ul = mpz_get_ui (i);
+    #####:  490:      if (ul < SIZE_MAX)
+    #####:  491:        return ul;
+        -:  492:    }
+    #####:  493:  return SIZE_MAX - 1;
+        -:  494:}
+        -:  495:
+        -:  496:/* Return true and advance if the next token matches STR exactly.
+        -:  497:   STR must not be NULL.  */
+        -:  498:
+        -:  499:static bool
+      200:  500:nextarg (char const *str)
+        -:  501:{
+      200:  502:  if (*args == NULL)
+       90:  503:    return false;
+        -:  504:  else
+        -:  505:    {
+      110:  506:      bool r = STREQ (*args, str);
+      110:  507:      args += r;
+      110:  508:      return r;
+        -:  509:    }
+        -:  510:}
+        -:  511:
+        -:  512:/* Return true if there no more tokens.  */
+        -:  513:
+        -:  514:static bool
+       18:  515:nomoreargs (void)
+        -:  516:{
+       18:  517:  return *args == 0;
+        -:  518:}
+        -:  519:
+        -:  520:#ifdef EVAL_TRACE
+        -:  521:/* Print evaluation trace and args remaining.  */
+        -:  522:
+        -:  523:static void
+        -:  524:trace (fxn)
+        -:  525:     char *fxn;
+        -:  526:{
+        -:  527:  char **a;
+        -:  528:
+        -:  529:  printf ("%s:", fxn);
+        -:  530:  for (a = args; *a; a++)
+        -:  531:    printf (" %s", *a);
+        -:  532:  putchar ('\n');
+        -:  533:}
+        -:  534:#endif
+        -:  535:
+        -:  536:/* Do the : operator.
+        -:  537:   SV is the VALUE for the lhs (the string),
+        -:  538:   PV is the VALUE for the rhs (the pattern).  */
+        -:  539:
+        -:  540:static VALUE *
+        1:  541:docolon (VALUE *sv, VALUE *pv)
+        -:  542:{
+        1:  543:  VALUE *v IF_LINT ( = NULL);
+        -:  544:  const char *errmsg;
+        -:  545:  struct re_pattern_buffer re_buffer;
+        -:  546:  char fastmap[UCHAR_MAX + 1];
+        -:  547:  struct re_registers re_regs;
+        -:  548:  regoff_t matchlen;
+        -:  549:
+        1:  550:  tostring (sv);
+        1:  551:  tostring (pv);
+        -:  552:
+        1:  553:  re_regs.num_regs = 0;
+        1:  554:  re_regs.start = NULL;
+        1:  555:  re_regs.end = NULL;
+        -:  556:
+        1:  557:  re_buffer.buffer = NULL;
+        1:  558:  re_buffer.allocated = 0;
+        1:  559:  re_buffer.fastmap = fastmap;
+        1:  560:  re_buffer.translate = NULL;
+        1:  561:  re_syntax_options =
+        -:  562:    RE_SYNTAX_POSIX_BASIC & ~RE_CONTEXT_INVALID_DUP & ~RE_NO_EMPTY_RANGES;
+        1:  563:  errmsg = re_compile_pattern (pv->u.s, strlen (pv->u.s), &re_buffer);
+        1:  564:  if (errmsg)
+    #####:  565:    error (EXPR_INVALID, 0, "%s", errmsg);
+        1:  566:  re_buffer.newline_anchor = 0;
+        -:  567:
+        1:  568:  matchlen = re_match (&re_buffer, sv->u.s, strlen (sv->u.s), 0, &re_regs);
+        1:  569:  if (0 <= matchlen)
+        -:  570:    {
+        -:  571:      /* Were \(...\) used? */
+        1:  572:      if (re_buffer.re_nsub > 0)
+        -:  573:        {
+        1:  574:          sv->u.s[re_regs.end[1]] = '\0';
+        1:  575:          v = str_value (sv->u.s + re_regs.start[1]);
+        -:  576:        }
+        -:  577:      else
+    #####:  578:        v = int_value (matchlen);
+        -:  579:    }
+    #####:  580:  else if (matchlen == -1)
+        -:  581:    {
+        -:  582:      /* Match failed -- return the right kind of null.  */
+    #####:  583:      if (re_buffer.re_nsub > 0)
+    #####:  584:        v = str_value ("");
+        -:  585:      else
+    #####:  586:        v = int_value (0);
+        -:  587:    }
+        -:  588:  else
+    #####:  589:    error (EXPR_FAILURE,
+    #####:  590:           (matchlen == -2 ? errno : EOVERFLOW),
+        -:  591:           _("error in regular expression matcher"));
+        -:  592:
+        1:  593:  if (0 < re_regs.num_regs)
+        -:  594:    {
+        1:  595:      free (re_regs.start);
+        1:  596:      free (re_regs.end);
+        -:  597:    }
+        1:  598:  re_buffer.fastmap = NULL;
+        1:  599:  regfree (&re_buffer);
+        1:  600:  return v;
+        -:  601:}
+        -:  602:
+        -:  603:/* Handle bare operands and ( expr ) syntax.  */
+        -:  604:
+        -:  605:static VALUE *
+       12:  606:eval7 (bool evaluate)
+        -:  607:{
+        -:  608:  VALUE *v;
+        -:  609:
+        -:  610:#ifdef EVAL_TRACE
+        -:  611:  trace ("eval7");
+        -:  612:#endif
+       12:  613:  if (nomoreargs ())
+    #####:  614:    syntax_error ();
+        -:  615:
+       12:  616:  if (nextarg ("("))
+        -:  617:    {
+    #####:  618:      v = eval (evaluate);
+    #####:  619:      if (!nextarg (")"))
+    #####:  620:        syntax_error ();
+    #####:  621:      return v;
+        -:  622:    }
+        -:  623:
+       12:  624:  if (nextarg (")"))
+    #####:  625:    syntax_error ();
+        -:  626:
+       12:  627:  return str_value (*args++);
+        -:  628:}
+        -:  629:
+        -:  630:/* Handle match, substr, index, and length keywords, and quoting "+".  */
+        -:  631:
+        -:  632:static VALUE *
+       12:  633:eval6 (bool evaluate)
+        -:  634:{
+        -:  635:  VALUE *l;
+        -:  636:  VALUE *r;
+        -:  637:  VALUE *v;
+        -:  638:  VALUE *i1;
+        -:  639:  VALUE *i2;
+        -:  640:
+        -:  641:#ifdef EVAL_TRACE
+        -:  642:  trace ("eval6");
+        -:  643:#endif
+       12:  644:  if (nextarg ("+"))
+        -:  645:    {
+    #####:  646:      if (nomoreargs ())
+    #####:  647:        syntax_error ();
+    #####:  648:      return str_value (*args++);
+        -:  649:    }
+       12:  650:  else if (nextarg ("length"))
+        -:  651:    {
+    #####:  652:      r = eval6 (evaluate);
+    #####:  653:      tostring (r);
+    #####:  654:      v = int_value (strlen (r->u.s));
+    #####:  655:      freev (r);
+    #####:  656:      return v;
+        -:  657:    }
+       12:  658:  else if (nextarg ("match"))
+        -:  659:    {
+    #####:  660:      l = eval6 (evaluate);
+    #####:  661:      r = eval6 (evaluate);
+    #####:  662:      if (evaluate)
+        -:  663:        {
+    #####:  664:          v = docolon (l, r);
+    #####:  665:          freev (l);
+        -:  666:        }
+        -:  667:      else
+    #####:  668:        v = l;
+    #####:  669:      freev (r);
+    #####:  670:      return v;
+        -:  671:    }
+       12:  672:  else if (nextarg ("index"))
+        -:  673:    {
+        -:  674:      size_t pos;
+        -:  675:
+    #####:  676:      l = eval6 (evaluate);
+    #####:  677:      r = eval6 (evaluate);
+    #####:  678:      tostring (l);
+    #####:  679:      tostring (r);
+    #####:  680:      pos = strcspn (l->u.s, r->u.s);
+    #####:  681:      v = int_value (l->u.s[pos] ? pos + 1 : 0);
+    #####:  682:      freev (l);
+    #####:  683:      freev (r);
+    #####:  684:      return v;
+        -:  685:    }
+       12:  686:  else if (nextarg ("substr"))
+        -:  687:    {
+        -:  688:      size_t llen;
+    #####:  689:      l = eval6 (evaluate);
+    #####:  690:      i1 = eval6 (evaluate);
+    #####:  691:      i2 = eval6 (evaluate);
+    #####:  692:      tostring (l);
+    #####:  693:      llen = strlen (l->u.s);
+        -:  694:
+    #####:  695:      if (!toarith (i1) || !toarith (i2))
+    #####:  696:        v = str_value ("");
+        -:  697:      else
+        -:  698:        {
+    #####:  699:          size_t pos = getsize (i1->u.i);
+    #####:  700:          size_t len = getsize (i2->u.i);
+        -:  701:
+    #####:  702:          if (llen < pos || pos == 0 || len == 0 || len == SIZE_MAX)
+    #####:  703:            v = str_value ("");
+        -:  704:          else
+        -:  705:            {
+    #####:  706:              size_t vlen = MIN (len, llen - pos + 1);
+        -:  707:              char *vlim;
+    #####:  708:              v = xmalloc (sizeof *v);
+    #####:  709:              v->type = string;
+    #####:  710:              v->u.s = xmalloc (vlen + 1);
+    #####:  711:              vlim = mempcpy (v->u.s, l->u.s + pos - 1, vlen);
+    #####:  712:              *vlim = '\0';
+        -:  713:            }
+        -:  714:        }
+    #####:  715:      freev (l);
+    #####:  716:      freev (i1);
+    #####:  717:      freev (i2);
+    #####:  718:      return v;
+        -:  719:    }
+        -:  720:  else
+       12:  721:    return eval7 (evaluate);
+        -:  722:}
+        -:  723:
+        -:  724:/* Handle : operator (pattern matching).
+        -:  725:   Calls docolon to do the real work.  */
+        -:  726:
+        -:  727:static VALUE *
+       11:  728:eval5 (bool evaluate)
+        -:  729:{
+        -:  730:  VALUE *l;
+        -:  731:  VALUE *r;
+        -:  732:  VALUE *v;
+        -:  733:
+        -:  734:#ifdef EVAL_TRACE
+        -:  735:  trace ("eval5");
+        -:  736:#endif
+       11:  737:  l = eval6 (evaluate);
+        -:  738:  while (1)
+        -:  739:    {
+       12:  740:      if (nextarg (":"))
+        -:  741:        {
+        1:  742:          r = eval6 (evaluate);
+        1:  743:          if (evaluate)
+        -:  744:            {
+        1:  745:              v = docolon (l, r);
+        1:  746:              freev (l);
+        1:  747:              l = v;
+        -:  748:            }
+        1:  749:          freev (r);
+        -:  750:        }
+        -:  751:      else
+       22:  752:        return l;
+        1:  753:    }
+        -:  754:}
+        -:  755:
+        -:  756:/* Handle *, /, % operators.  */
+        -:  757:
+        -:  758:static VALUE *
+       11:  759:eval4 (bool evaluate)
+        -:  760:{
+        -:  761:  VALUE *l;
+        -:  762:  VALUE *r;
+        -:  763:  enum { multiply, divide, mod } fxn;
+        -:  764:
+        -:  765:#ifdef EVAL_TRACE
+        -:  766:  trace ("eval4");
+        -:  767:#endif
+       11:  768:  l = eval5 (evaluate);
+        -:  769:  while (1)
+        -:  770:    {
+       11:  771:      if (nextarg ("*"))
+    #####:  772:        fxn = multiply;
+       11:  773:      else if (nextarg ("/"))
+    #####:  774:        fxn = divide;
+       11:  775:      else if (nextarg ("%"))
+    #####:  776:        fxn = mod;
+        -:  777:      else
+       22:  778:        return l;
+    #####:  779:      r = eval5 (evaluate);
+    #####:  780:      if (evaluate)
+        -:  781:        {
+    #####:  782:          if (!toarith (l) || !toarith (r))
+    #####:  783:            error (EXPR_INVALID, 0, _("non-integer argument"));
+    #####:  784:          if (fxn != multiply && mpz_sgn (r->u.i) == 0)
+    #####:  785:            error (EXPR_INVALID, 0, _("division by zero"));
+        -:  786:          ((fxn == multiply ? mpz_mul
+    #####:  787:            : fxn == divide ? mpz_tdiv_q
+    #####:  788:            : mpz_tdiv_r)
+    #####:  789:           (l->u.i, l->u.i, r->u.i));
+        -:  790:        }
+    #####:  791:      freev (r);
+    #####:  792:    }
+        -:  793:}
+        -:  794:
+        -:  795:/* Handle +, - operators.  */
+        -:  796:
+        -:  797:static VALUE *
+        6:  798:eval3 (bool evaluate)
+        -:  799:{
+        -:  800:  VALUE *l;
+        -:  801:  VALUE *r;
+        -:  802:  enum { plus, minus } fxn;
+        -:  803:
+        -:  804:#ifdef EVAL_TRACE
+        -:  805:  trace ("eval3");
+        -:  806:#endif
+        6:  807:  l = eval4 (evaluate);
+        -:  808:  while (1)
+        -:  809:    {
+       11:  810:      if (nextarg ("+"))
+        5:  811:        fxn = plus;
+        6:  812:      else if (nextarg ("-"))
+    #####:  813:        fxn = minus;
+        -:  814:      else
+       12:  815:        return l;
+        5:  816:      r = eval4 (evaluate);
+        5:  817:      if (evaluate)
+        -:  818:        {
+        5:  819:          if (!toarith (l) || !toarith (r))
+    #####:  820:            error (EXPR_INVALID, 0, _("non-integer argument"));
+        5:  821:          (fxn == plus ? mpz_add : mpz_sub) (l->u.i, l->u.i, r->u.i);
+        -:  822:        }
+        5:  823:      freev (r);
+        5:  824:    }
+        -:  825:}
+        -:  826:
+        -:  827:/* Handle comparisons.  */
+        -:  828:
+        -:  829:static VALUE *
+        6:  830:eval2 (bool evaluate)
+        -:  831:{
+        -:  832:  VALUE *l;
+        -:  833:
+        -:  834:#ifdef EVAL_TRACE
+        -:  835:  trace ("eval2");
+        -:  836:#endif
+        6:  837:  l = eval3 (evaluate);
+        -:  838:  while (1)
+        -:  839:    {
+        -:  840:      VALUE *r;
+        -:  841:      enum
+        -:  842:        {
+        -:  843:          less_than, less_equal, equal, not_equal, greater_equal, greater_than
+        -:  844:        } fxn;
+        6:  845:      bool val = false;
+        -:  846:
+        6:  847:      if (nextarg ("<"))
+    #####:  848:        fxn = less_than;
+        6:  849:      else if (nextarg ("<="))
+    #####:  850:        fxn = less_equal;
+        6:  851:      else if (nextarg ("=") || nextarg ("=="))
+    #####:  852:        fxn = equal;
+        6:  853:      else if (nextarg ("!="))
+    #####:  854:        fxn = not_equal;
+        6:  855:      else if (nextarg (">="))
+    #####:  856:        fxn = greater_equal;
+        6:  857:      else if (nextarg (">"))
+    #####:  858:        fxn = greater_than;
+        -:  859:      else
+       12:  860:        return l;
+    #####:  861:      r = eval3 (evaluate);
+        -:  862:
+    #####:  863:      if (evaluate)
+        -:  864:        {
+        -:  865:          int cmp;
+    #####:  866:          tostring (l);
+    #####:  867:          tostring (r);
+        -:  868:
+    #####:  869:          if (looks_like_integer (l->u.s) && looks_like_integer (r->u.s))
+    #####:  870:            cmp = strintcmp (l->u.s, r->u.s);
+        -:  871:          else
+        -:  872:            {
+    #####:  873:              errno = 0;
+    #####:  874:              cmp = strcoll (l->u.s, r->u.s);
+        -:  875:
+    #####:  876:              if (errno)
+        -:  877:                {
+    #####:  878:                  error (0, errno, _("string comparison failed"));
+    #####:  879:                  error (0, 0, _("set LC_ALL='C' to work around the problem"));
+    #####:  880:                  error (EXPR_INVALID, 0,
+        -:  881:                         _("the strings compared were %s and %s"),
+    #####:  882:                         quotearg_n_style (0, locale_quoting_style, l->u.s),
+    #####:  883:                         quotearg_n_style (1, locale_quoting_style, r->u.s));
+        -:  884:                }
+        -:  885:            }
+        -:  886:
+    #####:  887:          switch (fxn)
+        -:  888:            {
+    #####:  889:            case less_than:     val = (cmp <  0); break;
+    #####:  890:            case less_equal:    val = (cmp <= 0); break;
+    #####:  891:            case equal:         val = (cmp == 0); break;
+    #####:  892:            case not_equal:     val = (cmp != 0); break;
+    #####:  893:            case greater_equal: val = (cmp >= 0); break;
+    #####:  894:            case greater_than:  val = (cmp >  0); break;
+    #####:  895:            default: abort ();
+        -:  896:            }
+        -:  897:        }
+        -:  898:
+    #####:  899:      freev (l);
+    #####:  900:      freev (r);
+    #####:  901:      l = int_value (val);
+    #####:  902:    }
+        -:  903:}
+        -:  904:
+        -:  905:/* Handle &.  */
+        -:  906:
+        -:  907:static VALUE *
+        6:  908:eval1 (bool evaluate)
+        -:  909:{
+        -:  910:  VALUE *l;
+        -:  911:  VALUE *r;
+        -:  912:
+        -:  913:#ifdef EVAL_TRACE
+        -:  914:  trace ("eval1");
+        -:  915:#endif
+        6:  916:  l = eval2 (evaluate);
+        -:  917:  while (1)
+        -:  918:    {
+        6:  919:      if (nextarg ("&"))
+        -:  920:        {
+    #####:  921:          r = eval2 (evaluate && !null (l));
+    #####:  922:          if (null (l) || null (r))
+        -:  923:            {
+    #####:  924:              freev (l);
+    #####:  925:              freev (r);
+    #####:  926:              l = int_value (0);
+        -:  927:            }
+        -:  928:          else
+    #####:  929:            freev (r);
+        -:  930:        }
+        -:  931:      else
+       12:  932:        return l;
+    #####:  933:    }
+        -:  934:}
+        -:  935:
+        -:  936:/* Handle |.  */
+        -:  937:
+        -:  938:static VALUE *
+        6:  939:eval (bool evaluate)
+        -:  940:{
+        -:  941:  VALUE *l;
+        -:  942:  VALUE *r;
+        -:  943:
+        -:  944:#ifdef EVAL_TRACE
+        -:  945:  trace ("eval");
+        -:  946:#endif
+        6:  947:  l = eval1 (evaluate);
+        -:  948:  while (1)
+        -:  949:    {
+        6:  950:      if (nextarg ("|"))
+        -:  951:        {
+    #####:  952:          r = eval1 (evaluate && null (l));
+    #####:  953:          if (null (l))
+        -:  954:            {
+    #####:  955:              freev (l);
+    #####:  956:              l = r;
+    #####:  957:              if (null (l))
+        -:  958:                {
+    #####:  959:                  freev (l);
+    #####:  960:                  l = int_value (0);
+        -:  961:                }
+        -:  962:            }
+        -:  963:          else
+    #####:  964:            freev (r);
+        -:  965:        }
+        -:  966:      else
+       12:  967:        return l;
+    #####:  968:    }
+        -:  969:}

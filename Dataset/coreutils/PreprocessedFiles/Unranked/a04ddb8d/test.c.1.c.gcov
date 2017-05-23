@@ -1,0 +1,880 @@
+        -:    0:Source:src/test.c
+        -:    0:Graph:src/test.gcno
+        -:    0:Data:src/test.gcda
+        -:    0:Runs:8
+        -:    0:Programs:1
+        -:    1:/* GNU test program (ksb and mjb) */
+        -:    2:
+        -:    3:/* Modified to run with the GNU shell by bfox. */
+        -:    4:
+        -:    5:/* Copyright (C) 1987-2012 Free Software Foundation, Inc.
+        -:    6:
+        -:    7:   This program is free software: you can redistribute it and/or modify
+        -:    8:   it under the terms of the GNU General Public License as published by
+        -:    9:   the Free Software Foundation, either version 3 of the License, or
+        -:   10:   (at your option) any later version.
+        -:   11:
+        -:   12:   This program is distributed in the hope that it will be useful,
+        -:   13:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   14:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   15:   GNU General Public License for more details.
+        -:   16:
+        -:   17:   You should have received a copy of the GNU General Public License
+        -:   18:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   19:
+        -:   20:/* Define TEST_STANDALONE to get the /bin/test version.  Otherwise, you get
+        -:   21:   the shell builtin version. */
+        -:   22:
+        -:   23:/* Without this pragma, gcc 4.6.2 20111027 mistakenly suggests that
+        -:   24:   the advance function might be candidate for attribute 'pure'.  */
+        -:   25:#if (__GNUC__ == 4 && 6 <= __GNUC_MINOR__) || 4 < __GNUC__
+        -:   26:# pragma GCC diagnostic ignored "-Wsuggest-attribute=pure"
+        -:   27:#endif
+        -:   28:
+        -:   29:#include <config.h>
+        -:   30:#include <stdio.h>
+        -:   31:#include <sys/types.h>
+        -:   32:
+        -:   33:#define TEST_STANDALONE 1
+        -:   34:
+        -:   35:#ifndef LBRACKET
+        -:   36:# define LBRACKET 0
+        -:   37:#endif
+        -:   38:
+        -:   39:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   40:#if LBRACKET
+        -:   41:# define PROGRAM_NAME "["
+        -:   42:#else
+        -:   43:# define PROGRAM_NAME "test"
+        -:   44:#endif
+        -:   45:
+        -:   46:#include "system.h"
+        -:   47:#include "quote.h"
+        -:   48:#include "stat-time.h"
+        -:   49:#include "strnumcmp.h"
+        -:   50:
+        -:   51:#if HAVE_SYS_PARAM_H
+        -:   52:# include <sys/param.h>
+        -:   53:#endif
+        -:   54:
+        -:   55:/* Exit status for syntax errors, etc.  */
+        -:   56:enum { TEST_TRUE, TEST_FALSE, TEST_FAILURE };
+        -:   57:
+        -:   58:#if defined TEST_STANDALONE
+        -:   59:# define test_exit(val) exit (val)
+        -:   60:#else
+        -:   61:   static jmp_buf test_exit_buf;
+        -:   62:   static int test_error_return = 0;
+        -:   63:# define test_exit(val) test_error_return = val, longjmp (test_exit_buf, 1)
+        -:   64:#endif /* !TEST_STANDALONE */
+        -:   65:
+        -:   66:static int pos;		/* The offset of the current argument in ARGV. */
+        -:   67:static int argc;	/* The number of arguments present in ARGV. */
+        -:   68:static char **argv;	/* The argument list. */
+        -:   69:
+        -:   70:static bool test_unop (char const *s);
+        -:   71:static bool unary_operator (void);
+        -:   72:static bool binary_operator (bool);
+        -:   73:static bool two_arguments (void);
+        -:   74:static bool three_arguments (void);
+        -:   75:static bool posixtest (int);
+        -:   76:
+        -:   77:static bool expr (void);
+        -:   78:static bool term (void);
+        -:   79:static bool and (void);
+        -:   80:static bool or (void);
+        -:   81:
+        -:   82:static void test_syntax_error (char const *format, char const *arg)
+        -:   83:     ATTRIBUTE_NORETURN;
+        -:   84:static void beyond (void) ATTRIBUTE_NORETURN;
+        -:   85:
+        -:   86:static void
+    #####:   87:test_syntax_error (char const *format, char const *arg)
+        -:   88:{
+    #####:   89:  fprintf (stderr, "%s: ", argv[0]);
+    #####:   90:  fprintf (stderr, format, arg);
+    #####:   91:  fputc ('\n', stderr);
+    #####:   92:  fflush (stderr);
+    #####:   93:  test_exit (TEST_FAILURE);
+        -:   94:}
+        -:   95:
+        -:   96:/* Increment our position in the argument list.  Check that we're not
+        -:   97:   past the end of the argument list.  This check is suppressed if the
+        -:   98:   argument is false.  */
+        -:   99:
+        -:  100:static void
+        8:  101:advance (bool f)
+        -:  102:{
+        8:  103:  ++pos;
+        -:  104:
+        8:  105:  if (f && pos >= argc)
+    #####:  106:    beyond ();
+        8:  107:}
+        -:  108:
+        -:  109:static void
+        8:  110:unary_advance (void)
+        -:  111:{
+        8:  112:  advance (true);
+        8:  113:  ++pos;
+        8:  114:}
+        -:  115:
+        -:  116:/*
+        -:  117: * beyond - call when we're beyond the end of the argument list (an
+        -:  118: *	error condition)
+        -:  119: */
+        -:  120:static void
+    #####:  121:beyond (void)
+        -:  122:{
+    #####:  123:  test_syntax_error (_("missing argument after %s"), quote (argv[argc - 1]));
+        -:  124:}
+        -:  125:
+        -:  126:/* If the characters pointed to by STRING constitute a valid number,
+        -:  127:   return a pointer to the start of the number, skipping any blanks or
+        -:  128:   leading '+'.  Otherwise, report an error and exit.  */
+        -:  129:static char const *
+    #####:  130:find_int (char const *string)
+        -:  131:{
+        -:  132:  char const *p;
+        -:  133:  char const *number_start;
+        -:  134:
+    #####:  135:  for (p = string; isblank (to_uchar (*p)); p++)
+    #####:  136:    continue;
+        -:  137:
+    #####:  138:  if (*p == '+')
+        -:  139:    {
+    #####:  140:      p++;
+    #####:  141:      number_start = p;
+        -:  142:    }
+        -:  143:  else
+        -:  144:    {
+    #####:  145:      number_start = p;
+    #####:  146:      p += (*p == '-');
+        -:  147:    }
+        -:  148:
+    #####:  149:  if (ISDIGIT (*p++))
+        -:  150:    {
+    #####:  151:      while (ISDIGIT (*p))
+    #####:  152:        p++;
+    #####:  153:      while (isblank (to_uchar (*p)))
+    #####:  154:        p++;
+    #####:  155:      if (!*p)
+    #####:  156:        return number_start;
+        -:  157:    }
+        -:  158:
+    #####:  159:  test_syntax_error (_("invalid integer %s"), quote (string));
+        -:  160:}
+        -:  161:
+        -:  162:/* Find the modification time of FILE, and stuff it into *MTIME.
+        -:  163:   Return true if successful.  */
+        -:  164:static bool
+    #####:  165:get_mtime (char const *filename, struct timespec *mtime)
+        -:  166:{
+        -:  167:  struct stat finfo;
+    #####:  168:  bool ok = (stat (filename, &finfo) == 0);
+        -:  169:#ifdef lint
+        -:  170:  static struct timespec const zero;
+    #####:  171:  *mtime = zero;
+        -:  172:#endif
+    #####:  173:  if (ok)
+    #####:  174:    *mtime = get_stat_mtime (&finfo);
+    #####:  175:  return ok;
+        -:  176:}
+        -:  177:
+        -:  178:/* Return true if S is one of the test command's binary operators.  */
+        -:  179:static bool
+    #####:  180:binop (char const *s)
+        -:  181:{
+    #####:  182:  return ((STREQ (s,   "=")) || (STREQ (s,  "!=")) || (STREQ (s, "==")) ||
+    #####:  183:          (STREQ (s,   "-nt")) ||
+    #####:  184:          (STREQ (s, "-ot")) || (STREQ (s, "-ef")) || (STREQ (s, "-eq")) ||
+    #####:  185:          (STREQ (s, "-ne")) || (STREQ (s, "-lt")) || (STREQ (s, "-le")) ||
+    #####:  186:          (STREQ (s, "-gt")) || (STREQ (s, "-ge")));
+        -:  187:}
+        -:  188:
+        -:  189:/*
+        -:  190: * term - parse a term and return 1 or 0 depending on whether the term
+        -:  191: *	evaluates to true or false, respectively.
+        -:  192: *
+        -:  193: * term ::=
+        -:  194: *	'-'('h'|'d'|'f'|'r'|'s'|'w'|'c'|'b'|'p'|'u'|'g'|'k') filename
+        -:  195: *	'-'('L'|'x') filename
+        -:  196: *	'-t' int
+        -:  197: *	'-'('z'|'n') string
+        -:  198: *	string
+        -:  199: *	string ('!='|'=') string
+        -:  200: *	<int> '-'(eq|ne|le|lt|ge|gt) <int>
+        -:  201: *	file '-'(nt|ot|ef) file
+        -:  202: *	'(' <expr> ')'
+        -:  203: * int ::=
+        -:  204: *	'-l' string
+        -:  205: *	positive and negative integers
+        -:  206: */
+        -:  207:static bool
+    #####:  208:term (void)
+        -:  209:{
+        -:  210:  bool value;
+    #####:  211:  bool negated = false;
+        -:  212:
+        -:  213:  /* Deal with leading 'not's.  */
+    #####:  214:  while (pos < argc && argv[pos][0] == '!' && argv[pos][1] == '\0')
+        -:  215:    {
+    #####:  216:      advance (true);
+    #####:  217:      negated = !negated;
+        -:  218:    }
+        -:  219:
+    #####:  220:  if (pos >= argc)
+    #####:  221:    beyond ();
+        -:  222:
+        -:  223:  /* A paren-bracketed argument. */
+    #####:  224:  if (argv[pos][0] == '(' && argv[pos][1] == '\0')
+    #####:  225:    {
+        -:  226:      int nargs;
+        -:  227:
+    #####:  228:      advance (true);
+        -:  229:
+    #####:  230:      for (nargs = 1;
+    #####:  231:           pos + nargs < argc && ! STREQ (argv[pos + nargs], ")");
+    #####:  232:           nargs++)
+    #####:  233:        if (nargs == 4)
+        -:  234:          {
+    #####:  235:            nargs = argc - pos;
+    #####:  236:            break;
+        -:  237:          }
+        -:  238:
+    #####:  239:      value = posixtest (nargs);
+    #####:  240:      if (argv[pos] == 0)
+    #####:  241:        test_syntax_error (_("')' expected"), NULL);
+        -:  242:      else
+    #####:  243:        if (argv[pos][0] != ')' || argv[pos][1])
+    #####:  244:          test_syntax_error (_("')' expected, found %s"), argv[pos]);
+    #####:  245:      advance (false);
+        -:  246:    }
+        -:  247:
+        -:  248:  /* Are there enough arguments left that this could be dyadic?  */
+    #####:  249:  else if (4 <= argc - pos && STREQ (argv[pos], "-l") && binop (argv[pos + 2]))
+    #####:  250:    value = binary_operator (true);
+    #####:  251:  else if (3 <= argc - pos && binop (argv[pos + 1]))
+    #####:  252:    value = binary_operator (false);
+        -:  253:
+        -:  254:  /* It might be a switch type argument.  */
+    #####:  255:  else if (argv[pos][0] == '-' && argv[pos][1] && argv[pos][2] == '\0')
+        -:  256:    {
+    #####:  257:      if (test_unop (argv[pos]))
+    #####:  258:        value = unary_operator ();
+        -:  259:      else
+    #####:  260:        test_syntax_error (_("%s: unary operator expected"), argv[pos]);
+        -:  261:    }
+        -:  262:  else
+        -:  263:    {
+    #####:  264:      value = (argv[pos][0] != '\0');
+    #####:  265:      advance (false);
+        -:  266:    }
+        -:  267:
+    #####:  268:  return negated ^ value;
+        -:  269:}
+        -:  270:
+        -:  271:static bool
+    #####:  272:binary_operator (bool l_is_l)
+        -:  273:{
+        -:  274:  int op;
+        -:  275:  struct stat stat_buf, stat_spare;
+        -:  276:  /* Is the right integer expression of the form '-l string'? */
+        -:  277:  bool r_is_l;
+        -:  278:
+    #####:  279:  if (l_is_l)
+    #####:  280:    advance (false);
+    #####:  281:  op = pos + 1;
+        -:  282:
+    #####:  283:  if ((op < argc - 2) && STREQ (argv[op + 1], "-l"))
+        -:  284:    {
+    #####:  285:      r_is_l = true;
+    #####:  286:      advance (false);
+        -:  287:    }
+        -:  288:  else
+    #####:  289:    r_is_l = false;
+        -:  290:
+    #####:  291:  if (argv[op][0] == '-')
+        -:  292:    {
+        -:  293:      /* check for eq, nt, and stuff */
+    #####:  294:      if ((((argv[op][1] == 'l' || argv[op][1] == 'g')
+    #####:  295:            && (argv[op][2] == 'e' || argv[op][2] == 't'))
+    #####:  296:           || (argv[op][1] == 'e' && argv[op][2] == 'q')
+    #####:  297:           || (argv[op][1] == 'n' && argv[op][2] == 'e'))
+    #####:  298:          && !argv[op][3])
+        -:  299:        {
+        -:  300:          char lbuf[INT_BUFSIZE_BOUND (uintmax_t)];
+        -:  301:          char rbuf[INT_BUFSIZE_BOUND (uintmax_t)];
+    #####:  302:          char const *l = (l_is_l
+    #####:  303:                           ? umaxtostr (strlen (argv[op - 1]), lbuf)
+    #####:  304:                           : find_int (argv[op - 1]));
+    #####:  305:          char const *r = (r_is_l
+    #####:  306:                           ? umaxtostr (strlen (argv[op + 2]), rbuf)
+    #####:  307:                           : find_int (argv[op + 1]));
+    #####:  308:          int cmp = strintcmp (l, r);
+    #####:  309:          bool xe_operator = (argv[op][2] == 'e');
+    #####:  310:          pos += 3;
+    #####:  311:          return (argv[op][1] == 'l' ? cmp < xe_operator
+    #####:  312:                  : argv[op][1] == 'g' ? cmp > - xe_operator
+    #####:  313:                  : (cmp != 0) == xe_operator);
+        -:  314:        }
+        -:  315:
+    #####:  316:      switch (argv[op][1])
+        -:  317:        {
+        -:  318:        default:
+    #####:  319:          break;
+        -:  320:
+        -:  321:        case 'n':
+    #####:  322:          if (argv[op][2] == 't' && !argv[op][3])
+        -:  323:            {
+        -:  324:              /* nt - newer than */
+        -:  325:              struct timespec lt, rt;
+        -:  326:              bool le, re;
+    #####:  327:              pos += 3;
+    #####:  328:              if (l_is_l || r_is_l)
+    #####:  329:                test_syntax_error (_("-nt does not accept -l"), NULL);
+    #####:  330:              le = get_mtime (argv[op - 1], &lt);
+    #####:  331:              re = get_mtime (argv[op + 1], &rt);
+    #####:  332:              return le && (!re || timespec_cmp (lt, rt) > 0);
+        -:  333:            }
+    #####:  334:          break;
+        -:  335:
+        -:  336:        case 'e':
+    #####:  337:          if (argv[op][2] == 'f' && !argv[op][3])
+        -:  338:            {
+        -:  339:              /* ef - hard link? */
+    #####:  340:              pos += 3;
+    #####:  341:              if (l_is_l || r_is_l)
+    #####:  342:                test_syntax_error (_("-ef does not accept -l"), NULL);
+    #####:  343:              return (stat (argv[op - 1], &stat_buf) == 0
+    #####:  344:                      && stat (argv[op + 1], &stat_spare) == 0
+    #####:  345:                      && stat_buf.st_dev == stat_spare.st_dev
+    #####:  346:                      && stat_buf.st_ino == stat_spare.st_ino);
+        -:  347:            }
+    #####:  348:          break;
+        -:  349:
+        -:  350:        case 'o':
+    #####:  351:          if ('t' == argv[op][2] && '\000' == argv[op][3])
+        -:  352:            {
+        -:  353:              /* ot - older than */
+        -:  354:              struct timespec lt, rt;
+        -:  355:              bool le, re;
+    #####:  356:              pos += 3;
+    #####:  357:              if (l_is_l || r_is_l)
+    #####:  358:                test_syntax_error (_("-ot does not accept -l"), NULL);
+    #####:  359:              le = get_mtime (argv[op - 1], &lt);
+    #####:  360:              re = get_mtime (argv[op + 1], &rt);
+    #####:  361:              return re && (!le || timespec_cmp (lt, rt) < 0);
+        -:  362:            }
+    #####:  363:          break;
+        -:  364:        }
+        -:  365:
+        -:  366:      /* FIXME: is this dead code? */
+    #####:  367:      test_syntax_error (_("unknown binary operator"), argv[op]);
+        -:  368:    }
+        -:  369:
+    #####:  370:  if (argv[op][0] == '='
+    #####:  371:      && (!argv[op][1] || ((argv[op][1] == '=') && !argv[op][2])))
+        -:  372:    {
+    #####:  373:      bool value = STREQ (argv[pos], argv[pos + 2]);
+    #####:  374:      pos += 3;
+    #####:  375:      return value;
+        -:  376:    }
+        -:  377:
+    #####:  378:  if (STREQ (argv[op], "!="))
+        -:  379:    {
+    #####:  380:      bool value = !STREQ (argv[pos], argv[pos + 2]);
+    #####:  381:      pos += 3;
+    #####:  382:      return value;
+        -:  383:    }
+        -:  384:
+        -:  385:  /* Not reached.  */
+    #####:  386:  abort ();
+        -:  387:}
+        -:  388:
+        -:  389:static bool
+        8:  390:unary_operator (void)
+        -:  391:{
+        -:  392:  struct stat stat_buf;
+        -:  393:
+        8:  394:  switch (argv[pos][1])
+        -:  395:    {
+        -:  396:    default:
+    #####:  397:      return false;
+        -:  398:
+        -:  399:      /* All of the following unary operators use unary_advance (), which
+        -:  400:         checks to make sure that there is an argument, and then advances
+        -:  401:         pos right past it.  This means that pos - 1 is the location of the
+        -:  402:         argument. */
+        -:  403:
+        -:  404:    case 'a':			/* file exists in the file system? */
+        -:  405:    case 'e':
+    #####:  406:      unary_advance ();
+    #####:  407:      return stat (argv[pos - 1], &stat_buf) == 0;
+        -:  408:
+        -:  409:    case 'r':			/* file is readable? */
+    #####:  410:      unary_advance ();
+    #####:  411:      return euidaccess (argv[pos - 1], R_OK) == 0;
+        -:  412:
+        -:  413:    case 'w':			/* File is writable? */
+    #####:  414:      unary_advance ();
+    #####:  415:      return euidaccess (argv[pos - 1], W_OK) == 0;
+        -:  416:
+        -:  417:    case 'x':			/* File is executable? */
+    #####:  418:      unary_advance ();
+    #####:  419:      return euidaccess (argv[pos - 1], X_OK) == 0;
+        -:  420:
+        -:  421:    case 'O':			/* File is owned by you? */
+        -:  422:      {
+    #####:  423:        unary_advance ();
+    #####:  424:        if (stat (argv[pos - 1], &stat_buf) != 0)
+    #####:  425:          return false;
+    #####:  426:        errno = 0;
+    #####:  427:        uid_t euid = geteuid ();
+    #####:  428:        uid_t NO_UID = -1;
+    #####:  429:        return ! (euid == NO_UID && errno) && euid == stat_buf.st_uid;
+        -:  430:      }
+        -:  431:
+        -:  432:    case 'G':			/* File is owned by your group? */
+        -:  433:      {
+    #####:  434:        unary_advance ();
+    #####:  435:        if (stat (argv[pos - 1], &stat_buf) != 0)
+    #####:  436:          return false;
+    #####:  437:        errno = 0;
+    #####:  438:        gid_t egid = getegid ();
+    #####:  439:        gid_t NO_GID = -1;
+    #####:  440:        return ! (egid == NO_GID && errno) && egid == stat_buf.st_gid;
+        -:  441:      }
+        -:  442:
+        -:  443:    case 'f':			/* File is a file? */
+    #####:  444:      unary_advance ();
+        -:  445:      /* Under POSIX, -f is true if the given file exists
+        -:  446:         and is a regular file. */
+    #####:  447:      return (stat (argv[pos - 1], &stat_buf) == 0
+    #####:  448:              && S_ISREG (stat_buf.st_mode));
+        -:  449:
+        -:  450:    case 'd':			/* File is a directory? */
+    #####:  451:      unary_advance ();
+    #####:  452:      return (stat (argv[pos - 1], &stat_buf) == 0
+    #####:  453:              && S_ISDIR (stat_buf.st_mode));
+        -:  454:
+        -:  455:    case 's':			/* File has something in it? */
+    #####:  456:      unary_advance ();
+    #####:  457:      return (stat (argv[pos - 1], &stat_buf) == 0
+    #####:  458:              && 0 < stat_buf.st_size);
+        -:  459:
+        -:  460:    case 'S':			/* File is a socket? */
+    #####:  461:      unary_advance ();
+    #####:  462:      return (stat (argv[pos - 1], &stat_buf) == 0
+    #####:  463:              && S_ISSOCK (stat_buf.st_mode));
+        -:  464:
+        -:  465:    case 'c':			/* File is character special? */
+    #####:  466:      unary_advance ();
+    #####:  467:      return (stat (argv[pos - 1], &stat_buf) == 0
+    #####:  468:              && S_ISCHR (stat_buf.st_mode));
+        -:  469:
+        -:  470:    case 'b':			/* File is block special? */
+    #####:  471:      unary_advance ();
+    #####:  472:      return (stat (argv[pos - 1], &stat_buf) == 0
+    #####:  473:              && S_ISBLK (stat_buf.st_mode));
+        -:  474:
+        -:  475:    case 'p':			/* File is a named pipe? */
+    #####:  476:      unary_advance ();
+    #####:  477:      return (stat (argv[pos - 1], &stat_buf) == 0
+    #####:  478:              && S_ISFIFO (stat_buf.st_mode));
+        -:  479:
+        -:  480:    case 'L':			/* Same as -h  */
+        -:  481:      /*FALLTHROUGH*/
+        -:  482:
+        -:  483:    case 'h':			/* File is a symbolic link? */
+    #####:  484:      unary_advance ();
+    #####:  485:      return (lstat (argv[pos - 1], &stat_buf) == 0
+    #####:  486:              && S_ISLNK (stat_buf.st_mode));
+        -:  487:
+        -:  488:    case 'u':			/* File is setuid? */
+        2:  489:      unary_advance ();
+        4:  490:      return (stat (argv[pos - 1], &stat_buf) == 0
+        2:  491:              && (stat_buf.st_mode & S_ISUID));
+        -:  492:
+        -:  493:    case 'g':			/* File is setgid? */
+        2:  494:      unary_advance ();
+        4:  495:      return (stat (argv[pos - 1], &stat_buf) == 0
+        2:  496:              && (stat_buf.st_mode & S_ISGID));
+        -:  497:
+        -:  498:    case 'k':			/* File has sticky bit set? */
+        4:  499:      unary_advance ();
+        8:  500:      return (stat (argv[pos - 1], &stat_buf) == 0
+        4:  501:              && (stat_buf.st_mode & S_ISVTX));
+        -:  502:
+        -:  503:    case 't':			/* File (fd) is a terminal? */
+        -:  504:      {
+        -:  505:        long int fd;
+        -:  506:        char const *arg;
+    #####:  507:        unary_advance ();
+    #####:  508:        arg = find_int (argv[pos - 1]);
+    #####:  509:        errno = 0;
+    #####:  510:        fd = strtol (arg, NULL, 10);
+    #####:  511:        return (errno != ERANGE && 0 <= fd && fd <= INT_MAX && isatty (fd));
+        -:  512:      }
+        -:  513:
+        -:  514:    case 'n':			/* True if arg has some length. */
+    #####:  515:      unary_advance ();
+    #####:  516:      return argv[pos - 1][0] != 0;
+        -:  517:
+        -:  518:    case 'z':			/* True if arg has no length. */
+    #####:  519:      unary_advance ();
+    #####:  520:      return argv[pos - 1][0] == '\0';
+        -:  521:    }
+        -:  522:}
+        -:  523:
+        -:  524:/*
+        -:  525: * and:
+        -:  526: *	term
+        -:  527: *	term '-a' and
+        -:  528: */
+        -:  529:static bool
+    #####:  530:and (void)
+        -:  531:{
+    #####:  532:  bool value = true;
+        -:  533:
+        -:  534:  while (true)
+        -:  535:    {
+    #####:  536:      value &= term ();
+    #####:  537:      if (! (pos < argc && STREQ (argv[pos], "-a")))
+    #####:  538:        return value;
+    #####:  539:      advance (false);
+    #####:  540:    }
+        -:  541:}
+        -:  542:
+        -:  543:/*
+        -:  544: * or:
+        -:  545: *	and
+        -:  546: *	and '-o' or
+        -:  547: */
+        -:  548:static bool
+    #####:  549:or (void)
+        -:  550:{
+    #####:  551:  bool value = false;
+        -:  552:
+        -:  553:  while (true)
+        -:  554:    {
+    #####:  555:      value |= and ();
+    #####:  556:      if (! (pos < argc && STREQ (argv[pos], "-o")))
+    #####:  557:        return value;
+    #####:  558:      advance (false);
+    #####:  559:    }
+        -:  560:}
+        -:  561:
+        -:  562:/*
+        -:  563: * expr:
+        -:  564: *	or
+        -:  565: */
+        -:  566:static bool
+    #####:  567:expr (void)
+        -:  568:{
+    #####:  569:  if (pos >= argc)
+    #####:  570:    beyond ();
+        -:  571:
+    #####:  572:  return or ();		/* Same with this. */
+        -:  573:}
+        -:  574:
+        -:  575:/* Return true if OP is one of the test command's unary operators. */
+        -:  576:static bool
+        8:  577:test_unop (char const *op)
+        -:  578:{
+        8:  579:  if (op[0] != '-')
+    #####:  580:    return false;
+        -:  581:
+        8:  582:  switch (op[1])
+        -:  583:    {
+        -:  584:    case 'a': case 'b': case 'c': case 'd': case 'e':
+        -:  585:    case 'f': case 'g': case 'h': case 'k': case 'n':
+        -:  586:    case 'o': case 'p': case 'r': case 's': case 't':
+        -:  587:    case 'u': case 'w': case 'x': case 'z':
+        -:  588:    case 'G': case 'L': case 'O': case 'S': case 'N':
+        8:  589:      return true;
+        -:  590:    default:
+    #####:  591:      return false;
+        -:  592:    }
+        -:  593:}
+        -:  594:
+        -:  595:static bool
+    #####:  596:one_argument (void)
+        -:  597:{
+    #####:  598:  return argv[pos++][0] != '\0';
+        -:  599:}
+        -:  600:
+        -:  601:static bool
+        8:  602:two_arguments (void)
+        -:  603:{
+        -:  604:  bool value;
+        -:  605:
+        8:  606:  if (STREQ (argv[pos], "!"))
+        -:  607:    {
+    #####:  608:      advance (false);
+    #####:  609:      value = ! one_argument ();
+        -:  610:    }
+        8:  611:  else if (argv[pos][0] == '-'
+        8:  612:           && argv[pos][1] != '\0'
+        8:  613:           && argv[pos][2] == '\0')
+        -:  614:    {
+       16:  615:      if (test_unop (argv[pos]))
+        8:  616:        value = unary_operator ();
+        -:  617:      else
+    #####:  618:        test_syntax_error (_("%s: unary operator expected"), argv[pos]);
+        -:  619:    }
+        -:  620:  else
+    #####:  621:    beyond ();
+        8:  622:  return (value);
+        -:  623:}
+        -:  624:
+        -:  625:static bool
+    #####:  626:three_arguments (void)
+        -:  627:{
+        -:  628:  bool value;
+        -:  629:
+    #####:  630:  if (binop (argv[pos + 1]))
+    #####:  631:    value = binary_operator (false);
+    #####:  632:  else if (STREQ (argv[pos], "!"))
+        -:  633:    {
+    #####:  634:      advance (true);
+    #####:  635:      value = !two_arguments ();
+        -:  636:    }
+    #####:  637:  else if (STREQ (argv[pos], "(") && STREQ (argv[pos + 2], ")"))
+        -:  638:    {
+    #####:  639:      advance (false);
+    #####:  640:      value = one_argument ();
+    #####:  641:      advance (false);
+        -:  642:    }
+    #####:  643:  else if (STREQ (argv[pos + 1], "-a") || STREQ (argv[pos + 1], "-o"))
+    #####:  644:    value = expr ();
+        -:  645:  else
+    #####:  646:    test_syntax_error (_("%s: binary operator expected"), argv[pos+1]);
+    #####:  647:  return (value);
+        -:  648:}
+        -:  649:
+        -:  650:/* This is an implementation of a Posix.2 proposal by David Korn. */
+        -:  651:static bool
+        8:  652:posixtest (int nargs)
+        -:  653:{
+        -:  654:  bool value;
+        -:  655:
+        8:  656:  switch (nargs)
+        -:  657:    {
+        -:  658:      case 1:
+    #####:  659:        value = one_argument ();
+    #####:  660:        break;
+        -:  661:
+        -:  662:      case 2:
+        8:  663:        value = two_arguments ();
+        8:  664:        break;
+        -:  665:
+        -:  666:      case 3:
+    #####:  667:        value = three_arguments ();
+    #####:  668:        break;
+        -:  669:
+        -:  670:      case 4:
+    #####:  671:        if (STREQ (argv[pos], "!"))
+        -:  672:          {
+    #####:  673:            advance (true);
+    #####:  674:            value = !three_arguments ();
+    #####:  675:            break;
+        -:  676:          }
+    #####:  677:        if (STREQ (argv[pos], "(") && STREQ (argv[pos + 3], ")"))
+        -:  678:          {
+    #####:  679:            advance (false);
+    #####:  680:            value = two_arguments ();
+    #####:  681:            advance (false);
+    #####:  682:            break;
+        -:  683:          }
+        -:  684:        /* FALLTHROUGH */
+        -:  685:      case 5:
+        -:  686:      default:
+    #####:  687:        if (nargs <= 0)
+    #####:  688:          abort ();
+    #####:  689:        value = expr ();
+        -:  690:    }
+        -:  691:
+        8:  692:  return (value);
+        -:  693:}
+        -:  694:
+        -:  695:#if defined TEST_STANDALONE
+        -:  696:
+        -:  697:void
+    #####:  698:usage (int status)
+        -:  699:{
+    #####:  700:  if (status != EXIT_SUCCESS)
+    #####:  701:    emit_try_help ();
+        -:  702:  else
+        -:  703:    {
+    #####:  704:      fputs (_("\
+        -:  705:Usage: test EXPRESSION\n\
+        -:  706:  or:  test\n\
+        -:  707:  or:  [ EXPRESSION ]\n\
+        -:  708:  or:  [ ]\n\
+        -:  709:  or:  [ OPTION\n\
+        -:  710:"), stdout);
+    #####:  711:      fputs (_("\
+        -:  712:Exit with the status determined by EXPRESSION.\n\
+        -:  713:\n\
+        -:  714:"), stdout);
+    #####:  715:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  716:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  717:      fputs (_("\
+        -:  718:\n\
+        -:  719:An omitted EXPRESSION defaults to false.  Otherwise,\n\
+        -:  720:EXPRESSION is true or false and sets exit status.  It is one of:\n\
+        -:  721:"), stdout);
+    #####:  722:      fputs (_("\
+        -:  723:\n\
+        -:  724:  ( EXPRESSION )               EXPRESSION is true\n\
+        -:  725:  ! EXPRESSION                 EXPRESSION is false\n\
+        -:  726:  EXPRESSION1 -a EXPRESSION2   both EXPRESSION1 and EXPRESSION2 are true\n\
+        -:  727:  EXPRESSION1 -o EXPRESSION2   either EXPRESSION1 or EXPRESSION2 is true\n\
+        -:  728:"), stdout);
+    #####:  729:      fputs (_("\
+        -:  730:\n\
+        -:  731:  -n STRING            the length of STRING is nonzero\n\
+        -:  732:  STRING               equivalent to -n STRING\n\
+        -:  733:  -z STRING            the length of STRING is zero\n\
+        -:  734:  STRING1 = STRING2    the strings are equal\n\
+        -:  735:  STRING1 != STRING2   the strings are not equal\n\
+        -:  736:"), stdout);
+    #####:  737:      fputs (_("\
+        -:  738:\n\
+        -:  739:  INTEGER1 -eq INTEGER2   INTEGER1 is equal to INTEGER2\n\
+        -:  740:  INTEGER1 -ge INTEGER2   INTEGER1 is greater than or equal to INTEGER2\n\
+        -:  741:  INTEGER1 -gt INTEGER2   INTEGER1 is greater than INTEGER2\n\
+        -:  742:  INTEGER1 -le INTEGER2   INTEGER1 is less than or equal to INTEGER2\n\
+        -:  743:  INTEGER1 -lt INTEGER2   INTEGER1 is less than INTEGER2\n\
+        -:  744:  INTEGER1 -ne INTEGER2   INTEGER1 is not equal to INTEGER2\n\
+        -:  745:"), stdout);
+    #####:  746:      fputs (_("\
+        -:  747:\n\
+        -:  748:  FILE1 -ef FILE2   FILE1 and FILE2 have the same device and inode numbers\n\
+        -:  749:  FILE1 -nt FILE2   FILE1 is newer (modification date) than FILE2\n\
+        -:  750:  FILE1 -ot FILE2   FILE1 is older than FILE2\n\
+        -:  751:"), stdout);
+    #####:  752:      fputs (_("\
+        -:  753:\n\
+        -:  754:  -b FILE     FILE exists and is block special\n\
+        -:  755:  -c FILE     FILE exists and is character special\n\
+        -:  756:  -d FILE     FILE exists and is a directory\n\
+        -:  757:  -e FILE     FILE exists\n\
+        -:  758:"), stdout);
+    #####:  759:      fputs (_("\
+        -:  760:  -f FILE     FILE exists and is a regular file\n\
+        -:  761:  -g FILE     FILE exists and is set-group-ID\n\
+        -:  762:  -G FILE     FILE exists and is owned by the effective group ID\n\
+        -:  763:  -h FILE     FILE exists and is a symbolic link (same as -L)\n\
+        -:  764:  -k FILE     FILE exists and has its sticky bit set\n\
+        -:  765:"), stdout);
+    #####:  766:      fputs (_("\
+        -:  767:  -L FILE     FILE exists and is a symbolic link (same as -h)\n\
+        -:  768:  -O FILE     FILE exists and is owned by the effective user ID\n\
+        -:  769:  -p FILE     FILE exists and is a named pipe\n\
+        -:  770:  -r FILE     FILE exists and read permission is granted\n\
+        -:  771:  -s FILE     FILE exists and has a size greater than zero\n\
+        -:  772:"), stdout);
+    #####:  773:      fputs (_("\
+        -:  774:  -S FILE     FILE exists and is a socket\n\
+        -:  775:  -t FD       file descriptor FD is opened on a terminal\n\
+        -:  776:  -u FILE     FILE exists and its set-user-ID bit is set\n\
+        -:  777:  -w FILE     FILE exists and write permission is granted\n\
+        -:  778:  -x FILE     FILE exists and execute (or search) permission is granted\n\
+        -:  779:"), stdout);
+    #####:  780:      fputs (_("\
+        -:  781:\n\
+        -:  782:Except for -h and -L, all FILE-related tests dereference symbolic links.\n\
+        -:  783:Beware that parentheses need to be escaped (e.g., by backslashes) for shells.\n\
+        -:  784:INTEGER may also be -l STRING, which evaluates to the length of STRING.\n\
+        -:  785:"), stdout);
+    #####:  786:      fputs (_("\
+        -:  787:\n\
+        -:  788:NOTE: [ honors the --help and --version options, but test does not.\n\
+        -:  789:test treats each of those as it treats any other nonempty STRING.\n\
+        -:  790:"), stdout);
+    #####:  791:      printf (USAGE_BUILTIN_WARNING, _("test and/or ["));
+    #####:  792:      emit_ancillary_info ();
+        -:  793:    }
+    #####:  794:  exit (status);
+        -:  795:}
+        -:  796:#endif /* TEST_STANDALONE */
+        -:  797:
+        -:  798:#if !defined TEST_STANDALONE
+        -:  799:# define main test_command
+        -:  800:#endif
+        -:  801:
+        -:  802:#define AUTHORS \
+        -:  803:  proper_name ("Kevin Braunsdorf"), \
+        -:  804:  proper_name ("Matthew Bradburn")
+        -:  805:
+        -:  806:/*
+        -:  807: * [:
+        -:  808: *	'[' expr ']'
+        -:  809: * test:
+        -:  810: *	test expr
+        -:  811: */
+        -:  812:int
+        8:  813:main (int margc, char **margv)
+        -:  814:{
+        -:  815:  bool value;
+        -:  816:
+        -:  817:#if !defined TEST_STANDALONE
+        -:  818:  int code;
+        -:  819:
+        -:  820:  code = setjmp (test_exit_buf);
+        -:  821:
+        -:  822:  if (code)
+        -:  823:    return (test_error_return);
+        -:  824:#else /* TEST_STANDALONE */
+        -:  825:  initialize_main (&margc, &margv);
+        8:  826:  set_program_name (margv[0]);
+        8:  827:  setlocale (LC_ALL, "");
+        -:  828:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  829:  textdomain (PACKAGE);
+        -:  830:
+        8:  831:  initialize_exit_failure (TEST_FAILURE);
+        8:  832:  atexit (close_stdout);
+        -:  833:#endif /* TEST_STANDALONE */
+        -:  834:
+        8:  835:  argv = margv;
+        -:  836:
+        -:  837:  if (LBRACKET)
+        -:  838:    {
+        -:  839:      /* Recognize --help or --version, but only when invoked in the
+        -:  840:         "[" form, when the last argument is not "]".  Use direct
+        -:  841:         parsing, rather than parse_long_options, to avoid accepting
+        -:  842:         abbreviations.  POSIX allows "[ --help" and "[ --version" to
+        -:  843:         have the usual GNU behavior, but it requires "test --help"
+        -:  844:         and "test --version" to exit silently with status 0.  */
+        -:  845:      if (margc == 2)
+        -:  846:        {
+        -:  847:          if (STREQ (margv[1], "--help"))
+        -:  848:            usage (EXIT_SUCCESS);
+        -:  849:
+        -:  850:          if (STREQ (margv[1], "--version"))
+        -:  851:            {
+        -:  852:              version_etc (stdout, PROGRAM_NAME, PACKAGE_NAME, Version, AUTHORS,
+        -:  853:                           (char *) NULL);
+        -:  854:              test_exit (EXIT_SUCCESS);
+        -:  855:            }
+        -:  856:        }
+        -:  857:      if (margc < 2 || !STREQ (margv[margc - 1], "]"))
+        -:  858:        test_syntax_error (_("missing ']'"), NULL);
+        -:  859:
+        -:  860:      --margc;
+        -:  861:    }
+        -:  862:
+        8:  863:  argc = margc;
+        8:  864:  pos = 1;
+        -:  865:
+        8:  866:  if (pos >= argc)
+    #####:  867:    test_exit (TEST_FALSE);
+        -:  868:
+        8:  869:  value = posixtest (argc - 1);
+        -:  870:
+        8:  871:  if (pos != argc)
+    #####:  872:    test_syntax_error (_("extra argument %s"), quote (argv[pos]));
+        -:  873:
+        8:  874:  test_exit (value ? TEST_TRUE : TEST_FALSE);
+        -:  875:}

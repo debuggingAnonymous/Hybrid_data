@@ -1,0 +1,443 @@
+        -:    0:Source:src/touch.c
+        -:    0:Graph:src/touch.gcno
+        -:    0:Data:src/touch.gcda
+        -:    0:Runs:1
+        -:    0:Programs:1
+        -:    1:/* touch -- change modification and access times of files
+        -:    2:   Copyright (C) 1987-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Written by Paul Rubin, Arnold Robbins, Jim Kingdon, David MacKenzie,
+        -:   18:   and Randy Smith. */
+        -:   19:
+        -:   20:#include <config.h>
+        -:   21:#include <stdio.h>
+        -:   22:#include <getopt.h>
+        -:   23:#include <sys/types.h>
+        -:   24:#include <assert.h>
+        -:   25:
+        -:   26:#include "system.h"
+        -:   27:#include "argmatch.h"
+        -:   28:#include "error.h"
+        -:   29:#include "fd-reopen.h"
+        -:   30:#include "parse-datetime.h"
+        -:   31:#include "posixtm.h"
+        -:   32:#include "posixver.h"
+        -:   33:#include "quote.h"
+        -:   34:#include "stat-time.h"
+        -:   35:#include "utimens.h"
+        -:   36:
+        -:   37:/* The official name of this program (e.g., no 'g' prefix).  */
+        -:   38:#define PROGRAM_NAME "touch"
+        -:   39:
+        -:   40:#define AUTHORS \
+        -:   41:  proper_name ("Paul Rubin"), \
+        -:   42:  proper_name ("Arnold Robbins"), \
+        -:   43:  proper_name ("Jim Kingdon"), \
+        -:   44:  proper_name ("David MacKenzie"), \
+        -:   45:  proper_name ("Randy Smith")
+        -:   46:
+        -:   47:/* Bitmasks for 'change_times'. */
+        -:   48:#define CH_ATIME 1
+        -:   49:#define CH_MTIME 2
+        -:   50:
+        -:   51:/* Which timestamps to change. */
+        -:   52:static int change_times;
+        -:   53:
+        -:   54:/* (-c) If true, don't create if not already there.  */
+        -:   55:static bool no_create;
+        -:   56:
+        -:   57:/* (-r) If true, use times from a reference file.  */
+        -:   58:static bool use_ref;
+        -:   59:
+        -:   60:/* (-h) If true, change the times of an existing symlink, if possible.  */
+        -:   61:static bool no_dereference;
+        -:   62:
+        -:   63:/* If true, the only thing we have to do is change both the
+        -:   64:   modification and access time to the current time, so we don't
+        -:   65:   have to own the file, just be able to read and write it.
+        -:   66:   On some systems, we can do this if we own the file, even though
+        -:   67:   we have neither read nor write access to it.  */
+        -:   68:static bool amtime_now;
+        -:   69:
+        -:   70:/* New access and modification times to use when setting time.  */
+        -:   71:static struct timespec newtime[2];
+        -:   72:
+        -:   73:/* File to use for -r. */
+        -:   74:static char *ref_file;
+        -:   75:
+        -:   76:/* For long options that have no equivalent short option, use a
+        -:   77:   non-character as a pseudo short option, starting with CHAR_MAX + 1.  */
+        -:   78:enum
+        -:   79:{
+        -:   80:  TIME_OPTION = CHAR_MAX + 1
+        -:   81:};
+        -:   82:
+        -:   83:static struct option const longopts[] =
+        -:   84:{
+        -:   85:  {"time", required_argument, NULL, TIME_OPTION},
+        -:   86:  {"no-create", no_argument, NULL, 'c'},
+        -:   87:  {"date", required_argument, NULL, 'd'},
+        -:   88:  {"reference", required_argument, NULL, 'r'},
+        -:   89:  {"no-dereference", no_argument, NULL, 'h'},
+        -:   90:  {GETOPT_HELP_OPTION_DECL},
+        -:   91:  {GETOPT_VERSION_OPTION_DECL},
+        -:   92:  {NULL, 0, NULL, 0}
+        -:   93:};
+        -:   94:
+        -:   95:/* Valid arguments to the '--time' option. */
+        -:   96:static char const* const time_args[] =
+        -:   97:{
+        -:   98:  "atime", "access", "use", "mtime", "modify", NULL
+        -:   99:};
+        -:  100:
+        -:  101:/* The bits in 'change_times' that those arguments set. */
+        -:  102:static int const time_masks[] =
+        -:  103:{
+        -:  104:  CH_ATIME, CH_ATIME, CH_ATIME, CH_MTIME, CH_MTIME
+        -:  105:};
+        -:  106:
+        -:  107:/* Store into *RESULT the result of interpreting FLEX_DATE as a date,
+        -:  108:   relative to NOW.  If NOW is null, use the current time.  */
+        -:  109:
+        -:  110:static void
+        1:  111:get_reldate (struct timespec *result,
+        -:  112:             char const *flex_date, struct timespec const *now)
+        -:  113:{
+        1:  114:  if (! parse_datetime (result, flex_date, now))
+    #####:  115:    error (EXIT_FAILURE, 0, _("invalid date format %s"), quote (flex_date));
+        1:  116:}
+        -:  117:
+        -:  118:/* Update the time of file FILE according to the options given.
+        -:  119:   Return true if successful.  */
+        -:  120:
+        -:  121:static bool
+        3:  122:touch (const char *file)
+        -:  123:{
+        -:  124:  bool ok;
+        3:  125:  int fd = -1;
+        3:  126:  int open_errno = 0;
+        3:  127:  struct timespec const *t = newtime;
+        -:  128:
+        3:  129:  if (STREQ (file, "-"))
+    #####:  130:    fd = STDOUT_FILENO;
+        3:  131:  else if (! (no_create || no_dereference))
+        -:  132:    {
+        -:  133:      /* Try to open FILE, creating it if necessary.  */
+        3:  134:      fd = fd_reopen (STDIN_FILENO, file,
+        -:  135:                      O_WRONLY | O_CREAT | O_NONBLOCK | O_NOCTTY, MODE_RW_UGO);
+        -:  136:
+        -:  137:      /* Don't save a copy of errno if it's EISDIR, since that would lead
+        -:  138:         touch to give a bogus diagnostic for e.g., 'touch /' (assuming
+        -:  139:         we don't own / or have write access to it).  On Solaris 5.6,
+        -:  140:         and probably other systems, it is EINVAL.  On SunOS4, it's EPERM.  */
+        3:  141:      if (fd == -1 && errno != EISDIR && errno != EINVAL && errno != EPERM)
+    #####:  142:        open_errno = errno;
+        -:  143:    }
+        -:  144:
+        3:  145:  if (change_times != (CH_ATIME | CH_MTIME))
+        -:  146:    {
+        -:  147:      /* We're setting only one of the time values.  */
+    #####:  148:      if (change_times == CH_MTIME)
+    #####:  149:        newtime[0].tv_nsec = UTIME_OMIT;
+        -:  150:      else
+        -:  151:        {
+    #####:  152:          assert (change_times == CH_ATIME);
+    #####:  153:          newtime[1].tv_nsec = UTIME_OMIT;
+        -:  154:        }
+        -:  155:    }
+        -:  156:
+        3:  157:  if (amtime_now)
+        -:  158:    {
+        -:  159:      /* Pass NULL to futimens so it will not fail if we have
+        -:  160:         write access to the file, but don't own it.  */
+    #####:  161:      t = NULL;
+        -:  162:    }
+        -:  163:
+        3:  164:  ok = (fdutimensat (fd, AT_FDCWD, (fd == STDOUT_FILENO ? NULL : file), t,
+    #####:  165:                     (no_dereference && fd == -1) ? AT_SYMLINK_NOFOLLOW : 0)
+        -:  166:        == 0);
+        -:  167:
+        3:  168:  if (fd == STDIN_FILENO)
+        -:  169:    {
+        3:  170:      if (close (STDIN_FILENO) != 0)
+        -:  171:        {
+    #####:  172:          error (0, errno, _("closing %s"), quote (file));
+    #####:  173:          return false;
+        -:  174:        }
+        -:  175:    }
+    #####:  176:  else if (fd == STDOUT_FILENO)
+        -:  177:    {
+        -:  178:      /* Do not diagnose "touch -c - >&-".  */
+    #####:  179:      if (!ok && errno == EBADF && no_create)
+    #####:  180:        return true;
+        -:  181:    }
+        -:  182:
+        3:  183:  if (!ok)
+        -:  184:    {
+    #####:  185:      if (open_errno)
+        -:  186:        {
+        -:  187:          /* The wording of this diagnostic should cover at least two cases:
+        -:  188:             - the file does not exist, but the parent directory is unwritable
+        -:  189:             - the file exists, but it isn't writable
+        -:  190:             I think it's not worth trying to distinguish them.  */
+    #####:  191:          error (0, open_errno, _("cannot touch %s"), quote (file));
+        -:  192:        }
+        -:  193:      else
+        -:  194:        {
+    #####:  195:          if (no_create && errno == ENOENT)
+    #####:  196:            return true;
+    #####:  197:          error (0, errno, _("setting times of %s"), quote (file));
+        -:  198:        }
+    #####:  199:      return false;
+        -:  200:    }
+        -:  201:
+        3:  202:  return true;
+        -:  203:}
+        -:  204:
+        -:  205:void
+    #####:  206:usage (int status)
+        -:  207:{
+    #####:  208:  if (status != EXIT_SUCCESS)
+    #####:  209:    emit_try_help ();
+        -:  210:  else
+        -:  211:    {
+    #####:  212:      printf (_("Usage: %s [OPTION]... FILE...\n"), program_name);
+    #####:  213:      fputs (_("\
+        -:  214:Update the access and modification times of each FILE to the current time.\n\
+        -:  215:\n\
+        -:  216:A FILE argument that does not exist is created empty, unless -c or -h\n\
+        -:  217:is supplied.\n\
+        -:  218:\n\
+        -:  219:A FILE argument string of - is handled specially and causes touch to\n\
+        -:  220:change the times of the file associated with standard output.\n\
+        -:  221:\n\
+        -:  222:"), stdout);
+    #####:  223:      fputs (_("\
+        -:  224:Mandatory arguments to long options are mandatory for short options too.\n\
+        -:  225:"), stdout);
+    #####:  226:      fputs (_("\
+        -:  227:  -a                     change only the access time\n\
+        -:  228:  -c, --no-create        do not create any files\n\
+        -:  229:  -d, --date=STRING      parse STRING and use it instead of current time\n\
+        -:  230:  -f                     (ignored)\n\
+        -:  231:"), stdout);
+    #####:  232:      fputs (_("\
+        -:  233:  -h, --no-dereference   affect each symbolic link instead of any referenced\n\
+        -:  234:                         file (useful only on systems that can change the\n\
+        -:  235:                         timestamps of a symlink)\n\
+        -:  236:  -m                     change only the modification time\n\
+        -:  237:"), stdout);
+    #####:  238:      fputs (_("\
+        -:  239:  -r, --reference=FILE   use this file's times instead of current time\n\
+        -:  240:  -t STAMP               use [[CC]YY]MMDDhhmm[.ss] instead of current time\n\
+        -:  241:      --time=WORD        change the specified time:\n\
+        -:  242:                           WORD is access, atime, or use: equivalent to -a\n\
+        -:  243:                           WORD is modify or mtime: equivalent to -m\n\
+        -:  244:"), stdout);
+    #####:  245:      fputs (HELP_OPTION_DESCRIPTION, stdout);
+    #####:  246:      fputs (VERSION_OPTION_DESCRIPTION, stdout);
+    #####:  247:      fputs (_("\
+        -:  248:\n\
+        -:  249:Note that the -d and -t options accept different time-date formats.\n\
+        -:  250:"), stdout);
+    #####:  251:      emit_ancillary_info ();
+        -:  252:    }
+    #####:  253:  exit (status);
+        -:  254:}
+        -:  255:
+        -:  256:int
+        1:  257:main (int argc, char **argv)
+        -:  258:{
+        -:  259:  int c;
+        1:  260:  bool date_set = false;
+        1:  261:  bool ok = true;
+        1:  262:  char const *flex_date = NULL;
+        -:  263:
+        -:  264:  initialize_main (&argc, &argv);
+        1:  265:  set_program_name (argv[0]);
+        1:  266:  setlocale (LC_ALL, "");
+        -:  267:  bindtextdomain (PACKAGE, LOCALEDIR);
+        -:  268:  textdomain (PACKAGE);
+        -:  269:
+        1:  270:  atexit (close_stdout);
+        -:  271:
+        1:  272:  change_times = 0;
+        1:  273:  no_create = use_ref = false;
+        -:  274:
+        3:  275:  while ((c = getopt_long (argc, argv, "acd:fhmr:t:", longopts, NULL)) != -1)
+        -:  276:    {
+        1:  277:      switch (c)
+        -:  278:        {
+        -:  279:        case 'a':
+    #####:  280:          change_times |= CH_ATIME;
+    #####:  281:          break;
+        -:  282:
+        -:  283:        case 'c':
+    #####:  284:          no_create = true;
+    #####:  285:          break;
+        -:  286:
+        -:  287:        case 'd':
+        1:  288:          flex_date = optarg;
+        1:  289:          break;
+        -:  290:
+        -:  291:        case 'f':
+    #####:  292:          break;
+        -:  293:
+        -:  294:        case 'h':
+    #####:  295:          no_dereference = true;
+    #####:  296:          break;
+        -:  297:
+        -:  298:        case 'm':
+    #####:  299:          change_times |= CH_MTIME;
+    #####:  300:          break;
+        -:  301:
+        -:  302:        case 'r':
+    #####:  303:          use_ref = true;
+    #####:  304:          ref_file = optarg;
+    #####:  305:          break;
+        -:  306:
+        -:  307:        case 't':
+    #####:  308:          if (! posixtime (&newtime[0].tv_sec, optarg,
+        -:  309:                           PDS_LEADING_YEAR | PDS_CENTURY | PDS_SECONDS))
+    #####:  310:            error (EXIT_FAILURE, 0, _("invalid date format %s"),
+        -:  311:                   quote (optarg));
+    #####:  312:          newtime[0].tv_nsec = 0;
+    #####:  313:          newtime[1] = newtime[0];
+    #####:  314:          date_set = true;
+    #####:  315:          break;
+        -:  316:
+        -:  317:        case TIME_OPTION:	/* --time */
+    #####:  318:          change_times |= XARGMATCH ("--time", optarg,
+        -:  319:                                     time_args, time_masks);
+    #####:  320:          break;
+        -:  321:
+    #####:  322:        case_GETOPT_HELP_CHAR;
+        -:  323:
+    #####:  324:        case_GETOPT_VERSION_CHAR (PROGRAM_NAME, AUTHORS);
+        -:  325:
+        -:  326:        default:
+    #####:  327:          usage (EXIT_FAILURE);
+        -:  328:        }
+        -:  329:    }
+        -:  330:
+        1:  331:  if (change_times == 0)
+        1:  332:    change_times = CH_ATIME | CH_MTIME;
+        -:  333:
+        1:  334:  if (date_set && (use_ref || flex_date))
+        -:  335:    {
+    #####:  336:      error (0, 0, _("cannot specify times from more than one source"));
+    #####:  337:      usage (EXIT_FAILURE);
+        -:  338:    }
+        -:  339:
+        1:  340:  if (use_ref)
+        -:  341:    {
+        -:  342:      struct stat ref_stats;
+        -:  343:      /* Don't use (no_dereference?lstat:stat) (args), since stat
+        -:  344:         might be an object-like macro.  */
+    #####:  345:      if (no_dereference ? lstat (ref_file, &ref_stats)
+    #####:  346:          : stat (ref_file, &ref_stats))
+    #####:  347:        error (EXIT_FAILURE, errno,
+        -:  348:               _("failed to get attributes of %s"), quote (ref_file));
+    #####:  349:      newtime[0] = get_stat_atime (&ref_stats);
+    #####:  350:      newtime[1] = get_stat_mtime (&ref_stats);
+    #####:  351:      date_set = true;
+    #####:  352:      if (flex_date)
+        -:  353:        {
+    #####:  354:          if (change_times & CH_ATIME)
+    #####:  355:            get_reldate (&newtime[0], flex_date, &newtime[0]);
+    #####:  356:          if (change_times & CH_MTIME)
+    #####:  357:            get_reldate (&newtime[1], flex_date, &newtime[1]);
+        -:  358:        }
+        -:  359:    }
+        -:  360:  else
+        -:  361:    {
+        1:  362:      if (flex_date)
+        -:  363:        {
+        -:  364:          struct timespec now;
+        1:  365:          gettime (&now);
+        1:  366:          get_reldate (&newtime[0], flex_date, &now);
+        1:  367:          newtime[1] = newtime[0];
+        1:  368:          date_set = true;
+        -:  369:
+        -:  370:          /* If neither -a nor -m is specified, treat "-d now" as if
+        -:  371:             it were absent; this lets "touch" succeed more often in
+        -:  372:             the presence of restrictive permissions.  */
+        1:  373:          if (change_times == (CH_ATIME | CH_MTIME)
+        1:  374:              && newtime[0].tv_sec == now.tv_sec
+    #####:  375:              && newtime[0].tv_nsec == now.tv_nsec)
+        -:  376:            {
+        -:  377:              /* Check that it really was "-d now", and not a time
+        -:  378:                 stamp that just happens to be the current time.  */
+        -:  379:              struct timespec notnow, notnow1;
+    #####:  380:              notnow.tv_sec = now.tv_sec ^ 1;
+    #####:  381:              notnow.tv_nsec = now.tv_nsec;
+    #####:  382:              get_reldate (&notnow1, flex_date, &notnow);
+    #####:  383:              if (notnow1.tv_sec == notnow.tv_sec
+    #####:  384:                  && notnow1.tv_nsec == notnow.tv_nsec)
+    #####:  385:                date_set = false;
+        -:  386:            }
+        -:  387:        }
+        -:  388:    }
+        -:  389:
+        -:  390:  /* The obsolete 'MMDDhhmm[YY]' form is valid IFF there are
+        -:  391:     two or more non-option arguments.  */
+        1:  392:  if (!date_set && 2 <= argc - optind && posix2_version () < 200112
+    #####:  393:      && posixtime (&newtime[0].tv_sec, argv[optind],
+        -:  394:                    PDS_TRAILING_YEAR | PDS_PRE_2000))
+        -:  395:    {
+    #####:  396:      newtime[0].tv_nsec = 0;
+    #####:  397:      newtime[1] = newtime[0];
+    #####:  398:      date_set = true;
+        -:  399:
+    #####:  400:      if (! getenv ("POSIXLY_CORRECT"))
+        -:  401:        {
+    #####:  402:          struct tm const *tm = localtime (&newtime[0].tv_sec);
+        -:  403:
+        -:  404:          /* Technically, it appears that even a deliberate attempt to cause
+        -:  405:             the above localtime to return NULL will always fail because our
+        -:  406:             posixtime implementation rejects all dates for which localtime
+        -:  407:             would fail.  However, skip the warning if it ever fails.  */
+    #####:  408:          if (tm)
+    #####:  409:            error (0, 0,
+        -:  410:                   _("warning: 'touch %s' is obsolete; use "
+        -:  411:                     "'touch -t %04ld%02d%02d%02d%02d.%02d'"),
+    #####:  412:                   argv[optind],
+    #####:  413:                   tm->tm_year + 1900L, tm->tm_mon + 1, tm->tm_mday,
+        -:  414:                   tm->tm_hour, tm->tm_min, tm->tm_sec);
+        -:  415:        }
+        -:  416:
+    #####:  417:      optind++;
+        -:  418:    }
+        -:  419:
+        1:  420:  if (!date_set)
+        -:  421:    {
+    #####:  422:      if (change_times == (CH_ATIME | CH_MTIME))
+    #####:  423:        amtime_now = true;
+        -:  424:      else
+    #####:  425:        newtime[1].tv_nsec = newtime[0].tv_nsec = UTIME_NOW;
+        -:  426:    }
+        -:  427:
+        1:  428:  if (optind == argc)
+        -:  429:    {
+    #####:  430:      error (0, 0, _("missing file operand"));
+    #####:  431:      usage (EXIT_FAILURE);
+        -:  432:    }
+        -:  433:
+        4:  434:  for (; optind < argc; ++optind)
+        3:  435:    ok &= touch (argv[optind]);
+        -:  436:
+        1:  437:  exit (ok ? EXIT_SUCCESS : EXIT_FAILURE);
+        -:  438:}

@@ -1,0 +1,2766 @@
+        -:    0:Source:src/copy.c
+        -:    0:Graph:src/copy.gcno
+        -:    0:Data:src/copy.gcda
+        -:    0:Runs:4
+        -:    0:Programs:2
+        -:    1:/* copy.c -- core functions for copying files and directories
+        -:    2:   Copyright (C) 1989-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+        -:   16:
+        -:   17:/* Extracted from cp.c and librarified by Jim Meyering.  */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <stdio.h>
+        -:   21:#include <assert.h>
+        -:   22:#include <sys/ioctl.h>
+        -:   23:#include <sys/types.h>
+        -:   24:#include <selinux/selinux.h>
+        -:   25:
+        -:   26:#if HAVE_HURD_H
+        -:   27:# include <hurd.h>
+        -:   28:#endif
+        -:   29:#if HAVE_PRIV_H
+        -:   30:# include <priv.h>
+        -:   31:#endif
+        -:   32:
+        -:   33:#include "system.h"
+        -:   34:#include "acl.h"
+        -:   35:#include "backupfile.h"
+        -:   36:#include "buffer-lcm.h"
+        -:   37:#include "canonicalize.h"
+        -:   38:#include "copy.h"
+        -:   39:#include "cp-hash.h"
+        -:   40:#include "extent-scan.h"
+        -:   41:#include "error.h"
+        -:   42:#include "fadvise.h"
+        -:   43:#include "fcntl--.h"
+        -:   44:#include "fiemap.h"
+        -:   45:#include "file-set.h"
+        -:   46:#include "filemode.h"
+        -:   47:#include "filenamecat.h"
+        -:   48:#include "full-write.h"
+        -:   49:#include "hash.h"
+        -:   50:#include "hash-triple.h"
+        -:   51:#include "ignore-value.h"
+        -:   52:#include "ioblksize.h"
+        -:   53:#include "quote.h"
+        -:   54:#include "same.h"
+        -:   55:#include "savedir.h"
+        -:   56:#include "stat-size.h"
+        -:   57:#include "stat-time.h"
+        -:   58:#include "utimecmp.h"
+        -:   59:#include "utimens.h"
+        -:   60:#include "write-any-file.h"
+        -:   61:#include "areadlink.h"
+        -:   62:#include "yesno.h"
+        -:   63:
+        -:   64:#if USE_XATTR
+        -:   65:# include <attr/error_context.h>
+        -:   66:# include <attr/libattr.h>
+        -:   67:# include <stdarg.h>
+        -:   68:# include "verror.h"
+        -:   69:#endif
+        -:   70:
+        -:   71:#ifndef HAVE_FCHOWN
+        -:   72:# define HAVE_FCHOWN false
+        -:   73:# define fchown(fd, uid, gid) (-1)
+        -:   74:#endif
+        -:   75:
+        -:   76:#ifndef HAVE_LCHOWN
+        -:   77:# define HAVE_LCHOWN false
+        -:   78:# define lchown(name, uid, gid) chown (name, uid, gid)
+        -:   79:#endif
+        -:   80:
+        -:   81:#ifndef HAVE_MKFIFO
+        -:   82:static int
+        -:   83:rpl_mkfifo (char const *file, mode_t mode)
+        -:   84:{
+        -:   85:  errno = ENOTSUP;
+        -:   86:  return -1;
+        -:   87:}
+        -:   88:# define mkfifo rpl_mkfifo
+        -:   89:#endif
+        -:   90:
+        -:   91:#ifndef USE_ACL
+        -:   92:# define USE_ACL 0
+        -:   93:#endif
+        -:   94:
+        -:   95:#define SAME_OWNER(A, B) ((A).st_uid == (B).st_uid)
+        -:   96:#define SAME_GROUP(A, B) ((A).st_gid == (B).st_gid)
+        -:   97:#define SAME_OWNER_AND_GROUP(A, B) (SAME_OWNER (A, B) && SAME_GROUP (A, B))
+        -:   98:
+        -:   99:struct dir_list
+        -:  100:{
+        -:  101:  struct dir_list *parent;
+        -:  102:  ino_t ino;
+        -:  103:  dev_t dev;
+        -:  104:};
+        -:  105:
+        -:  106:/* Initial size of the cp.dest_info hash table.  */
+        -:  107:#define DEST_INFO_INITIAL_CAPACITY 61
+        -:  108:
+        -:  109:static bool copy_internal (char const *src_name, char const *dst_name,
+        -:  110:                           bool new_dst, dev_t device,
+        -:  111:                           struct dir_list *ancestors,
+        -:  112:                           const struct cp_options *x,
+        -:  113:                           bool command_line_arg,
+        -:  114:                           bool *first_dir_created_per_command_line_arg,
+        -:  115:                           bool *copy_into_self,
+        -:  116:                           bool *rename_succeeded);
+        -:  117:static bool owner_failure_ok (struct cp_options const *x);
+        -:  118:
+        -:  119:/* Pointers to the file names:  they're used in the diagnostic that is issued
+        -:  120:   when we detect the user is trying to copy a directory into itself.  */
+        -:  121:static char const *top_level_src_name;
+        -:  122:static char const *top_level_dst_name;
+        -:  123:
+        -:  124:/* Set the timestamp of symlink, FILE, to TIMESPEC.
+        -:  125:   If this system lacks support for that, simply return 0.  */
+        -:  126:static inline int
+    #####:  127:utimens_symlink (char const *file, struct timespec const *timespec)
+        -:  128:{
+    #####:  129:  int err = lutimens (file, timespec);
+        -:  130:  /* When configuring on a system with new headers and libraries, and
+        -:  131:     running on one with a kernel that is old enough to lack the syscall,
+        -:  132:     utimensat fails with ENOSYS.  Ignore that.  */
+    #####:  133:  if (err && errno == ENOSYS)
+    #####:  134:    err = 0;
+    #####:  135:  return err;
+        -:  136:}
+        -:  137:
+        -:  138:/* Copy the regular file open on SRC_FD/SRC_NAME to DST_FD/DST_NAME,
+        -:  139:   honoring the MAKE_HOLES setting and using the BUF_SIZE-byte buffer
+        -:  140:   BUF for temporary storage.  Copy no more than MAX_N_READ bytes.
+        -:  141:   Return true upon successful completion;
+        -:  142:   print a diagnostic and return false upon error.
+        -:  143:   Note that for best results, BUF should be "well"-aligned.
+        -:  144:   BUF must have sizeof(uintptr_t)-1 bytes of additional space
+        -:  145:   beyond BUF[BUF_SIZE-1].
+        -:  146:   Set *LAST_WRITE_MADE_HOLE to true if the final operation on
+        -:  147:   DEST_FD introduced a hole.  Set *TOTAL_N_READ to the number of
+        -:  148:   bytes read.  */
+        -:  149:static bool
+        1:  150:sparse_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
+        -:  151:             bool make_holes,
+        -:  152:             char const *src_name, char const *dst_name,
+        -:  153:             uintmax_t max_n_read, off_t *total_n_read,
+        -:  154:             bool *last_write_made_hole)
+        -:  155:{
+        1:  156:  *last_write_made_hole = false;
+        1:  157:  *total_n_read = 0;
+        -:  158:
+        3:  159:  while (max_n_read)
+        -:  160:    {
+        2:  161:      bool make_hole = false;
+        -:  162:
+        2:  163:      ssize_t n_read = read (src_fd, buf, MIN (max_n_read, buf_size));
+        2:  164:      if (n_read < 0)
+        -:  165:        {
+    #####:  166:          if (errno == EINTR)
+    #####:  167:            continue;
+    #####:  168:          error (0, errno, _("reading %s"), quote (src_name));
+    #####:  169:          return false;
+        -:  170:        }
+        2:  171:      if (n_read == 0)
+        1:  172:        break;
+        1:  173:      max_n_read -= n_read;
+        1:  174:      *total_n_read += n_read;
+        -:  175:
+        1:  176:      if (make_holes)
+        -:  177:        {
+        -:  178:          /* Sentinel required by is_nul().  */
+    #####:  179:          buf[n_read] = '\1';
+        -:  180:#ifdef lint
+        -:  181:          typedef uintptr_t word;
+        -:  182:          /* Usually, buf[n_read] is not the byte just before a "word"
+        -:  183:             (aka uintptr_t) boundary.  In that case, the word-oriented
+        -:  184:             test below (*wp++ == 0) would read some uninitialized bytes
+        -:  185:             after the sentinel.  To avoid false-positive reports about
+        -:  186:             this condition (e.g., from a tool like valgrind), set the
+        -:  187:             remaining bytes -- to any value.  */
+    #####:  188:          memset (buf + n_read + 1, 0, sizeof (word) - 1);
+        -:  189:#endif
+        -:  190:
+    #####:  191:          if ((make_hole = is_nul (buf, n_read)))
+        -:  192:            {
+    #####:  193:              if (lseek (dest_fd, n_read, SEEK_CUR) < 0)
+        -:  194:                {
+    #####:  195:                  error (0, errno, _("cannot lseek %s"), quote (dst_name));
+    #####:  196:                  return false;
+        -:  197:                }
+        -:  198:            }
+        -:  199:        }
+        -:  200:
+        1:  201:      if (!make_hole)
+        -:  202:        {
+        1:  203:          size_t n = n_read;
+        1:  204:          if (full_write (dest_fd, buf, n) != n)
+        -:  205:            {
+    #####:  206:              error (0, errno, _("writing %s"), quote (dst_name));
+    #####:  207:              return false;
+        -:  208:            }
+        -:  209:
+        -:  210:          /* It is tempting to return early here upon a short read from a
+        -:  211:             regular file.  That would save the final read syscall for each
+        -:  212:             file.  Unfortunately that doesn't work for certain files in
+        -:  213:             /proc with linux kernels from at least 2.6.9 .. 2.6.29.  */
+        -:  214:        }
+        -:  215:
+        1:  216:      *last_write_made_hole = make_hole;
+        -:  217:    }
+        -:  218:
+        1:  219:  return true;
+        -:  220:}
+        -:  221:
+        -:  222:/* Perform the O(1) btrfs clone operation, if possible.
+        -:  223:   Upon success, return 0.  Otherwise, return -1 and set errno.  */
+        -:  224:static inline int
+    #####:  225:clone_file (int dest_fd, int src_fd)
+        -:  226:{
+        -:  227:#ifdef __linux__
+        -:  228:# undef BTRFS_IOCTL_MAGIC
+        -:  229:# define BTRFS_IOCTL_MAGIC 0x94
+        -:  230:# undef BTRFS_IOC_CLONE
+        -:  231:# define BTRFS_IOC_CLONE _IOW (BTRFS_IOCTL_MAGIC, 9, int)
+    #####:  232:  return ioctl (dest_fd, BTRFS_IOC_CLONE, src_fd);
+        -:  233:#else
+        -:  234:  (void) dest_fd;
+        -:  235:  (void) src_fd;
+        -:  236:  errno = ENOTSUP;
+        -:  237:  return -1;
+        -:  238:#endif
+        -:  239:}
+        -:  240:
+        -:  241:/* Write N_BYTES zero bytes to file descriptor FD.  Return true if successful.
+        -:  242:   Upon write failure, set errno and return false.  */
+        -:  243:static bool
+    #####:  244:write_zeros (int fd, uint64_t n_bytes)
+        -:  245:{
+        -:  246:  static char *zeros;
+        -:  247:  static size_t nz = IO_BUFSIZE;
+        -:  248:
+        -:  249:  /* Attempt to use a relatively large calloc'd source buffer for
+        -:  250:     efficiency, but if that allocation fails, resort to a smaller
+        -:  251:     statically allocated one.  */
+    #####:  252:  if (zeros == NULL)
+        -:  253:    {
+        -:  254:      static char fallback[1024];
+    #####:  255:      zeros = calloc (nz, 1);
+    #####:  256:      if (zeros == NULL)
+        -:  257:        {
+    #####:  258:          zeros = fallback;
+    #####:  259:          nz = sizeof fallback;
+        -:  260:        }
+        -:  261:    }
+        -:  262:
+    #####:  263:  while (n_bytes)
+        -:  264:    {
+    #####:  265:      uint64_t n = MIN (nz, n_bytes);
+    #####:  266:      if ((full_write (fd, zeros, n)) != n)
+    #####:  267:        return false;
+    #####:  268:      n_bytes -= n;
+        -:  269:    }
+        -:  270:
+    #####:  271:  return true;
+        -:  272:}
+        -:  273:
+        -:  274:/* Perform an efficient extent copy, if possible.  This avoids
+        -:  275:   the overhead of detecting holes in hole-introducing/preserving
+        -:  276:   copy, and thus makes copying sparse files much more efficient.
+        -:  277:   Upon a successful copy, return true.  If the initial extent scan
+        -:  278:   fails, set *NORMAL_COPY_REQUIRED to true and return false.
+        -:  279:   Upon any other failure, set *NORMAL_COPY_REQUIRED to false and
+        -:  280:   return false.  */
+        -:  281:static bool
+    #####:  282:extent_copy (int src_fd, int dest_fd, char *buf, size_t buf_size,
+        -:  283:             off_t src_total_size, enum Sparse_type sparse_mode,
+        -:  284:             char const *src_name, char const *dst_name,
+        -:  285:             bool *require_normal_copy)
+        -:  286:{
+        -:  287:  struct extent_scan scan;
+    #####:  288:  off_t last_ext_start = 0;
+    #####:  289:  uint64_t last_ext_len = 0;
+        -:  290:
+        -:  291:  /* Keep track of the output position.
+        -:  292:     We may need this at the end, for a final ftruncate.  */
+    #####:  293:  off_t dest_pos = 0;
+        -:  294:
+    #####:  295:  extent_scan_init (src_fd, &scan);
+        -:  296:
+    #####:  297:  *require_normal_copy = false;
+    #####:  298:  bool wrote_hole_at_eof = true;
+        -:  299:  do
+        -:  300:    {
+    #####:  301:      bool ok = extent_scan_read (&scan);
+    #####:  302:      if (! ok)
+        -:  303:        {
+    #####:  304:          if (scan.hit_final_extent)
+    #####:  305:            break;
+        -:  306:
+    #####:  307:          if (scan.initial_scan_failed)
+        -:  308:            {
+    #####:  309:              *require_normal_copy = true;
+    #####:  310:              return false;
+        -:  311:            }
+        -:  312:
+    #####:  313:          error (0, errno, _("%s: failed to get extents info"),
+        -:  314:                 quote (src_name));
+    #####:  315:          return false;
+        -:  316:        }
+        -:  317:
+        -:  318:      unsigned int i;
+    #####:  319:      bool empty_extent = false;
+    #####:  320:      for (i = 0; i < scan.ei_count || empty_extent; i++)
+        -:  321:        {
+        -:  322:          off_t ext_start;
+        -:  323:          uint64_t ext_len;
+        -:  324:          uint64_t hole_size;
+        -:  325:
+    #####:  326:          if (i < scan.ei_count)
+        -:  327:            {
+    #####:  328:              ext_start = scan.ext_info[i].ext_logical;
+    #####:  329:              ext_len = scan.ext_info[i].ext_length;
+        -:  330:            }
+        -:  331:          else /* empty extent at EOF.  */
+        -:  332:            {
+    #####:  333:              i--;
+    #####:  334:              ext_start = last_ext_start + scan.ext_info[i].ext_length;
+    #####:  335:              ext_len = 0;
+        -:  336:            }
+        -:  337:
+    #####:  338:          hole_size = ext_start - last_ext_start - last_ext_len;
+        -:  339:
+    #####:  340:          wrote_hole_at_eof = false;
+        -:  341:
+    #####:  342:          if (hole_size)
+        -:  343:            {
+    #####:  344:              if (lseek (src_fd, ext_start, SEEK_SET) < 0)
+        -:  345:                {
+    #####:  346:                  error (0, errno, _("cannot lseek %s"), quote (src_name));
+        -:  347:                fail:
+    #####:  348:                  extent_scan_free (&scan);
+    #####:  349:                  return false;
+        -:  350:                }
+        -:  351:
+    #####:  352:              if ((empty_extent && sparse_mode == SPARSE_ALWAYS)
+    #####:  353:                  || (!empty_extent && sparse_mode != SPARSE_NEVER))
+        -:  354:                {
+    #####:  355:                  if (lseek (dest_fd, ext_start, SEEK_SET) < 0)
+        -:  356:                    {
+    #####:  357:                      error (0, errno, _("cannot lseek %s"), quote (dst_name));
+    #####:  358:                      goto fail;
+        -:  359:                    }
+    #####:  360:                  wrote_hole_at_eof = true;
+        -:  361:                }
+        -:  362:              else
+        -:  363:                {
+        -:  364:                  /* When not inducing holes and when there is a hole between
+        -:  365:                     the end of the previous extent and the beginning of the
+        -:  366:                     current one, write zeros to the destination file.  */
+    #####:  367:                  off_t nzeros = hole_size;
+    #####:  368:                  if (empty_extent)
+    #####:  369:                    nzeros = MIN (src_total_size - dest_pos, hole_size);
+        -:  370:
+    #####:  371:                  if (! write_zeros (dest_fd, nzeros))
+        -:  372:                    {
+    #####:  373:                      error (0, errno, _("%s: write failed"), quote (dst_name));
+    #####:  374:                      goto fail;
+        -:  375:                    }
+        -:  376:
+    #####:  377:                  dest_pos = MIN (src_total_size, ext_start);
+        -:  378:                }
+        -:  379:            }
+        -:  380:
+    #####:  381:          last_ext_start = ext_start;
+        -:  382:
+        -:  383:          /* Treat an unwritten but allocated extent much like a hole.
+        -:  384:             I.E. don't read, but don't convert to a hole in the destination,
+        -:  385:             unless SPARSE_ALWAYS.  */
+        -:  386:          /* For now, do not treat FIEMAP_EXTENT_UNWRITTEN specially,
+        -:  387:             because that (in combination with no sync) would lead to data
+        -:  388:             loss at least on XFS and ext4 when using 2.6.39-rc3 kernels.  */
+        -:  389:          if (0 && (scan.ext_info[i].ext_flags & FIEMAP_EXTENT_UNWRITTEN))
+        -:  390:            {
+        -:  391:              empty_extent = true;
+        -:  392:              last_ext_len = 0;
+        -:  393:              if (ext_len == 0) /* The last extent is empty and processed.  */
+        -:  394:                empty_extent = false;
+        -:  395:            }
+        -:  396:          else
+        -:  397:            {
+        -:  398:              off_t n_read;
+    #####:  399:              empty_extent = false;
+    #####:  400:              last_ext_len = ext_len;
+        -:  401:
+    #####:  402:              if ( ! sparse_copy (src_fd, dest_fd, buf, buf_size,
+        -:  403:                                  sparse_mode == SPARSE_ALWAYS,
+        -:  404:                                  src_name, dst_name, ext_len, &n_read,
+        -:  405:                                  &wrote_hole_at_eof))
+    #####:  406:                goto fail;
+        -:  407:
+    #####:  408:              dest_pos = ext_start + n_read;
+        -:  409:            }
+        -:  410:
+        -:  411:          /* If the file ends with unwritten extents not accounted for in the
+        -:  412:             size, then skip processing them, and the associated redundant
+        -:  413:             read() calls which will always return 0.  We will need to
+        -:  414:             remove this when we add fallocate() so that we can maintain
+        -:  415:             extents beyond the apparent size.  */
+    #####:  416:          if (dest_pos == src_total_size)
+        -:  417:            {
+    #####:  418:              scan.hit_final_extent = true;
+    #####:  419:              break;
+        -:  420:            }
+        -:  421:        }
+        -:  422:
+        -:  423:      /* Release the space allocated to scan->ext_info.  */
+    #####:  424:      extent_scan_free (&scan);
+        -:  425:
+        -:  426:    }
+    #####:  427:  while (! scan.hit_final_extent);
+        -:  428:
+        -:  429:  /* When the source file ends with a hole, we have to do a little more work,
+        -:  430:     since the above copied only up to and including the final extent.
+        -:  431:     In order to complete the copy, we may have to insert a hole or write
+        -:  432:     zeros in the destination corresponding to the source file's hole-at-EOF.
+        -:  433:
+        -:  434:     In addition, if the final extent was a block of zeros at EOF and we've
+        -:  435:     just converted them to a hole in the destination, we must call ftruncate
+        -:  436:     here in order to record the proper length in the destination.  */
+    #####:  437:  if ((dest_pos < src_total_size || wrote_hole_at_eof)
+    #####:  438:      && (sparse_mode != SPARSE_NEVER
+    #####:  439:          ? ftruncate (dest_fd, src_total_size)
+    #####:  440:          : ! write_zeros (dest_fd, src_total_size - dest_pos)))
+        -:  441:    {
+    #####:  442:      error (0, errno, _("failed to extend %s"), quote (dst_name));
+    #####:  443:      return false;
+        -:  444:    }
+        -:  445:
+    #####:  446:  return true;
+        -:  447:}
+        -:  448:
+        -:  449:/* FIXME: describe */
+        -:  450:/* FIXME: rewrite this to use a hash table so we avoid the quadratic
+        -:  451:   performance hit that's probably noticeable only on trees deeper
+        -:  452:   than a few hundred levels.  See use of active_dir_map in remove.c  */
+        -:  453:
+        -:  454:static bool _GL_ATTRIBUTE_PURE
+    #####:  455:is_ancestor (const struct stat *sb, const struct dir_list *ancestors)
+        -:  456:{
+    #####:  457:  while (ancestors != 0)
+        -:  458:    {
+    #####:  459:      if (ancestors->ino == sb->st_ino && ancestors->dev == sb->st_dev)
+    #####:  460:        return true;
+    #####:  461:      ancestors = ancestors->parent;
+        -:  462:    }
+    #####:  463:  return false;
+        -:  464:}
+        -:  465:
+        -:  466:static bool
+    #####:  467:errno_unsupported (int err)
+        -:  468:{
+    #####:  469:  return err == ENOTSUP || err == ENODATA;
+        -:  470:}
+        -:  471:
+        -:  472:#if USE_XATTR
+        -:  473:static void
+        -:  474:copy_attr_error (struct error_context *ctx ATTRIBUTE_UNUSED,
+        -:  475:                 char const *fmt, ...)
+        -:  476:{
+        -:  477:  if (!errno_unsupported (errno))
+        -:  478:    {
+        -:  479:      int err = errno;
+        -:  480:      va_list ap;
+        -:  481:
+        -:  482:      /* use verror module to print error message */
+        -:  483:      va_start (ap, fmt);
+        -:  484:      verror (0, err, fmt, ap);
+        -:  485:      va_end (ap);
+        -:  486:    }
+        -:  487:}
+        -:  488:
+        -:  489:static void
+        -:  490:copy_attr_allerror (struct error_context *ctx ATTRIBUTE_UNUSED,
+        -:  491:                 char const *fmt, ...)
+        -:  492:{
+        -:  493:  int err = errno;
+        -:  494:  va_list ap;
+        -:  495:
+        -:  496:  /* use verror module to print error message */
+        -:  497:  va_start (ap, fmt);
+        -:  498:  verror (0, err, fmt, ap);
+        -:  499:  va_end (ap);
+        -:  500:}
+        -:  501:
+        -:  502:static char const *
+        -:  503:copy_attr_quote (struct error_context *ctx ATTRIBUTE_UNUSED, char const *str)
+        -:  504:{
+        -:  505:  return quote (str);
+        -:  506:}
+        -:  507:
+        -:  508:static void
+        -:  509:copy_attr_free (struct error_context *ctx ATTRIBUTE_UNUSED,
+        -:  510:                char const *str ATTRIBUTE_UNUSED)
+        -:  511:{
+        -:  512:}
+        -:  513:
+        -:  514:/* If positive SRC_FD and DST_FD descriptors are passed,
+        -:  515:   then copy by fd, otherwise copy by name.  */
+        -:  516:
+        -:  517:static bool
+        -:  518:copy_attr (char const *src_path, int src_fd,
+        -:  519:           char const *dst_path, int dst_fd, struct cp_options const *x)
+        -:  520:{
+        -:  521:  int ret;
+        -:  522:  bool all_errors = (!x->data_copy_required || x->require_preserve_xattr);
+        -:  523:  bool some_errors = (!all_errors && !x->reduce_diagnostics);
+        -:  524:  struct error_context ctx =
+        -:  525:  {
+        -:  526:    .error = all_errors ? copy_attr_allerror : copy_attr_error,
+        -:  527:    .quote = copy_attr_quote,
+        -:  528:    .quote_free = copy_attr_free
+        -:  529:  };
+        -:  530:  if (0 <= src_fd && 0 <= dst_fd)
+        -:  531:    ret = attr_copy_fd (src_path, src_fd, dst_path, dst_fd, 0,
+        -:  532:                        (all_errors || some_errors ? &ctx : NULL));
+        -:  533:  else
+        -:  534:    ret = attr_copy_file (src_path, dst_path, 0,
+        -:  535:                          (all_errors || some_errors ? &ctx : NULL));
+        -:  536:
+        -:  537:  return ret == 0;
+        -:  538:}
+        -:  539:#else /* USE_XATTR */
+        -:  540:
+        -:  541:static bool
+        1:  542:copy_attr (char const *src_path ATTRIBUTE_UNUSED,
+        -:  543:           int src_fd ATTRIBUTE_UNUSED,
+        -:  544:           char const *dst_path ATTRIBUTE_UNUSED,
+        -:  545:           int dst_fd ATTRIBUTE_UNUSED,
+        -:  546:           struct cp_options const *x ATTRIBUTE_UNUSED)
+        -:  547:{
+        1:  548:  return true;
+        -:  549:}
+        -:  550:#endif /* USE_XATTR */
+        -:  551:
+        -:  552:/* Read the contents of the directory SRC_NAME_IN, and recursively
+        -:  553:   copy the contents to DST_NAME_IN.  NEW_DST is true if
+        -:  554:   DST_NAME_IN is a directory that was created previously in the
+        -:  555:   recursion.   SRC_SB and ANCESTORS describe SRC_NAME_IN.
+        -:  556:   Set *COPY_INTO_SELF if SRC_NAME_IN is a parent of
+        -:  557:   (or the same as) DST_NAME_IN; otherwise, clear it.
+        -:  558:   Propagate *FIRST_DIR_CREATED_PER_COMMAND_LINE_ARG from
+        -:  559:   caller to each invocation of copy_internal.  Be careful to
+        -:  560:   pass the address of a temporary, and to update
+        -:  561:   *FIRST_DIR_CREATED_PER_COMMAND_LINE_ARG only upon completion.
+        -:  562:   Return true if successful.  */
+        -:  563:
+        -:  564:static bool
+    #####:  565:copy_dir (char const *src_name_in, char const *dst_name_in, bool new_dst,
+        -:  566:          const struct stat *src_sb, struct dir_list *ancestors,
+        -:  567:          const struct cp_options *x,
+        -:  568:          bool *first_dir_created_per_command_line_arg,
+        -:  569:          bool *copy_into_self)
+        -:  570:{
+        -:  571:  char *name_space;
+        -:  572:  char *namep;
+    #####:  573:  struct cp_options non_command_line_options = *x;
+    #####:  574:  bool ok = true;
+        -:  575:
+    #####:  576:  name_space = savedir (src_name_in);
+    #####:  577:  if (name_space == NULL)
+        -:  578:    {
+        -:  579:      /* This diagnostic is a bit vague because savedir can fail in
+        -:  580:         several different ways.  */
+    #####:  581:      error (0, errno, _("cannot access %s"), quote (src_name_in));
+    #####:  582:      return false;
+        -:  583:    }
+        -:  584:
+        -:  585:  /* For cp's -H option, dereference command line arguments, but do not
+        -:  586:     dereference symlinks that are found via recursive traversal.  */
+    #####:  587:  if (x->dereference == DEREF_COMMAND_LINE_ARGUMENTS)
+    #####:  588:    non_command_line_options.dereference = DEREF_NEVER;
+        -:  589:
+    #####:  590:  bool new_first_dir_created = false;
+    #####:  591:  namep = name_space;
+    #####:  592:  while (*namep != '\0')
+        -:  593:    {
+        -:  594:      bool local_copy_into_self;
+    #####:  595:      char *src_name = file_name_concat (src_name_in, namep, NULL);
+    #####:  596:      char *dst_name = file_name_concat (dst_name_in, namep, NULL);
+    #####:  597:      bool first_dir_created = *first_dir_created_per_command_line_arg;
+        -:  598:
+    #####:  599:      ok &= copy_internal (src_name, dst_name, new_dst, src_sb->st_dev,
+        -:  600:                           ancestors, &non_command_line_options, false,
+        -:  601:                           &first_dir_created,
+        -:  602:                           &local_copy_into_self, NULL);
+    #####:  603:      *copy_into_self |= local_copy_into_self;
+        -:  604:
+    #####:  605:      free (dst_name);
+    #####:  606:      free (src_name);
+        -:  607:
+        -:  608:      /* If we're copying into self, there's no point in continuing,
+        -:  609:         and in fact, that would even infloop, now that we record only
+        -:  610:         the first created directory per command line argument.  */
+    #####:  611:      if (local_copy_into_self)
+    #####:  612:        break;
+        -:  613:
+    #####:  614:      new_first_dir_created |= first_dir_created;
+    #####:  615:      namep += strlen (namep) + 1;
+        -:  616:    }
+    #####:  617:  free (name_space);
+    #####:  618:  *first_dir_created_per_command_line_arg = new_first_dir_created;
+        -:  619:
+    #####:  620:  return ok;
+        -:  621:}
+        -:  622:
+        -:  623:/* Set the owner and owning group of DEST_DESC to the st_uid and
+        -:  624:   st_gid fields of SRC_SB.  If DEST_DESC is undefined (-1), set
+        -:  625:   the owner and owning group of DST_NAME instead; for
+        -:  626:   safety prefer lchown if the system supports it since no
+        -:  627:   symbolic links should be involved.  DEST_DESC must
+        -:  628:   refer to the same file as DEST_NAME if defined.
+        -:  629:   Upon failure to set both UID and GID, try to set only the GID.
+        -:  630:   NEW_DST is true if the file was newly created; otherwise,
+        -:  631:   DST_SB is the status of the destination.
+        -:  632:   Return 1 if the initial syscall succeeds, 0 if it fails but it's OK
+        -:  633:   not to preserve ownership, -1 otherwise.  */
+        -:  634:
+        -:  635:static int
+        1:  636:set_owner (const struct cp_options *x, char const *dst_name, int dest_desc,
+        -:  637:           struct stat const *src_sb, bool new_dst,
+        -:  638:           struct stat const *dst_sb)
+        -:  639:{
+        1:  640:  uid_t uid = src_sb->st_uid;
+        1:  641:  gid_t gid = src_sb->st_gid;
+        -:  642:
+        -:  643:  /* Naively changing the ownership of an already-existing file before
+        -:  644:     changing its permissions would create a window of vulnerability if
+        -:  645:     the file's old permissions are too generous for the new owner and
+        -:  646:     group.  Avoid the window by first changing to a restrictive
+        -:  647:     temporary mode if necessary.  */
+        -:  648:
+        1:  649:  if (!new_dst && (x->preserve_mode || x->move_mode || x->set_mode))
+        -:  650:    {
+    #####:  651:      mode_t old_mode = dst_sb->st_mode;
+    #####:  652:      mode_t new_mode =
+    #####:  653:        (x->preserve_mode || x->move_mode ? src_sb->st_mode : x->mode);
+    #####:  654:      mode_t restrictive_temp_mode = old_mode & new_mode & S_IRWXU;
+        -:  655:
+    #####:  656:      if ((USE_ACL
+        -:  657:           || (old_mode & CHMOD_MODE_BITS
+    #####:  658:               & (~new_mode | S_ISUID | S_ISGID | S_ISVTX)))
+    #####:  659:          && qset_acl (dst_name, dest_desc, restrictive_temp_mode) != 0)
+        -:  660:        {
+    #####:  661:          if (! owner_failure_ok (x))
+    #####:  662:            error (0, errno, _("clearing permissions for %s"),
+        -:  663:                   quote (dst_name));
+    #####:  664:          return -x->require_preserve;
+        -:  665:        }
+        -:  666:    }
+        -:  667:
+        1:  668:  if (HAVE_FCHOWN && dest_desc != -1)
+        -:  669:    {
+        1:  670:      if (fchown (dest_desc, uid, gid) == 0)
+        1:  671:        return 1;
+    #####:  672:      if (errno == EPERM || errno == EINVAL)
+        -:  673:        {
+        -:  674:          /* We've failed to set *both*.  Now, try to set just the group
+        -:  675:             ID, but ignore any failure here, and don't change errno.  */
+    #####:  676:          int saved_errno = errno;
+    #####:  677:          ignore_value (fchown (dest_desc, -1, gid));
+    #####:  678:          errno = saved_errno;
+        -:  679:        }
+        -:  680:    }
+        -:  681:  else
+        -:  682:    {
+    #####:  683:      if (lchown (dst_name, uid, gid) == 0)
+    #####:  684:        return 1;
+    #####:  685:      if (errno == EPERM || errno == EINVAL)
+        -:  686:        {
+        -:  687:          /* We've failed to set *both*.  Now, try to set just the group
+        -:  688:             ID, but ignore any failure here, and don't change errno.  */
+    #####:  689:          int saved_errno = errno;
+    #####:  690:          ignore_value (lchown (dst_name, -1, gid));
+    #####:  691:          errno = saved_errno;
+        -:  692:        }
+        -:  693:    }
+        -:  694:
+    #####:  695:  if (! chown_failure_ok (x))
+        -:  696:    {
+    #####:  697:      error (0, errno, _("failed to preserve ownership for %s"),
+        -:  698:             quote (dst_name));
+    #####:  699:      if (x->require_preserve)
+    #####:  700:        return -1;
+        -:  701:    }
+        -:  702:
+    #####:  703:  return 0;
+        -:  704:}
+        -:  705:
+        -:  706:/* Set the st_author field of DEST_DESC to the st_author field of
+        -:  707:   SRC_SB. If DEST_DESC is undefined (-1), set the st_author field
+        -:  708:   of DST_NAME instead.  DEST_DESC must refer to the same file as
+        -:  709:   DEST_NAME if defined.  */
+        -:  710:
+        -:  711:static void
+        1:  712:set_author (const char *dst_name, int dest_desc, const struct stat *src_sb)
+        -:  713:{
+        -:  714:#if HAVE_STRUCT_STAT_ST_AUTHOR
+        -:  715:  /* FIXME: Modify the following code so that it does not
+        -:  716:     follow symbolic links.  */
+        -:  717:
+        -:  718:  /* Preserve the st_author field.  */
+        -:  719:  file_t file = (dest_desc < 0
+        -:  720:                 ? file_name_lookup (dst_name, 0, 0)
+        -:  721:                 : getdport (dest_desc));
+        -:  722:  if (file == MACH_PORT_NULL)
+        -:  723:    error (0, errno, _("failed to lookup file %s"), quote (dst_name));
+        -:  724:  else
+        -:  725:    {
+        -:  726:      error_t err = file_chauthor (file, src_sb->st_author);
+        -:  727:      if (err)
+        -:  728:        error (0, err, _("failed to preserve authorship for %s"),
+        -:  729:               quote (dst_name));
+        -:  730:      mach_port_deallocate (mach_task_self (), file);
+        -:  731:    }
+        -:  732:#else
+        -:  733:  (void) dst_name;
+        -:  734:  (void) dest_desc;
+        -:  735:  (void) src_sb;
+        -:  736:#endif
+        1:  737:}
+        -:  738:
+        -:  739:/* Change the file mode bits of the file identified by DESC or NAME to MODE.
+        -:  740:   Use DESC if DESC is valid and fchmod is available, NAME otherwise.  */
+        -:  741:
+        -:  742:static int
+    #####:  743:fchmod_or_lchmod (int desc, char const *name, mode_t mode)
+        -:  744:{
+        -:  745:#if HAVE_FCHMOD
+    #####:  746:  if (0 <= desc)
+    #####:  747:    return fchmod (desc, mode);
+        -:  748:#endif
+    #####:  749:  return lchmod (name, mode);
+        -:  750:}
+        -:  751:
+        -:  752:#ifndef HAVE_STRUCT_STAT_ST_BLOCKS
+        -:  753:# define HAVE_STRUCT_STAT_ST_BLOCKS 0
+        -:  754:#endif
+        -:  755:
+        -:  756:/* Use a heuristic to determine whether stat buffer SB comes from a file
+        -:  757:   with sparse blocks.  If the file has fewer blocks than would normally
+        -:  758:   be needed for a file of its size, then at least one of the blocks in
+        -:  759:   the file is a hole.  In that case, return true.  */
+        -:  760:static bool
+        1:  761:is_probably_sparse (struct stat const *sb)
+        -:  762:{
+        1:  763:  return (HAVE_STRUCT_STAT_ST_BLOCKS
+        1:  764:          && S_ISREG (sb->st_mode)
+        1:  765:          && ST_NBLOCKS (*sb) < sb->st_size / ST_NBLOCKSIZE);
+        -:  766:}
+        -:  767:
+        -:  768:
+        -:  769:/* Copy a regular file from SRC_NAME to DST_NAME.
+        -:  770:   If the source file contains holes, copies holes and blocks of zeros
+        -:  771:   in the source file as holes in the destination file.
+        -:  772:   (Holes are read as zeroes by the 'read' system call.)
+        -:  773:   When creating the destination, use DST_MODE & ~OMITTED_PERMISSIONS
+        -:  774:   as the third argument in the call to open, adding
+        -:  775:   OMITTED_PERMISSIONS after copying as needed.
+        -:  776:   X provides many option settings.
+        -:  777:   Return true if successful.
+        -:  778:   *NEW_DST is as in copy_internal.
+        -:  779:   SRC_SB is the result of calling XSTAT (aka stat) on SRC_NAME.  */
+        -:  780:
+        -:  781:static bool
+        1:  782:copy_reg (char const *src_name, char const *dst_name,
+        -:  783:          const struct cp_options *x,
+        -:  784:          mode_t dst_mode, mode_t omitted_permissions, bool *new_dst,
+        -:  785:          struct stat const *src_sb)
+        -:  786:{
+        -:  787:  char *buf;
+        1:  788:  char *buf_alloc = NULL;
+        1:  789:  char *name_alloc = NULL;
+        -:  790:  int dest_desc;
+        -:  791:  int dest_errno;
+        -:  792:  int source_desc;
+        1:  793:  mode_t src_mode = src_sb->st_mode;
+        -:  794:  struct stat sb;
+        -:  795:  struct stat src_open_sb;
+        1:  796:  bool return_val = true;
+        1:  797:  bool data_copy_required = x->data_copy_required;
+        -:  798:
+        1:  799:  source_desc = open (src_name,
+        -:  800:                      (O_RDONLY | O_BINARY
+        1:  801:                       | (x->dereference == DEREF_NEVER ? O_NOFOLLOW : 0)));
+        1:  802:  if (source_desc < 0)
+        -:  803:    {
+    #####:  804:      error (0, errno, _("cannot open %s for reading"), quote (src_name));
+    #####:  805:      return false;
+        -:  806:    }
+        -:  807:
+        1:  808:  if (fstat (source_desc, &src_open_sb) != 0)
+        -:  809:    {
+    #####:  810:      error (0, errno, _("cannot fstat %s"), quote (src_name));
+    #####:  811:      return_val = false;
+    #####:  812:      goto close_src_desc;
+        -:  813:    }
+        -:  814:
+        -:  815:  /* Compare the source dev/ino from the open file to the incoming,
+        -:  816:     saved ones obtained via a previous call to stat.  */
+        1:  817:  if (! SAME_INODE (*src_sb, src_open_sb))
+        -:  818:    {
+    #####:  819:      error (0, 0,
+        -:  820:             _("skipping file %s, as it was replaced while being copied"),
+        -:  821:             quote (src_name));
+    #####:  822:      return_val = false;
+    #####:  823:      goto close_src_desc;
+        -:  824:    }
+        -:  825:
+        -:  826:  /* The semantics of the following open calls are mandated
+        -:  827:     by the specs for both cp and mv.  */
+        1:  828:  if (! *new_dst)
+        -:  829:    {
+    #####:  830:      int open_flags =
+    #####:  831:        O_WRONLY | O_BINARY | (x->data_copy_required ? O_TRUNC : 0);
+    #####:  832:      dest_desc = open (dst_name, open_flags);
+    #####:  833:      dest_errno = errno;
+        -:  834:
+        -:  835:      /* When using cp --preserve=context to copy to an existing destination,
+        -:  836:         use the default context rather than that of the source.  Why?
+        -:  837:         1) the src context may prohibit writing, and
+        -:  838:         2) because it's more consistent to use the same context
+        -:  839:         that is used when the destination file doesn't already exist.  */
+    #####:  840:      if (x->preserve_security_context && 0 <= dest_desc)
+        -:  841:        {
+    #####:  842:          bool all_errors = (!x->data_copy_required
+    #####:  843:                             || x->require_preserve_context);
+    #####:  844:          bool some_errors = !all_errors && !x->reduce_diagnostics;
+    #####:  845:          security_context_t con = NULL;
+        -:  846:
+    #####:  847:          if (getfscreatecon (&con) < 0)
+        -:  848:            {
+    #####:  849:              if (all_errors || (some_errors && !errno_unsupported (errno)))
+    #####:  850:                error (0, errno, _("failed to get file system create context"));
+    #####:  851:              if (x->require_preserve_context)
+        -:  852:                {
+    #####:  853:                  return_val = false;
+    #####:  854:                  goto close_src_and_dst_desc;
+        -:  855:                }
+        -:  856:            }
+        -:  857:
+    #####:  858:          if (con)
+        -:  859:            {
+    #####:  860:              if (fsetfilecon (dest_desc, con) < 0)
+        -:  861:                {
+    #####:  862:                  if (all_errors || (some_errors && !errno_unsupported (errno)))
+    #####:  863:                    error (0, errno,
+        -:  864:                           _("failed to set the security context of %s to %s"),
+        -:  865:                           quote_n (0, dst_name), quote_n (1, con));
+    #####:  866:                  if (x->require_preserve_context)
+        -:  867:                    {
+    #####:  868:                      return_val = false;
+    #####:  869:                      freecon (con);
+    #####:  870:                      goto close_src_and_dst_desc;
+        -:  871:                    }
+        -:  872:                }
+    #####:  873:              freecon (con);
+        -:  874:            }
+        -:  875:        }
+        -:  876:
+    #####:  877:      if (dest_desc < 0 && x->unlink_dest_after_failed_open)
+        -:  878:        {
+    #####:  879:          if (unlink (dst_name) != 0)
+        -:  880:            {
+    #####:  881:              error (0, errno, _("cannot remove %s"), quote (dst_name));
+    #####:  882:              return_val = false;
+    #####:  883:              goto close_src_desc;
+        -:  884:            }
+    #####:  885:          if (x->verbose)
+    #####:  886:            printf (_("removed %s\n"), quote (dst_name));
+        -:  887:
+        -:  888:          /* Tell caller that the destination file was unlinked.  */
+    #####:  889:          *new_dst = true;
+        -:  890:        }
+        -:  891:    }
+        -:  892:
+        1:  893:  if (*new_dst)
+        -:  894:    {
+        -:  895:    open_with_O_CREAT:;
+        -:  896:
+        1:  897:      int open_flags = O_WRONLY | O_CREAT | O_BINARY;
+        1:  898:      dest_desc = open (dst_name, open_flags | O_EXCL,
+        1:  899:                        dst_mode & ~omitted_permissions);
+        1:  900:      dest_errno = errno;
+        -:  901:
+        -:  902:      /* When trying to copy through a dangling destination symlink,
+        -:  903:         the above open fails with EEXIST.  If that happens, and
+        -:  904:         lstat'ing the DST_NAME shows that it is a symlink, then we
+        -:  905:         have a problem: trying to resolve this dangling symlink to
+        -:  906:         a directory/destination-entry pair is fundamentally racy,
+        -:  907:         so punt.  If x->open_dangling_dest_symlink is set (cp sets
+        -:  908:         that when POSIXLY_CORRECT is set in the environment), simply
+        -:  909:         call open again, but without O_EXCL (potentially dangerous).
+        -:  910:         If not, fail with a diagnostic.  These shenanigans are necessary
+        -:  911:         only when copying, i.e., not in move_mode.  */
+        1:  912:      if (dest_desc < 0 && dest_errno == EEXIST && ! x->move_mode)
+        -:  913:        {
+        -:  914:          struct stat dangling_link_sb;
+    #####:  915:          if (lstat (dst_name, &dangling_link_sb) == 0
+    #####:  916:              && S_ISLNK (dangling_link_sb.st_mode))
+        -:  917:            {
+    #####:  918:              if (x->open_dangling_dest_symlink)
+        -:  919:                {
+    #####:  920:                  dest_desc = open (dst_name, open_flags,
+    #####:  921:                                    dst_mode & ~omitted_permissions);
+    #####:  922:                  dest_errno = errno;
+        -:  923:                }
+        -:  924:              else
+        -:  925:                {
+    #####:  926:                  error (0, 0, _("not writing through dangling symlink %s"),
+        -:  927:                         quote (dst_name));
+    #####:  928:                  return_val = false;
+    #####:  929:                  goto close_src_desc;
+        -:  930:                }
+        -:  931:            }
+        -:  932:        }
+        -:  933:
+        -:  934:      /* Improve quality of diagnostic when a nonexistent dst_name
+        -:  935:         ends in a slash and open fails with errno == EISDIR.  */
+        1:  936:      if (dest_desc < 0 && dest_errno == EISDIR
+    #####:  937:          && *dst_name && dst_name[strlen (dst_name) - 1] == '/')
+    #####:  938:        dest_errno = ENOTDIR;
+        -:  939:    }
+        -:  940:  else
+        -:  941:    {
+    #####:  942:      omitted_permissions = 0;
+        -:  943:    }
+        -:  944:
+        1:  945:  if (dest_desc < 0)
+        -:  946:    {
+        -:  947:      /* If we've just failed due to ENOENT for an ostensibly preexisting
+        -:  948:         destination (*new_dst was 0), that's a bit of a contradiction/race:
+        -:  949:         the prior stat/lstat said the file existed (*new_dst was 0), yet
+        -:  950:         the subsequent open-existing-file failed with ENOENT.  With NFS,
+        -:  951:         the race window is wider still, since its meta-data caching tends
+        -:  952:         to make the stat succeed for a just-removed remote file, while the
+        -:  953:         more-definitive initial open call will fail with ENOENT.  When this
+        -:  954:         situation arises, we attempt to open again, but this time with
+        -:  955:         O_CREAT.  Do this only when not in move-mode, since when handling
+        -:  956:         a cross-device move, we must never open an existing destination.  */
+    #####:  957:      if (dest_errno == ENOENT && ! *new_dst && ! x->move_mode)
+        -:  958:        {
+    #####:  959:          *new_dst = 1;
+    #####:  960:          goto open_with_O_CREAT;
+        -:  961:        }
+        -:  962:
+        -:  963:      /* Otherwise, it's an error.  */
+    #####:  964:      error (0, dest_errno, _("cannot create regular file %s"),
+        -:  965:             quote (dst_name));
+    #####:  966:      return_val = false;
+    #####:  967:      goto close_src_desc;
+        -:  968:    }
+        -:  969:
+        1:  970:  if (fstat (dest_desc, &sb) != 0)
+        -:  971:    {
+    #####:  972:      error (0, errno, _("cannot fstat %s"), quote (dst_name));
+    #####:  973:      return_val = false;
+    #####:  974:      goto close_src_and_dst_desc;
+        -:  975:    }
+        -:  976:
+        -:  977:  /* --attributes-only overrides --reflink.  */
+        1:  978:  if (data_copy_required && x->reflink_mode)
+        -:  979:    {
+    #####:  980:      bool clone_ok = clone_file (dest_desc, source_desc) == 0;
+    #####:  981:      if (clone_ok || x->reflink_mode == REFLINK_ALWAYS)
+        -:  982:        {
+    #####:  983:          if (!clone_ok)
+        -:  984:            {
+    #####:  985:              error (0, errno, _("failed to clone %s from %s"),
+        -:  986:                     quote_n (0, dst_name), quote_n (1, src_name));
+    #####:  987:              return_val = false;
+    #####:  988:              goto close_src_and_dst_desc;
+        -:  989:            }
+    #####:  990:          data_copy_required = false;
+        -:  991:        }
+        -:  992:    }
+        -:  993:
+        1:  994:  if (data_copy_required)
+        -:  995:    {
+        -:  996:      typedef uintptr_t word;
+        -:  997:
+        -:  998:      /* Choose a suitable buffer size; it may be adjusted later.  */
+        1:  999:      size_t buf_alignment = lcm (getpagesize (), sizeof (word));
+        1: 1000:      size_t buf_alignment_slop = sizeof (word) + buf_alignment - 1;
+        1: 1001:      size_t buf_size = io_blksize (sb);
+        -: 1002:
+        1: 1003:      fdadvise (source_desc, 0, 0, FADVISE_SEQUENTIAL);
+        -: 1004:
+        -: 1005:      /* Deal with sparse files.  */
+        1: 1006:      bool make_holes = false;
+        1: 1007:      bool sparse_src = false;
+        -: 1008:
+        1: 1009:      if (S_ISREG (sb.st_mode))
+        -: 1010:        {
+        -: 1011:          /* Even with --sparse=always, try to create holes only
+        -: 1012:             if the destination is a regular file.  */
+        1: 1013:          if (x->sparse_mode == SPARSE_ALWAYS)
+    #####: 1014:            make_holes = true;
+        -: 1015:
+        -: 1016:          /* Use a heuristic to determine whether SRC_NAME contains any sparse
+        -: 1017:             blocks.  If the file has fewer blocks than would normally be
+        -: 1018:             needed for a file of its size, then at least one of the blocks in
+        -: 1019:             the file is a hole.  */
+        1: 1020:          sparse_src = is_probably_sparse (&src_open_sb);
+        1: 1021:          if (x->sparse_mode == SPARSE_AUTO && sparse_src)
+    #####: 1022:            make_holes = true;
+        -: 1023:        }
+        -: 1024:
+        -: 1025:      /* If not making a sparse file, try to use a more-efficient
+        -: 1026:         buffer size.  */
+        1: 1027:      if (! make_holes)
+        -: 1028:        {
+        -: 1029:          /* Compute the least common multiple of the input and output
+        -: 1030:             buffer sizes, adjusting for outlandish values.  */
+        1: 1031:          size_t blcm_max = MIN (SIZE_MAX, SSIZE_MAX) - buf_alignment_slop;
+        1: 1032:          size_t blcm = buffer_lcm (io_blksize (src_open_sb), buf_size,
+        -: 1033:                                    blcm_max);
+        -: 1034:
+        -: 1035:          /* Do not bother with a buffer larger than the input file, plus one
+        -: 1036:             byte to make sure the file has not grown while reading it.  */
+        1: 1037:          if (S_ISREG (src_open_sb.st_mode) && src_open_sb.st_size < buf_size)
+        1: 1038:            buf_size = src_open_sb.st_size + 1;
+        -: 1039:
+        -: 1040:          /* However, stick with a block size that is a positive multiple of
+        -: 1041:             blcm, overriding the above adjustments.  Watch out for
+        -: 1042:             overflow.  */
+        1: 1043:          buf_size += blcm - 1;
+        1: 1044:          buf_size -= buf_size % blcm;
+        1: 1045:          if (buf_size == 0 || blcm_max < buf_size)
+    #####: 1046:            buf_size = blcm;
+        -: 1047:        }
+        -: 1048:
+        -: 1049:      /* Make a buffer with space for a sentinel at the end.  */
+        1: 1050:      buf_alloc = xmalloc (buf_size + buf_alignment_slop);
+        1: 1051:      buf = ptr_align (buf_alloc, buf_alignment);
+        -: 1052:
+        1: 1053:      if (sparse_src)
+        -: 1054:        {
+        -: 1055:          bool normal_copy_required;
+        -: 1056:
+        -: 1057:          /* Perform an efficient extent-based copy, falling back to the
+        -: 1058:             standard copy only if the initial extent scan fails.  If the
+        -: 1059:             '--sparse=never' option is specified, write all data but use
+        -: 1060:             any extents to read more efficiently.  */
+    #####: 1061:          if (extent_copy (source_desc, dest_desc, buf, buf_size,
+        -: 1062:                           src_open_sb.st_size,
+    #####: 1063:                           S_ISREG (sb.st_mode) ? x->sparse_mode : SPARSE_NEVER,
+        -: 1064:                           src_name, dst_name, &normal_copy_required))
+    #####: 1065:            goto preserve_metadata;
+        -: 1066:
+    #####: 1067:          if (! normal_copy_required)
+        -: 1068:            {
+    #####: 1069:              return_val = false;
+    #####: 1070:              goto close_src_and_dst_desc;
+        -: 1071:            }
+        -: 1072:        }
+        -: 1073:
+        -: 1074:      off_t n_read;
+        -: 1075:      bool wrote_hole_at_eof;
+        1: 1076:      if ( ! sparse_copy (source_desc, dest_desc, buf, buf_size,
+        -: 1077:                          make_holes, src_name, dst_name,
+        -: 1078:                          UINTMAX_MAX, &n_read,
+        -: 1079:                          &wrote_hole_at_eof)
+        1: 1080:           || (wrote_hole_at_eof
+    #####: 1081:               && ftruncate (dest_desc, n_read) < 0))
+        -: 1082:        {
+    #####: 1083:          error (0, errno, _("failed to extend %s"), quote (dst_name));
+    #####: 1084:          return_val = false;
+    #####: 1085:          goto close_src_and_dst_desc;
+        -: 1086:        }
+        -: 1087:    }
+        -: 1088:
+        -: 1089:preserve_metadata:
+        1: 1090:  if (x->preserve_timestamps)
+        -: 1091:    {
+        -: 1092:      struct timespec timespec[2];
+        1: 1093:      timespec[0] = get_stat_atime (src_sb);
+        1: 1094:      timespec[1] = get_stat_mtime (src_sb);
+        -: 1095:
+        1: 1096:      if (fdutimens (dest_desc, dst_name, timespec) != 0)
+        -: 1097:        {
+    #####: 1098:          error (0, errno, _("preserving times for %s"), quote (dst_name));
+    #####: 1099:          if (x->require_preserve)
+        -: 1100:            {
+    #####: 1101:              return_val = false;
+    #####: 1102:              goto close_src_and_dst_desc;
+        -: 1103:            }
+        -: 1104:        }
+        -: 1105:    }
+        -: 1106:
+        -: 1107:  /* Set ownership before xattrs as changing owners will
+        -: 1108:     clear capabilities.  */
+        1: 1109:  if (x->preserve_ownership && ! SAME_OWNER_AND_GROUP (*src_sb, sb))
+        -: 1110:    {
+        1: 1111:      switch (set_owner (x, dst_name, dest_desc, src_sb, *new_dst, &sb))
+        -: 1112:        {
+        -: 1113:        case -1:
+    #####: 1114:          return_val = false;
+    #####: 1115:          goto close_src_and_dst_desc;
+        -: 1116:
+        -: 1117:        case 0:
+    #####: 1118:          src_mode &= ~ (S_ISUID | S_ISGID | S_ISVTX);
+    #####: 1119:          break;
+        -: 1120:        }
+        -: 1121:    }
+        -: 1122:
+        -: 1123:  /* To allow copying xattrs on read-only files, temporarily chmod u+rw.
+        -: 1124:     This workaround is required as an inode permission check is done
+        -: 1125:     by xattr_permission() in fs/xattr.c of the GNU/Linux kernel tree.  */
+        1: 1126:  if (x->preserve_xattr)
+        -: 1127:    {
+        1: 1128:      bool access_changed = false;
+        -: 1129:
+        1: 1130:      if (!(sb.st_mode & S_IWUSR) && geteuid () != 0)
+    #####: 1131:        access_changed = fchmod_or_lchmod (dest_desc, dst_name, 0600) == 0;
+        -: 1132:
+        1: 1133:      if (!copy_attr (src_name, source_desc, dst_name, dest_desc, x)
+    #####: 1134:          && x->require_preserve_xattr)
+    #####: 1135:        return_val = false;
+        -: 1136:
+        1: 1137:      if (access_changed)
+    #####: 1138:        fchmod_or_lchmod (dest_desc, dst_name, dst_mode & ~omitted_permissions);
+        -: 1139:    }
+        -: 1140:
+        1: 1141:  set_author (dst_name, dest_desc, src_sb);
+        -: 1142:
+        1: 1143:  if (x->preserve_mode || x->move_mode)
+        -: 1144:    {
+        2: 1145:      if (copy_acl (src_name, source_desc, dst_name, dest_desc, src_mode) != 0
+    #####: 1146:          && x->require_preserve)
+    #####: 1147:        return_val = false;
+        -: 1148:    }
+    #####: 1149:  else if (x->set_mode)
+        -: 1150:    {
+    #####: 1151:      if (set_acl (dst_name, dest_desc, x->mode) != 0)
+    #####: 1152:        return_val = false;
+        -: 1153:    }
+    #####: 1154:  else if (x->explicit_no_preserve_mode)
+        -: 1155:    {
+    #####: 1156:      set_acl (dst_name, dest_desc, 0666 & ~cached_umask ());
+    #####: 1157:      return_val = false;
+        -: 1158:    }
+    #####: 1159:  else if (omitted_permissions)
+        -: 1160:    {
+    #####: 1161:      omitted_permissions &= ~ cached_umask ();
+    #####: 1162:      if (omitted_permissions
+    #####: 1163:          && fchmod_or_lchmod (dest_desc, dst_name, dst_mode) != 0)
+        -: 1164:        {
+    #####: 1165:          error (0, errno, _("preserving permissions for %s"),
+        -: 1166:                 quote (dst_name));
+    #####: 1167:          if (x->require_preserve)
+    #####: 1168:            return_val = false;
+        -: 1169:        }
+        -: 1170:    }
+        -: 1171:
+        -: 1172:close_src_and_dst_desc:
+        1: 1173:  if (close (dest_desc) < 0)
+        -: 1174:    {
+    #####: 1175:      error (0, errno, _("closing %s"), quote (dst_name));
+    #####: 1176:      return_val = false;
+        -: 1177:    }
+        -: 1178:close_src_desc:
+        1: 1179:  if (close (source_desc) < 0)
+        -: 1180:    {
+    #####: 1181:      error (0, errno, _("closing %s"), quote (src_name));
+    #####: 1182:      return_val = false;
+        -: 1183:    }
+        -: 1184:
+        1: 1185:  free (buf_alloc);
+        1: 1186:  free (name_alloc);
+        1: 1187:  return return_val;
+        -: 1188:}
+        -: 1189:
+        -: 1190:/* Return true if it's ok that the source and destination
+        -: 1191:   files are the 'same' by some measure.  The goal is to avoid
+        -: 1192:   making the 'copy' operation remove both copies of the file
+        -: 1193:   in that case, while still allowing the user to e.g., move or
+        -: 1194:   copy a regular file onto a symlink that points to it.
+        -: 1195:   Try to minimize the cost of this function in the common case.
+        -: 1196:   Set *RETURN_NOW if we've determined that the caller has no more
+        -: 1197:   work to do and should return successfully, right away.
+        -: 1198:
+        -: 1199:   Set *UNLINK_SRC if we've determined that the caller wants to do
+        -: 1200:   'rename (a, b)' where 'a' and 'b' are distinct hard links to the same
+        -: 1201:   file. In that case, the caller should try to unlink 'a' and then return
+        -: 1202:   successfully.  Ideally, we wouldn't have to do that, and we'd be
+        -: 1203:   able to rely on rename to remove the source file.  However, POSIX
+        -: 1204:   mistakenly requires that such a rename call do *nothing* and return
+        -: 1205:   successfully.  */
+        -: 1206:
+        -: 1207:static bool
+        2: 1208:same_file_ok (char const *src_name, struct stat const *src_sb,
+        -: 1209:              char const *dst_name, struct stat const *dst_sb,
+        -: 1210:              const struct cp_options *x, bool *return_now, bool *unlink_src)
+        -: 1211:{
+        -: 1212:  const struct stat *src_sb_link;
+        -: 1213:  const struct stat *dst_sb_link;
+        -: 1214:  struct stat tmp_dst_sb;
+        -: 1215:  struct stat tmp_src_sb;
+        -: 1216:
+        -: 1217:  bool same_link;
+        2: 1218:  bool same = SAME_INODE (*src_sb, *dst_sb);
+        -: 1219:
+        2: 1220:  *return_now = false;
+        2: 1221:  *unlink_src = false;
+        -: 1222:
+        -: 1223:  /* FIXME: this should (at the very least) be moved into the following
+        -: 1224:     if-block.  More likely, it should be removed, because it inhibits
+        -: 1225:     making backups.  But removing it will result in a change in behavior
+        -: 1226:     that will probably have to be documented -- and tests will have to
+        -: 1227:     be updated.  */
+        2: 1228:  if (same && x->hard_link)
+        -: 1229:    {
+    #####: 1230:      *return_now = true;
+    #####: 1231:      return true;
+        -: 1232:    }
+        -: 1233:
+        2: 1234:  if (x->dereference == DEREF_NEVER)
+        -: 1235:    {
+    #####: 1236:      same_link = same;
+        -: 1237:
+        -: 1238:      /* If both the source and destination files are symlinks (and we'll
+        -: 1239:         know this here IFF preserving symlinks), then it's usually ok
+        -: 1240:         when they are distinct.  */
+    #####: 1241:      if (S_ISLNK (src_sb->st_mode) && S_ISLNK (dst_sb->st_mode))
+        -: 1242:        {
+    #####: 1243:          bool sn = same_name (src_name, dst_name);
+    #####: 1244:          if ( ! sn)
+        -: 1245:            {
+        -: 1246:              /* It's fine when we're making any type of backup.  */
+    #####: 1247:              if (x->backup_type != no_backups)
+    #####: 1248:                return true;
+        -: 1249:
+        -: 1250:              /* Here we have two symlinks that are hard-linked together,
+        -: 1251:                 and we're not making backups.  In this unusual case, simply
+        -: 1252:                 returning true would lead to mv calling "rename(A,B)",
+        -: 1253:                 which would do nothing and return 0.  I.e., A would
+        -: 1254:                 not be removed.  Hence, the solution is to tell the
+        -: 1255:                 caller that all it must do is unlink A and return.  */
+    #####: 1256:              if (same_link)
+        -: 1257:                {
+    #####: 1258:                  *unlink_src = true;
+    #####: 1259:                  *return_now = true;
+    #####: 1260:                  return true;
+        -: 1261:                }
+        -: 1262:            }
+        -: 1263:
+    #####: 1264:          return ! sn;
+        -: 1265:        }
+        -: 1266:
+    #####: 1267:      src_sb_link = src_sb;
+    #####: 1268:      dst_sb_link = dst_sb;
+        -: 1269:    }
+        -: 1270:  else
+        -: 1271:    {
+        2: 1272:      if (!same)
+        2: 1273:        return true;
+        -: 1274:
+    #####: 1275:      if (lstat (dst_name, &tmp_dst_sb) != 0
+    #####: 1276:          || lstat (src_name, &tmp_src_sb) != 0)
+    #####: 1277:        return true;
+        -: 1278:
+    #####: 1279:      src_sb_link = &tmp_src_sb;
+    #####: 1280:      dst_sb_link = &tmp_dst_sb;
+        -: 1281:
+    #####: 1282:      same_link = SAME_INODE (*src_sb_link, *dst_sb_link);
+        -: 1283:
+        -: 1284:      /* If both are symlinks, then it's ok, but only if the destination
+        -: 1285:         will be unlinked before being opened.  This is like the test
+        -: 1286:         above, but with the addition of the unlink_dest_before_opening
+        -: 1287:         conjunct because otherwise, with two symlinks to the same target,
+        -: 1288:         we'd end up truncating the source file.  */
+    #####: 1289:      if (S_ISLNK (src_sb_link->st_mode) && S_ISLNK (dst_sb_link->st_mode)
+    #####: 1290:          && x->unlink_dest_before_opening)
+    #####: 1291:        return true;
+        -: 1292:    }
+        -: 1293:
+        -: 1294:  /* The backup code ensures there's a copy, so it's usually ok to
+        -: 1295:     remove any destination file.  One exception is when both
+        -: 1296:     source and destination are the same directory entry.  In that
+        -: 1297:     case, moving the destination file aside (in making the backup)
+        -: 1298:     would also rename the source file and result in an error.  */
+    #####: 1299:  if (x->backup_type != no_backups)
+        -: 1300:    {
+    #####: 1301:      if (!same_link)
+        -: 1302:        {
+        -: 1303:          /* In copy mode when dereferencing symlinks, if the source is a
+        -: 1304:             symlink and the dest is not, then backing up the destination
+        -: 1305:             (moving it aside) would make it a dangling symlink, and the
+        -: 1306:             subsequent attempt to open it in copy_reg would fail with
+        -: 1307:             a misleading diagnostic.  Avoid that by returning zero in
+        -: 1308:             that case so the caller can make cp (or mv when it has to
+        -: 1309:             resort to reading the source file) fail now.  */
+        -: 1310:
+        -: 1311:          /* FIXME-note: even with the following kludge, we can still provoke
+        -: 1312:             the offending diagnostic.  It's just a little harder to do :-)
+        -: 1313:             $ rm -f a b c; touch c; ln -s c b; ln -s b a; cp -b a b
+        -: 1314:             cp: cannot open 'a' for reading: No such file or directory
+        -: 1315:             That's misleading, since a subsequent 'ls' shows that 'a'
+        -: 1316:             is still there.
+        -: 1317:             One solution would be to open the source file *before* moving
+        -: 1318:             aside the destination, but that'd involve a big rewrite. */
+    #####: 1319:          if ( ! x->move_mode
+    #####: 1320:               && x->dereference != DEREF_NEVER
+    #####: 1321:               && S_ISLNK (src_sb_link->st_mode)
+    #####: 1322:               && ! S_ISLNK (dst_sb_link->st_mode))
+    #####: 1323:            return false;
+        -: 1324:
+    #####: 1325:          return true;
+        -: 1326:        }
+        -: 1327:
+    #####: 1328:      return ! same_name (src_name, dst_name);
+        -: 1329:    }
+        -: 1330:
+        -: 1331:#if 0
+        -: 1332:  /* FIXME: use or remove */
+        -: 1333:
+        -: 1334:  /* If we're making a backup, we'll detect the problem case in
+        -: 1335:     copy_reg because SRC_NAME will no longer exist.  Allowing
+        -: 1336:     the test to be deferred lets cp do some useful things.
+        -: 1337:     But when creating hardlinks and SRC_NAME is a symlink
+        -: 1338:     but DST_NAME is not we must test anyway.  */
+        -: 1339:  if (x->hard_link
+        -: 1340:      || !S_ISLNK (src_sb_link->st_mode)
+        -: 1341:      || S_ISLNK (dst_sb_link->st_mode))
+        -: 1342:    return true;
+        -: 1343:
+        -: 1344:  if (x->dereference != DEREF_NEVER)
+        -: 1345:    return true;
+        -: 1346:#endif
+        -: 1347:
+        -: 1348:  /* They may refer to the same file if we're in move mode and the
+        -: 1349:     target is a symlink.  That is ok, since we remove any existing
+        -: 1350:     destination file before opening it -- via 'rename' if they're on
+        -: 1351:     the same file system, via 'unlink (DST_NAME)' otherwise.
+        -: 1352:     It's also ok if they're distinct hard links to the same file.  */
+    #####: 1353:  if (x->move_mode || x->unlink_dest_before_opening)
+        -: 1354:    {
+    #####: 1355:      if (S_ISLNK (dst_sb_link->st_mode))
+    #####: 1356:        return true;
+        -: 1357:
+    #####: 1358:      if (same_link
+    #####: 1359:          && 1 < dst_sb_link->st_nlink
+    #####: 1360:          && ! same_name (src_name, dst_name))
+        -: 1361:        {
+    #####: 1362:          if (x->move_mode)
+        -: 1363:            {
+    #####: 1364:              *unlink_src = true;
+    #####: 1365:              *return_now = true;
+        -: 1366:            }
+    #####: 1367:          return true;
+        -: 1368:        }
+        -: 1369:    }
+        -: 1370:
+        -: 1371:  /* If neither is a symlink, then it's ok as long as they aren't
+        -: 1372:     hard links to the same file.  */
+    #####: 1373:  if (!S_ISLNK (src_sb_link->st_mode) && !S_ISLNK (dst_sb_link->st_mode))
+        -: 1374:    {
+    #####: 1375:      if (!SAME_INODE (*src_sb_link, *dst_sb_link))
+    #####: 1376:        return true;
+        -: 1377:
+        -: 1378:      /* If they are the same file, it's ok if we're making hard links.  */
+    #####: 1379:      if (x->hard_link)
+        -: 1380:        {
+    #####: 1381:          *return_now = true;
+    #####: 1382:          return true;
+        -: 1383:        }
+        -: 1384:    }
+        -: 1385:
+        -: 1386:  /* At this point, it is normally an error (data loss) to move a symlink
+        -: 1387:     onto its referent, but in at least one narrow case, it is not:
+        -: 1388:     In move mode, when
+        -: 1389:     1) src is a symlink,
+        -: 1390:     2) dest has a link count of 2 or more and
+        -: 1391:     3) dest and the referent of src are not the same directory entry,
+        -: 1392:     then it's ok, since while we'll lose one of those hard links,
+        -: 1393:     src will still point to a remaining link.
+        -: 1394:     Note that technically, condition #3 obviates condition #2, but we
+        -: 1395:     retain the 1 < st_nlink condition because that means fewer invocations
+        -: 1396:     of the more expensive #3.
+        -: 1397:
+        -: 1398:     Given this,
+        -: 1399:       $ touch f && ln f l && ln -s f s
+        -: 1400:       $ ls -og f l s
+        -: 1401:       -rw-------. 2  0 Jan  4 22:46 f
+        -: 1402:       -rw-------. 2  0 Jan  4 22:46 l
+        -: 1403:       lrwxrwxrwx. 1  1 Jan  4 22:46 s -> f
+        -: 1404:     this must fail: mv s f
+        -: 1405:     this must succeed: mv s l */
+    #####: 1406:  if (x->move_mode
+    #####: 1407:      && S_ISLNK (src_sb->st_mode)
+    #####: 1408:      && 1 < dst_sb_link->st_nlink)
+        -: 1409:    {
+    #####: 1410:      char *abs_src = canonicalize_file_name (src_name);
+    #####: 1411:      if (abs_src)
+        -: 1412:        {
+    #####: 1413:          bool result = ! same_name (abs_src, dst_name);
+    #####: 1414:          free (abs_src);
+    #####: 1415:          return result;
+        -: 1416:        }
+        -: 1417:    }
+        -: 1418:
+        -: 1419:  /* It's ok to remove a destination symlink.  But that works only when we
+        -: 1420:     unlink before opening the destination and when the source and destination
+        -: 1421:     files are on the same partition.  */
+    #####: 1422:  if (x->unlink_dest_before_opening
+    #####: 1423:      && S_ISLNK (dst_sb_link->st_mode))
+    #####: 1424:    return dst_sb_link->st_dev == src_sb_link->st_dev;
+        -: 1425:
+    #####: 1426:  if (x->dereference == DEREF_NEVER)
+        -: 1427:    {
+    #####: 1428:      if ( ! S_ISLNK (src_sb_link->st_mode))
+    #####: 1429:        tmp_src_sb = *src_sb_link;
+    #####: 1430:      else if (stat (src_name, &tmp_src_sb) != 0)
+    #####: 1431:        return true;
+        -: 1432:
+    #####: 1433:      if ( ! S_ISLNK (dst_sb_link->st_mode))
+    #####: 1434:        tmp_dst_sb = *dst_sb_link;
+    #####: 1435:      else if (stat (dst_name, &tmp_dst_sb) != 0)
+    #####: 1436:        return true;
+        -: 1437:
+    #####: 1438:      if ( ! SAME_INODE (tmp_src_sb, tmp_dst_sb))
+    #####: 1439:        return true;
+        -: 1440:
+        -: 1441:      /* FIXME: shouldn't this be testing whether we're making symlinks?  */
+    #####: 1442:      if (x->hard_link)
+        -: 1443:        {
+    #####: 1444:          *return_now = true;
+    #####: 1445:          return true;
+        -: 1446:        }
+        -: 1447:    }
+        -: 1448:
+    #####: 1449:  return false;
+        -: 1450:}
+        -: 1451:
+        -: 1452:/* Return true if FILE, with mode MODE, is writable in the sense of 'mv'.
+        -: 1453:   Always consider a symbolic link to be writable.  */
+        -: 1454:static bool
+    #####: 1455:writable_destination (char const *file, mode_t mode)
+        -: 1456:{
+    #####: 1457:  return (S_ISLNK (mode)
+    #####: 1458:          || can_write_any_file ()
+    #####: 1459:          || euidaccess (file, W_OK) == 0);
+        -: 1460:}
+        -: 1461:
+        -: 1462:static void
+    #####: 1463:overwrite_prompt (char const *dst_name, struct stat const *dst_sb)
+        -: 1464:{
+    #####: 1465:  if (! writable_destination (dst_name, dst_sb->st_mode))
+        -: 1466:    {
+        -: 1467:      char perms[12];		/* "-rwxrwxrwx " ls-style modes. */
+    #####: 1468:      strmode (dst_sb->st_mode, perms);
+    #####: 1469:      perms[10] = '\0';
+    #####: 1470:      fprintf (stderr,
+        -: 1471:               _("%s: try to overwrite %s, overriding mode %04lo (%s)? "),
+        -: 1472:               program_name, quote (dst_name),
+    #####: 1473:               (unsigned long int) (dst_sb->st_mode & CHMOD_MODE_BITS),
+        -: 1474:               &perms[1]);
+        -: 1475:    }
+        -: 1476:  else
+        -: 1477:    {
+    #####: 1478:      fprintf (stderr, _("%s: overwrite %s? "),
+        -: 1479:               program_name, quote (dst_name));
+        -: 1480:    }
+    #####: 1481:}
+        -: 1482:
+        -: 1483:/* Initialize the hash table implementing a set of F_triple entries
+        -: 1484:   corresponding to destination files.  */
+        -: 1485:extern void
+    #####: 1486:dest_info_init (struct cp_options *x)
+        -: 1487:{
+        -: 1488:  x->dest_info
+    #####: 1489:    = hash_initialize (DEST_INFO_INITIAL_CAPACITY,
+        -: 1490:                       NULL,
+        -: 1491:                       triple_hash,
+        -: 1492:                       triple_compare,
+        -: 1493:                       triple_free);
+    #####: 1494:}
+        -: 1495:
+        -: 1496:/* Initialize the hash table implementing a set of F_triple entries
+        -: 1497:   corresponding to source files listed on the command line.  */
+        -: 1498:extern void
+    #####: 1499:src_info_init (struct cp_options *x)
+        -: 1500:{
+        -: 1501:
+        -: 1502:  /* Note that we use triple_hash_no_name here.
+        -: 1503:     Contrast with the use of triple_hash above.
+        -: 1504:     That is necessary because a source file may be specified
+        -: 1505:     in many different ways.  We want to warn about this
+        -: 1506:       cp a a d/
+        -: 1507:     as well as this:
+        -: 1508:       cp a ./a d/
+        -: 1509:  */
+        -: 1510:  x->src_info
+    #####: 1511:    = hash_initialize (DEST_INFO_INITIAL_CAPACITY,
+        -: 1512:                       NULL,
+        -: 1513:                       triple_hash_no_name,
+        -: 1514:                       triple_compare,
+        -: 1515:                       triple_free);
+    #####: 1516:}
+        -: 1517:
+        -: 1518:/* When effecting a move (e.g., for mv(1)), and given the name DST_NAME
+        -: 1519:   of the destination and a corresponding stat buffer, DST_SB, return
+        -: 1520:   true if the logical 'move' operation should _not_ proceed.
+        -: 1521:   Otherwise, return false.
+        -: 1522:   Depending on options specified in X, this code may issue an
+        -: 1523:   interactive prompt asking whether it's ok to overwrite DST_NAME.  */
+        -: 1524:static bool
+    #####: 1525:abandon_move (const struct cp_options *x,
+        -: 1526:              char const *dst_name,
+        -: 1527:              struct stat const *dst_sb)
+        -: 1528:{
+    #####: 1529:  assert (x->move_mode);
+    #####: 1530:  return (x->interactive == I_ALWAYS_NO
+    #####: 1531:          || ((x->interactive == I_ASK_USER
+    #####: 1532:               || (x->interactive == I_UNSPECIFIED
+    #####: 1533:                   && x->stdin_tty
+    #####: 1534:                   && ! writable_destination (dst_name, dst_sb->st_mode)))
+    #####: 1535:              && (overwrite_prompt (dst_name, dst_sb), 1)
+    #####: 1536:              && ! yesno ()));
+        -: 1537:}
+        -: 1538:
+        -: 1539:/* Print --verbose output on standard output, e.g. 'new' -> 'old'.
+        -: 1540:   If BACKUP_DST_NAME is non-NULL, then also indicate that it is
+        -: 1541:   the name of a backup file.  */
+        -: 1542:static void
+    #####: 1543:emit_verbose (char const *src, char const *dst, char const *backup_dst_name)
+        -: 1544:{
+    #####: 1545:  printf ("%s -> %s", quote_n (0, src), quote_n (1, dst));
+    #####: 1546:  if (backup_dst_name)
+    #####: 1547:    printf (_(" (backup: %s)"), quote (backup_dst_name));
+    #####: 1548:  putchar ('\n');
+    #####: 1549:}
+        -: 1550:
+        -: 1551:/* A wrapper around "setfscreatecon (NULL)" that exits upon failure.  */
+        -: 1552:static void
+    #####: 1553:restore_default_fscreatecon_or_die (void)
+        -: 1554:{
+    #####: 1555:  if (setfscreatecon (NULL) != 0)
+    #####: 1556:    error (EXIT_FAILURE, errno,
+        -: 1557:           _("failed to restore the default file creation context"));
+    #####: 1558:}
+        -: 1559:
+        -: 1560:/* Create a hard link DST_NAME to SRC_NAME, honoring the REPLACE and
+        -: 1561:   VERBOSE settings.  Return true upon success.  Otherwise, diagnose
+        -: 1562:   the failure and return false.
+        -: 1563:   If SRC_NAME is a symbolic link it will not be followed.  If the system
+        -: 1564:   doesn't support hard links to symbolic links, then DST_NAME will
+        -: 1565:   be created as a symbolic link to SRC_NAME.  */
+        -: 1566:static bool
+        1: 1567:create_hard_link (char const *src_name, char const *dst_name,
+        -: 1568:                  bool replace, bool verbose)
+        -: 1569:{
+        -: 1570:  /* We want to guarantee that symlinks are not followed.  */
+        1: 1571:  bool link_failed = (linkat (AT_FDCWD, src_name, AT_FDCWD, dst_name, 0) != 0);
+        -: 1572:
+        -: 1573:  /* If the link failed because of an existing destination,
+        -: 1574:     remove that file and then call link again.  */
+        1: 1575:  if (link_failed && replace && errno == EEXIST)
+        -: 1576:    {
+    #####: 1577:      if (unlink (dst_name) != 0)
+        -: 1578:        {
+    #####: 1579:          error (0, errno, _("cannot remove %s"), quote (dst_name));
+    #####: 1580:          return false;
+        -: 1581:        }
+    #####: 1582:      if (verbose)
+    #####: 1583:        printf (_("removed %s\n"), quote (dst_name));
+    #####: 1584:      link_failed = (linkat (AT_FDCWD, src_name, AT_FDCWD, dst_name, 0) != 0);
+        -: 1585:    }
+        -: 1586:
+        1: 1587:  if (link_failed)
+        -: 1588:    {
+    #####: 1589:      error (0, errno, _("cannot create hard link %s to %s"),
+        -: 1590:             quote_n (0, dst_name), quote_n (1, src_name));
+    #####: 1591:      return false;
+        -: 1592:    }
+        -: 1593:
+        1: 1594:  return true;
+        -: 1595:}
+        -: 1596:
+        -: 1597:/* Copy the file SRC_NAME to the file DST_NAME.  The files may be of
+        -: 1598:   any type.  NEW_DST should be true if the file DST_NAME cannot
+        -: 1599:   exist because its parent directory was just created; NEW_DST should
+        -: 1600:   be false if DST_NAME might already exist.  DEVICE is the device
+        -: 1601:   number of the parent directory, or 0 if the parent of this file is
+        -: 1602:   not known.  ANCESTORS points to a linked, null terminated list of
+        -: 1603:   devices and inodes of parent directories of SRC_NAME.  COMMAND_LINE_ARG
+        -: 1604:   is true iff SRC_NAME was specified on the command line.
+        -: 1605:   FIRST_DIR_CREATED_PER_COMMAND_LINE_ARG is both input and output.
+        -: 1606:   Set *COPY_INTO_SELF if SRC_NAME is a parent of (or the
+        -: 1607:   same as) DST_NAME; otherwise, clear it.
+        -: 1608:   Return true if successful.  */
+        -: 1609:static bool
+        3: 1610:copy_internal (char const *src_name, char const *dst_name,
+        -: 1611:               bool new_dst,
+        -: 1612:               dev_t device,
+        -: 1613:               struct dir_list *ancestors,
+        -: 1614:               const struct cp_options *x,
+        -: 1615:               bool command_line_arg,
+        -: 1616:               bool *first_dir_created_per_command_line_arg,
+        -: 1617:               bool *copy_into_self,
+        -: 1618:               bool *rename_succeeded)
+        -: 1619:{
+        -: 1620:  struct stat src_sb;
+        -: 1621:  struct stat dst_sb;
+        -: 1622:  mode_t src_mode;
+        3: 1623:  mode_t dst_mode IF_LINT ( = 0);
+        -: 1624:  mode_t dst_mode_bits;
+        -: 1625:  mode_t omitted_permissions;
+        3: 1626:  bool restore_dst_mode = false;
+        3: 1627:  char *earlier_file = NULL;
+        3: 1628:  char *dst_backup = NULL;
+        3: 1629:  bool backup_succeeded = false;
+        -: 1630:  bool delayed_ok;
+        3: 1631:  bool copied_as_regular = false;
+        3: 1632:  bool dest_is_symlink = false;
+        3: 1633:  bool have_dst_lstat = false;
+        -: 1634:
+        3: 1635:  if (x->move_mode && rename_succeeded)
+        1: 1636:    *rename_succeeded = false;
+        -: 1637:
+        3: 1638:  *copy_into_self = false;
+        -: 1639:
+        3: 1640:  if (XSTAT (x, src_name, &src_sb) != 0)
+        -: 1641:    {
+    #####: 1642:      error (0, errno, _("cannot stat %s"), quote (src_name));
+    #####: 1643:      return false;
+        -: 1644:    }
+        -: 1645:
+        3: 1646:  src_mode = src_sb.st_mode;
+        -: 1647:
+        3: 1648:  if (S_ISDIR (src_mode) && !x->recursive)
+        -: 1649:    {
+    #####: 1650:      error (0, 0, _("omitting directory %s"), quote (src_name));
+    #####: 1651:      return false;
+        -: 1652:    }
+        -: 1653:
+        -: 1654:  /* Detect the case in which the same source file appears more than
+        -: 1655:     once on the command line and no backup option has been selected.
+        -: 1656:     If so, simply warn and don't copy it the second time.
+        -: 1657:     This check is enabled only if x->src_info is non-NULL.  */
+        3: 1658:  if (command_line_arg)
+        -: 1659:    {
+        3: 1660:      if ( ! S_ISDIR (src_sb.st_mode)
+        3: 1661:           && x->backup_type == no_backups
+        3: 1662:           && seen_file (x->src_info, src_name, &src_sb))
+        -: 1663:        {
+    #####: 1664:          error (0, 0, _("warning: source file %s specified more than once"),
+        -: 1665:                 quote (src_name));
+    #####: 1666:          return true;
+        -: 1667:        }
+        -: 1668:
+        3: 1669:      record_file (x->src_info, src_name, &src_sb);
+        -: 1670:    }
+        -: 1671:
+        3: 1672:  if (!new_dst)
+        -: 1673:    {
+        -: 1674:      /* Regular files can be created by writing through symbolic
+        -: 1675:         links, but other files cannot.  So use stat on the
+        -: 1676:         destination when copying a regular file, and lstat otherwise.
+        -: 1677:         However, if we intend to unlink or remove the destination
+        -: 1678:         first, use lstat, since a copy won't actually be made to the
+        -: 1679:         destination in that case.  */
+        3: 1680:      bool use_stat =
+        3: 1681:        ((S_ISREG (src_mode)
+    #####: 1682:          || (x->copy_as_regular
+    #####: 1683:              && ! (S_ISDIR (src_mode) || S_ISLNK (src_mode))))
+        6: 1684:         && ! (x->move_mode || x->symbolic_link || x->hard_link
+    #####: 1685:               || x->backup_type != no_backups
+    #####: 1686:               || x->unlink_dest_before_opening));
+        3: 1687:      if ((use_stat
+    #####: 1688:           ? stat (dst_name, &dst_sb)
+        3: 1689:           : lstat (dst_name, &dst_sb))
+        6: 1690:          != 0)
+        -: 1691:        {
+        1: 1692:          if (errno != ENOENT)
+        -: 1693:            {
+    #####: 1694:              error (0, errno, _("cannot stat %s"), quote (dst_name));
+    #####: 1695:              return false;
+        -: 1696:            }
+        -: 1697:          else
+        -: 1698:            {
+        1: 1699:              new_dst = true;
+        -: 1700:            }
+        -: 1701:        }
+        -: 1702:      else
+        -: 1703:        { /* Here, we know that dst_name exists, at least to the point
+        -: 1704:             that it is stat'able or lstat'able.  */
+        -: 1705:          bool return_now;
+        -: 1706:          bool unlink_src;
+        -: 1707:
+        2: 1708:          have_dst_lstat = !use_stat;
+        2: 1709:          if (! same_file_ok (src_name, &src_sb, dst_name, &dst_sb,
+        -: 1710:                              x, &return_now, &unlink_src))
+        -: 1711:            {
+    #####: 1712:              error (0, 0, _("%s and %s are the same file"),
+        -: 1713:                     quote_n (0, src_name), quote_n (1, dst_name));
+    #####: 1714:              return false;
+        -: 1715:            }
+        -: 1716:
+        2: 1717:          if (!S_ISDIR (src_mode) && x->update)
+        -: 1718:            {
+        -: 1719:              /* When preserving time stamps (but not moving within a file
+        -: 1720:                 system), don't worry if the destination time stamp is
+        -: 1721:                 less than the source merely because of time stamp
+        -: 1722:                 truncation.  */
+    #####: 1723:              int options = ((x->preserve_timestamps
+    #####: 1724:                              && ! (x->move_mode
+    #####: 1725:                                    && dst_sb.st_dev == src_sb.st_dev))
+        -: 1726:                             ? UTIMECMP_TRUNCATE_SOURCE
+    #####: 1727:                             : 0);
+        -: 1728:
+    #####: 1729:              if (0 <= utimecmp (dst_name, &dst_sb, &src_sb, options))
+        -: 1730:                {
+        -: 1731:                  /* We're using --update and the destination is not older
+        -: 1732:                     than the source, so do not copy or move.  Pretend the
+        -: 1733:                     rename succeeded, so the caller (if it's mv) doesn't
+        -: 1734:                     end up removing the source file.  */
+    #####: 1735:                  if (rename_succeeded)
+    #####: 1736:                    *rename_succeeded = true;
+        -: 1737:
+        -: 1738:                  /* However, we still must record that we've processed
+        -: 1739:                     this src/dest pair, in case this source file is
+        -: 1740:                     hard-linked to another one.  In that case, we'll use
+        -: 1741:                     the mapping information to link the corresponding
+        -: 1742:                     destination names.  */
+    #####: 1743:                  earlier_file = remember_copied (dst_name, src_sb.st_ino,
+        -: 1744:                                                  src_sb.st_dev);
+    #####: 1745:                  if (earlier_file)
+        -: 1746:                    {
+        -: 1747:                      /* Note we currently replace DST_NAME unconditionally,
+        -: 1748:                         even if it was a newer separate file.  */
+    #####: 1749:                      if (! create_hard_link (earlier_file, dst_name, true,
+    #####: 1750:                                              x->verbose))
+        -: 1751:                        {
+    #####: 1752:                          goto un_backup;
+        -: 1753:                        }
+        -: 1754:                    }
+        -: 1755:
+    #####: 1756:                  return true;
+        -: 1757:                }
+        -: 1758:            }
+        -: 1759:
+        -: 1760:          /* When there is an existing destination file, we may end up
+        -: 1761:             returning early, and hence not copying/moving the file.
+        -: 1762:             This may be due to an interactive 'negative' reply to the
+        -: 1763:             prompt about the existing file.  It may also be due to the
+        -: 1764:             use of the --reply=no option.
+        -: 1765:
+        -: 1766:             cp and mv treat -i and -f differently.  */
+        2: 1767:          if (x->move_mode)
+        -: 1768:            {
+    #####: 1769:              if (abandon_move (x, dst_name, &dst_sb)
+    #####: 1770:                  || (unlink_src && unlink (src_name) == 0))
+        -: 1771:                {
+        -: 1772:                  /* Pretend the rename succeeded, so the caller (mv)
+        -: 1773:                     doesn't end up removing the source file.  */
+    #####: 1774:                  if (rename_succeeded)
+    #####: 1775:                    *rename_succeeded = true;
+    #####: 1776:                  if (unlink_src && x->verbose)
+    #####: 1777:                    printf (_("removed %s\n"), quote (src_name));
+    #####: 1778:                  return true;
+        -: 1779:                }
+    #####: 1780:              if (unlink_src)
+        -: 1781:                {
+    #####: 1782:                  error (0, errno, _("cannot remove %s"), quote (src_name));
+    #####: 1783:                  return false;
+        -: 1784:                }
+        -: 1785:            }
+        -: 1786:          else
+        -: 1787:            {
+        2: 1788:              if (! S_ISDIR (src_mode)
+        2: 1789:                  && (x->interactive == I_ALWAYS_NO
+        2: 1790:                      || (x->interactive == I_ASK_USER
+    #####: 1791:                          && (overwrite_prompt (dst_name, &dst_sb), 1)
+    #####: 1792:                          && ! yesno ())))
+    #####: 1793:                return true;
+        -: 1794:            }
+        -: 1795:
+        2: 1796:          if (return_now)
+    #####: 1797:            return true;
+        -: 1798:
+        2: 1799:          if (!S_ISDIR (dst_sb.st_mode))
+        -: 1800:            {
+        2: 1801:              if (S_ISDIR (src_mode))
+        -: 1802:                {
+    #####: 1803:                  if (x->move_mode && x->backup_type != no_backups)
+        -: 1804:                    {
+        -: 1805:                      /* Moving a directory onto an existing
+        -: 1806:                         non-directory is ok only with --backup.  */
+        -: 1807:                    }
+        -: 1808:                  else
+        -: 1809:                    {
+    #####: 1810:                      error (0, 0,
+        -: 1811:                       _("cannot overwrite non-directory %s with directory %s"),
+        -: 1812:                             quote_n (0, dst_name), quote_n (1, src_name));
+    #####: 1813:                      return false;
+        -: 1814:                    }
+        -: 1815:                }
+        -: 1816:
+        -: 1817:              /* Don't let the user destroy their data, even if they try hard:
+        -: 1818:                 This mv command must fail (likewise for cp):
+        -: 1819:                   rm -rf a b c; mkdir a b c; touch a/f b/f; mv a/f b/f c
+        -: 1820:                 Otherwise, the contents of b/f would be lost.
+        -: 1821:                 In the case of 'cp', b/f would be lost if the user simulated
+        -: 1822:                 a move using cp and rm.
+        -: 1823:                 Note that it works fine if you use --backup=numbered.  */
+        2: 1824:              if (command_line_arg
+        2: 1825:                  && x->backup_type != numbered_backups
+        2: 1826:                  && seen_file (x->dest_info, dst_name, &dst_sb))
+        -: 1827:                {
+    #####: 1828:                  error (0, 0,
+        -: 1829:                         _("will not overwrite just-created %s with %s"),
+        -: 1830:                         quote_n (0, dst_name), quote_n (1, src_name));
+    #####: 1831:                  return false;
+        -: 1832:                }
+        -: 1833:            }
+        -: 1834:
+        2: 1835:          if (!S_ISDIR (src_mode))
+        -: 1836:            {
+        2: 1837:              if (S_ISDIR (dst_sb.st_mode))
+        -: 1838:                {
+    #####: 1839:                  if (x->move_mode && x->backup_type != no_backups)
+        -: 1840:                    {
+        -: 1841:                      /* Moving a non-directory onto an existing
+        -: 1842:                         directory is ok only with --backup.  */
+        -: 1843:                    }
+        -: 1844:                  else
+        -: 1845:                    {
+    #####: 1846:                      error (0, 0,
+        -: 1847:                         _("cannot overwrite directory %s with non-directory"),
+        -: 1848:                             quote (dst_name));
+    #####: 1849:                      return false;
+        -: 1850:                    }
+        -: 1851:                }
+        -: 1852:            }
+        -: 1853:
+        2: 1854:          if (x->move_mode)
+        -: 1855:            {
+        -: 1856:              /* Don't allow user to move a directory onto a non-directory.  */
+    #####: 1857:              if (S_ISDIR (src_sb.st_mode) && !S_ISDIR (dst_sb.st_mode)
+    #####: 1858:                  && x->backup_type == no_backups)
+        -: 1859:                {
+    #####: 1860:                  error (0, 0,
+        -: 1861:                       _("cannot move directory onto non-directory: %s -> %s"),
+        -: 1862:                         quote_n (0, src_name), quote_n (0, dst_name));
+    #####: 1863:                  return false;
+        -: 1864:                }
+        -: 1865:            }
+        -: 1866:
+        2: 1867:          if (x->backup_type != no_backups
+        -: 1868:              /* Don't try to back up a destination if the last
+        -: 1869:                 component of src_name is "." or "..".  */
+    #####: 1870:              && ! dot_or_dotdot (last_component (src_name))
+        -: 1871:              /* Create a backup of each destination directory in move mode,
+        -: 1872:                 but not in copy mode.  FIXME: it might make sense to add an
+        -: 1873:                 option to suppress backup creation also for move mode.
+        -: 1874:                 That would let one use mv to merge new content into an
+        -: 1875:                 existing hierarchy.  */
+    #####: 1876:              && (x->move_mode || ! S_ISDIR (dst_sb.st_mode)))
+    #####: 1877:            {
+    #####: 1878:              char *tmp_backup = find_backup_file_name (dst_name,
+        -: 1879:                                                        x->backup_type);
+        -: 1880:
+        -: 1881:              /* Detect (and fail) when creating the backup file would
+        -: 1882:                 destroy the source file.  Before, running the commands
+        -: 1883:                 cd /tmp; rm -f a a~; : > a; echo A > a~; cp --b=simple a~ a
+        -: 1884:                 would leave two zero-length files: a and a~.  */
+        -: 1885:              /* FIXME: but simply change e.g., the final a~ to './a~'
+        -: 1886:                 and the source will still be destroyed.  */
+    #####: 1887:              if (STREQ (tmp_backup, src_name))
+        -: 1888:                {
+        -: 1889:                  const char *fmt;
+    #####: 1890:                  fmt = (x->move_mode
+        -: 1891:                 ? _("backing up %s would destroy source;  %s not moved")
+    #####: 1892:                 : _("backing up %s would destroy source;  %s not copied"));
+    #####: 1893:                  error (0, 0, fmt,
+        -: 1894:                         quote_n (0, dst_name),
+        -: 1895:                         quote_n (1, src_name));
+    #####: 1896:                  free (tmp_backup);
+    #####: 1897:                  return false;
+        -: 1898:                }
+        -: 1899:
+        -: 1900:              /* FIXME: use fts:
+        -: 1901:                 Using alloca for a file name that may be arbitrarily
+        -: 1902:                 long is not recommended.  In fact, even forming such a name
+        -: 1903:                 should be discouraged.  Eventually, this code will be rewritten
+        -: 1904:                 to use fts, so using alloca here will be less of a problem.  */
+    #####: 1905:              ASSIGN_STRDUPA (dst_backup, tmp_backup);
+    #####: 1906:              free (tmp_backup);
+        -: 1907:              /* In move mode, when src_name and dst_name are on the
+        -: 1908:                 same partition (FIXME, and when they are non-directories),
+        -: 1909:                 make the operation atomic: link dest
+        -: 1910:                 to backup, then rename src to dest.  */
+    #####: 1911:              if (rename (dst_name, dst_backup) != 0)
+        -: 1912:                {
+    #####: 1913:                  if (errno != ENOENT)
+        -: 1914:                    {
+    #####: 1915:                      error (0, errno, _("cannot backup %s"), quote (dst_name));
+    #####: 1916:                      return false;
+        -: 1917:                    }
+        -: 1918:                  else
+        -: 1919:                    {
+    #####: 1920:                      dst_backup = NULL;
+        -: 1921:                    }
+        -: 1922:                }
+        -: 1923:              else
+        -: 1924:                {
+    #####: 1925:                  backup_succeeded = true;
+        -: 1926:                }
+    #####: 1927:              new_dst = true;
+        -: 1928:            }
+        2: 1929:          else if (! S_ISDIR (dst_sb.st_mode)
+        -: 1930:                   /* Never unlink dst_name when in move mode.  */
+        2: 1931:                   && ! x->move_mode
+        2: 1932:                   && (x->unlink_dest_before_opening
+    #####: 1933:                       || (x->preserve_links && 1 < dst_sb.st_nlink)
+    #####: 1934:                       || (x->dereference == DEREF_NEVER
+    #####: 1935:                           && ! S_ISREG (src_sb.st_mode))
+        -: 1936:                       ))
+        -: 1937:            {
+        2: 1938:              if (unlink (dst_name) != 0 && errno != ENOENT)
+        -: 1939:                {
+    #####: 1940:                  error (0, errno, _("cannot remove %s"), quote (dst_name));
+    #####: 1941:                  return false;
+        -: 1942:                }
+        2: 1943:              new_dst = true;
+        2: 1944:              if (x->verbose)
+    #####: 1945:                printf (_("removed %s\n"), quote (dst_name));
+        -: 1946:            }
+        -: 1947:        }
+        -: 1948:    }
+        -: 1949:
+        -: 1950:  /* Ensure we don't try to copy through a symlink that was
+        -: 1951:     created by a prior call to this function.  */
+        3: 1952:  if (command_line_arg
+        3: 1953:      && x->dest_info
+    #####: 1954:      && ! x->move_mode
+    #####: 1955:      && x->backup_type == no_backups)
+        -: 1956:    {
+    #####: 1957:      bool lstat_ok = true;
+        -: 1958:      struct stat tmp_buf;
+        -: 1959:      struct stat *dst_lstat_sb;
+        -: 1960:
+        -: 1961:      /* If we called lstat above, good: use that data.
+        -: 1962:         Otherwise, call lstat here, in case dst_name is a symlink.  */
+    #####: 1963:      if (have_dst_lstat)
+    #####: 1964:        dst_lstat_sb = &dst_sb;
+        -: 1965:      else
+        -: 1966:        {
+    #####: 1967:          if (lstat (dst_name, &tmp_buf) == 0)
+    #####: 1968:            dst_lstat_sb = &tmp_buf;
+        -: 1969:          else
+    #####: 1970:            lstat_ok = false;
+        -: 1971:        }
+        -: 1972:
+        -: 1973:      /* Never copy through a symlink we've just created.  */
+    #####: 1974:      if (lstat_ok
+    #####: 1975:          && S_ISLNK (dst_lstat_sb->st_mode)
+    #####: 1976:          && seen_file (x->dest_info, dst_name, dst_lstat_sb))
+        -: 1977:        {
+    #####: 1978:          error (0, 0,
+        -: 1979:                 _("will not copy %s through just-created symlink %s"),
+        -: 1980:                 quote_n (0, src_name), quote_n (1, dst_name));
+    #####: 1981:          return false;
+        -: 1982:        }
+        -: 1983:    }
+        -: 1984:
+        -: 1985:  /* If the source is a directory, we don't always create the destination
+        -: 1986:     directory.  So --verbose should not announce anything until we're
+        -: 1987:     sure we'll create a directory. */
+        3: 1988:  if (x->verbose && !S_ISDIR (src_mode))
+    #####: 1989:    emit_verbose (src_name, dst_name, backup_succeeded ? dst_backup : NULL);
+        -: 1990:
+        -: 1991:  /* Associate the destination file name with the source device and inode
+        -: 1992:     so that if we encounter a matching dev/ino pair in the source tree
+        -: 1993:     we can arrange to create a hard link between the corresponding names
+        -: 1994:     in the destination tree.
+        -: 1995:
+        -: 1996:     When using the --link (-l) option, there is no need to take special
+        -: 1997:     measures, because (barring race conditions) files that are hard-linked
+        -: 1998:     in the source tree will also be hard-linked in the destination tree.
+        -: 1999:
+        -: 2000:     Sometimes, when preserving links, we have to record dev/ino even
+        -: 2001:     though st_nlink == 1:
+        -: 2002:     - when in move_mode, since we may be moving a group of N hard-linked
+        -: 2003:        files (via two or more command line arguments) to a different
+        -: 2004:        partition; the links may be distributed among the command line
+        -: 2005:        arguments (possibly hierarchies) so that the link count of
+        -: 2006:        the final, once-linked source file is reduced to 1 when it is
+        -: 2007:        considered below.  But in this case (for mv) we don't need to
+        -: 2008:        incur the expense of recording the dev/ino => name mapping; all we
+        -: 2009:        really need is a lookup, to see if the dev/ino pair has already
+        -: 2010:        been copied.
+        -: 2011:     - when using -H and processing a command line argument;
+        -: 2012:        that command line argument could be a symlink pointing to another
+        -: 2013:        command line argument.  With 'cp -H --preserve=link', we hard-link
+        -: 2014:        those two destination files.
+        -: 2015:     - likewise for -L except that it applies to all files, not just
+        -: 2016:        command line arguments.
+        -: 2017:
+        -: 2018:     Also, with --recursive, record dev/ino of each command-line directory.
+        -: 2019:     We'll use that info to detect this problem: cp -R dir dir.  */
+        -: 2020:
+        3: 2021:  if (x->move_mode && src_sb.st_nlink == 1)
+        -: 2022:    {
+        1: 2023:      earlier_file = src_to_dest_lookup (src_sb.st_ino, src_sb.st_dev);
+        -: 2024:    }
+        2: 2025:  else if (x->preserve_links
+    #####: 2026:           && !x->hard_link
+    #####: 2027:           && (1 < src_sb.st_nlink
+    #####: 2028:               || (command_line_arg
+    #####: 2029:                   && x->dereference == DEREF_COMMAND_LINE_ARGUMENTS)
+    #####: 2030:               || x->dereference == DEREF_ALWAYS))
+        -: 2031:    {
+    #####: 2032:      earlier_file = remember_copied (dst_name, src_sb.st_ino, src_sb.st_dev);
+        -: 2033:    }
+        2: 2034:  else if (x->recursive && S_ISDIR (src_mode))
+        -: 2035:    {
+    #####: 2036:      if (command_line_arg)
+    #####: 2037:        earlier_file = remember_copied (dst_name, src_sb.st_ino, src_sb.st_dev);
+        -: 2038:      else
+    #####: 2039:        earlier_file = src_to_dest_lookup (src_sb.st_ino, src_sb.st_dev);
+        -: 2040:    }
+        -: 2041:
+        -: 2042:  /* Did we copy this inode somewhere else (in this command line argument)
+        -: 2043:     and therefore this is a second hard link to the inode?  */
+        -: 2044:
+        3: 2045:  if (earlier_file)
+        -: 2046:    {
+        -: 2047:      /* Avoid damaging the destination file system by refusing to preserve
+        -: 2048:         hard-linked directories (which are found at least in Netapp snapshot
+        -: 2049:         directories).  */
+    #####: 2050:      if (S_ISDIR (src_mode))
+        -: 2051:        {
+        -: 2052:          /* If src_name and earlier_file refer to the same directory entry,
+        -: 2053:             then warn about copying a directory into itself.  */
+    #####: 2054:          if (same_name (src_name, earlier_file))
+        -: 2055:            {
+    #####: 2056:              error (0, 0, _("cannot copy a directory, %s, into itself, %s"),
+        -: 2057:                     quote_n (0, top_level_src_name),
+        -: 2058:                     quote_n (1, top_level_dst_name));
+    #####: 2059:              *copy_into_self = true;
+    #####: 2060:              goto un_backup;
+        -: 2061:            }
+    #####: 2062:          else if (x->dereference == DEREF_ALWAYS)
+        -: 2063:            {
+        -: 2064:              /* This happens when e.g., encountering a directory for the
+        -: 2065:                 second or subsequent time via symlinks when cp is invoked
+        -: 2066:                 with -R and -L.  E.g.,
+        -: 2067:                 rm -rf a b c d; mkdir a b c d; ln -s ../c a; ln -s ../c b;
+        -: 2068:                 cp -RL a b d
+        -: 2069:              */
+        -: 2070:            }
+        -: 2071:          else
+        -: 2072:            {
+    #####: 2073:              error (0, 0, _("will not create hard link %s to directory %s"),
+        -: 2074:                     quote_n (0, dst_name), quote_n (1, earlier_file));
+    #####: 2075:              goto un_backup;
+        -: 2076:            }
+        -: 2077:        }
+        -: 2078:      else
+        -: 2079:        {
+    #####: 2080:          if (! create_hard_link (earlier_file, dst_name, true, x->verbose))
+    #####: 2081:            goto un_backup;
+        -: 2082:
+    #####: 2083:          return true;
+        -: 2084:        }
+        -: 2085:    }
+        -: 2086:
+        3: 2087:  if (x->move_mode)
+        -: 2088:    {
+        1: 2089:      if (rename (src_name, dst_name) == 0)
+        -: 2090:        {
+    #####: 2091:          if (x->verbose && S_ISDIR (src_mode))
+    #####: 2092:            emit_verbose (src_name, dst_name,
+        -: 2093:                          backup_succeeded ? dst_backup : NULL);
+        -: 2094:
+    #####: 2095:          if (rename_succeeded)
+    #####: 2096:            *rename_succeeded = true;
+        -: 2097:
+    #####: 2098:          if (command_line_arg)
+        -: 2099:            {
+        -: 2100:              /* Record destination dev/ino/name, so that if we are asked
+        -: 2101:                 to overwrite that file again, we can detect it and fail.  */
+        -: 2102:              /* It's fine to use the _source_ stat buffer (src_sb) to get the
+        -: 2103:                 _destination_ dev/ino, since the rename above can't have
+        -: 2104:                 changed those, and 'mv' always uses lstat.
+        -: 2105:                 We could limit it further by operating
+        -: 2106:                 only on non-directories.  */
+    #####: 2107:              record_file (x->dest_info, dst_name, &src_sb);
+        -: 2108:            }
+        -: 2109:
+    #####: 2110:          return true;
+        -: 2111:        }
+        -: 2112:
+        -: 2113:      /* FIXME: someday, consider what to do when moving a directory into
+        -: 2114:         itself but when source and destination are on different devices.  */
+        -: 2115:
+        -: 2116:      /* This happens when attempting to rename a directory to a
+        -: 2117:         subdirectory of itself.  */
+        1: 2118:      if (errno == EINVAL)
+        -: 2119:        {
+        -: 2120:          /* FIXME: this is a little fragile in that it relies on rename(2)
+        -: 2121:             failing with a specific errno value.  Expect problems on
+        -: 2122:             non-POSIX systems.  */
+    #####: 2123:          error (0, 0, _("cannot move %s to a subdirectory of itself, %s"),
+        -: 2124:                 quote_n (0, top_level_src_name),
+        -: 2125:                 quote_n (1, top_level_dst_name));
+        -: 2126:
+        -: 2127:          /* Note that there is no need to call forget_created here,
+        -: 2128:             (compare with the other calls in this file) since the
+        -: 2129:             destination directory didn't exist before.  */
+        -: 2130:
+    #####: 2131:          *copy_into_self = true;
+        -: 2132:          /* FIXME-cleanup: Don't return true here; adjust mv.c accordingly.
+        -: 2133:             The only caller that uses this code (mv.c) ends up setting its
+        -: 2134:             exit status to nonzero when copy_into_self is nonzero.  */
+    #####: 2135:          return true;
+        -: 2136:        }
+        -: 2137:
+        -: 2138:      /* WARNING: there probably exist systems for which an inter-device
+        -: 2139:         rename fails with a value of errno not handled here.
+        -: 2140:         If/as those are reported, add them to the condition below.
+        -: 2141:         If this happens to you, please do the following and send the output
+        -: 2142:         to the bug-reporting address (e.g., in the output of cp --help):
+        -: 2143:           touch k; perl -e 'rename "k","/tmp/k" or print "$!(",$!+0,")\n"'
+        -: 2144:         where your current directory is on one partion and /tmp is the other.
+        -: 2145:         Also, please try to find the E* errno macro name corresponding to
+        -: 2146:         the diagnostic and parenthesized integer, and include that in your
+        -: 2147:         e-mail.  One way to do that is to run a command like this
+        -: 2148:           find /usr/include/. -type f \
+        -: 2149:             | xargs grep 'define.*\<E[A-Z]*\>.*\<18\>' /dev/null
+        -: 2150:         where you'd replace '18' with the integer in parentheses that
+        -: 2151:         was output from the perl one-liner above.
+        -: 2152:         If necessary, of course, change '/tmp' to some other directory.  */
+        1: 2153:      if (errno != EXDEV)
+        -: 2154:        {
+        -: 2155:          /* There are many ways this can happen due to a race condition.
+        -: 2156:             When something happens between the initial XSTAT and the
+        -: 2157:             subsequent rename, we can get many different types of errors.
+        -: 2158:             For example, if the destination is initially a non-directory
+        -: 2159:             or non-existent, but it is created as a directory, the rename
+        -: 2160:             fails.  If two 'mv' commands try to rename the same file at
+        -: 2161:             about the same time, one will succeed and the other will fail.
+        -: 2162:             If the permissions on the directory containing the source or
+        -: 2163:             destination file are made too restrictive, the rename will
+        -: 2164:             fail.  Etc.  */
+    #####: 2165:          error (0, errno,
+        -: 2166:                 _("cannot move %s to %s"),
+        -: 2167:                 quote_n (0, src_name), quote_n (1, dst_name));
+    #####: 2168:          forget_created (src_sb.st_ino, src_sb.st_dev);
+    #####: 2169:          return false;
+        -: 2170:        }
+        -: 2171:
+        -: 2172:      /* The rename attempt has failed.  Remove any existing destination
+        -: 2173:         file so that a cross-device 'mv' acts as if it were really using
+        -: 2174:         the rename syscall.  */
+        1: 2175:      if (unlink (dst_name) != 0 && errno != ENOENT)
+        -: 2176:        {
+    #####: 2177:          error (0, errno,
+        -: 2178:             _("inter-device move failed: %s to %s; unable to remove target"),
+        -: 2179:                 quote_n (0, src_name), quote_n (1, dst_name));
+    #####: 2180:          forget_created (src_sb.st_ino, src_sb.st_dev);
+    #####: 2181:          return false;
+        -: 2182:        }
+        -: 2183:
+        1: 2184:      new_dst = true;
+        -: 2185:    }
+        -: 2186:
+        -: 2187:  /* If the ownership might change, or if it is a directory (whose
+        -: 2188:     special mode bits may change after the directory is created),
+        -: 2189:     omit some permissions at first, so unauthorized users cannot nip
+        -: 2190:     in before the file is ready.  */
+        3: 2191:  dst_mode_bits = (x->set_mode ? x->mode : src_mode) & CHMOD_MODE_BITS;
+        3: 2192:  omitted_permissions =
+        -: 2193:    (dst_mode_bits
+        5: 2194:     & (x->preserve_ownership ? S_IRWXG | S_IRWXO
+        2: 2195:        : S_ISDIR (src_mode) ? S_IWGRP | S_IWOTH
+        -: 2196:        : 0));
+        -: 2197:
+        3: 2198:  delayed_ok = true;
+        -: 2199:
+        3: 2200:  if (x->preserve_security_context)
+        -: 2201:    {
+    #####: 2202:      bool all_errors = !x->data_copy_required || x->require_preserve_context;
+    #####: 2203:      bool some_errors = !all_errors && !x->reduce_diagnostics;
+        -: 2204:      security_context_t con;
+        -: 2205:
+    #####: 2206:      if (0 <= lgetfilecon (src_name, &con))
+        -: 2207:        {
+    #####: 2208:          if (setfscreatecon (con) < 0)
+        -: 2209:            {
+    #####: 2210:              if (all_errors || (some_errors && !errno_unsupported (errno)))
+    #####: 2211:                error (0, errno,
+        -: 2212:                       _("failed to set default file creation context to %s"),
+        -: 2213:                       quote (con));
+    #####: 2214:              if (x->require_preserve_context)
+        -: 2215:                {
+    #####: 2216:                  freecon (con);
+    #####: 2217:                  return false;
+        -: 2218:                }
+        -: 2219:            }
+    #####: 2220:          freecon (con);
+        -: 2221:        }
+        -: 2222:      else
+        -: 2223:        {
+    #####: 2224:          if (all_errors || (some_errors && !errno_unsupported (errno)))
+        -: 2225:            {
+    #####: 2226:              error (0, errno,
+        -: 2227:                     _("failed to get security context of %s"),
+        -: 2228:                     quote (src_name));
+        -: 2229:            }
+    #####: 2230:          if (x->require_preserve_context)
+    #####: 2231:            return false;
+        -: 2232:        }
+        -: 2233:    }
+        -: 2234:
+        3: 2235:  if (S_ISDIR (src_mode))
+        -: 2236:    {
+        -: 2237:      struct dir_list *dir;
+        -: 2238:
+        -: 2239:      /* If this directory has been copied before during the
+        -: 2240:         recursion, there is a symbolic link to an ancestor
+        -: 2241:         directory of the symbolic link.  It is impossible to
+        -: 2242:         continue to copy this, unless we've got an infinite disk.  */
+        -: 2243:
+    #####: 2244:      if (is_ancestor (&src_sb, ancestors))
+        -: 2245:        {
+    #####: 2246:          error (0, 0, _("cannot copy cyclic symbolic link %s"),
+        -: 2247:                 quote (src_name));
+    #####: 2248:          goto un_backup;
+        -: 2249:        }
+        -: 2250:
+        -: 2251:      /* Insert the current directory in the list of parents.  */
+        -: 2252:
+    #####: 2253:      dir = alloca (sizeof *dir);
+    #####: 2254:      dir->parent = ancestors;
+    #####: 2255:      dir->ino = src_sb.st_ino;
+    #####: 2256:      dir->dev = src_sb.st_dev;
+        -: 2257:
+    #####: 2258:      if (new_dst || !S_ISDIR (dst_sb.st_mode))
+        -: 2259:        {
+        -: 2260:          /* POSIX says mkdir's behavior is implementation-defined when
+        -: 2261:             (src_mode & ~S_IRWXUGO) != 0.  However, common practice is
+        -: 2262:             to ask mkdir to copy all the CHMOD_MODE_BITS, letting mkdir
+        -: 2263:             decide what to do with S_ISUID | S_ISGID | S_ISVTX.  */
+    #####: 2264:          if (mkdir (dst_name, dst_mode_bits & ~omitted_permissions) != 0)
+        -: 2265:            {
+    #####: 2266:              error (0, errno, _("cannot create directory %s"),
+        -: 2267:                     quote (dst_name));
+    #####: 2268:              goto un_backup;
+        -: 2269:            }
+        -: 2270:
+        -: 2271:          /* We need search and write permissions to the new directory
+        -: 2272:             for writing the directory's contents. Check if these
+        -: 2273:             permissions are there.  */
+        -: 2274:
+    #####: 2275:          if (lstat (dst_name, &dst_sb) != 0)
+        -: 2276:            {
+    #####: 2277:              error (0, errno, _("cannot stat %s"), quote (dst_name));
+    #####: 2278:              goto un_backup;
+        -: 2279:            }
+    #####: 2280:          else if ((dst_sb.st_mode & S_IRWXU) != S_IRWXU)
+        -: 2281:            {
+        -: 2282:              /* Make the new directory searchable and writable.  */
+        -: 2283:
+    #####: 2284:              dst_mode = dst_sb.st_mode;
+    #####: 2285:              restore_dst_mode = true;
+        -: 2286:
+    #####: 2287:              if (lchmod (dst_name, dst_mode | S_IRWXU) != 0)
+        -: 2288:                {
+    #####: 2289:                  error (0, errno, _("setting permissions for %s"),
+        -: 2290:                         quote (dst_name));
+    #####: 2291:                  goto un_backup;
+        -: 2292:                }
+        -: 2293:            }
+        -: 2294:
+        -: 2295:          /* Record the created directory's inode and device numbers into
+        -: 2296:             the search structure, so that we can avoid copying it again.
+        -: 2297:             Do this only for the first directory that is created for each
+        -: 2298:             source command line argument.  */
+    #####: 2299:          if (!*first_dir_created_per_command_line_arg)
+        -: 2300:            {
+    #####: 2301:              remember_copied (dst_name, dst_sb.st_ino, dst_sb.st_dev);
+    #####: 2302:              *first_dir_created_per_command_line_arg = true;
+        -: 2303:            }
+        -: 2304:
+    #####: 2305:          if (x->verbose)
+    #####: 2306:            emit_verbose (src_name, dst_name, NULL);
+        -: 2307:        }
+        -: 2308:      else
+        -: 2309:        {
+    #####: 2310:          omitted_permissions = 0;
+        -: 2311:        }
+        -: 2312:
+        -: 2313:      /* Decide whether to copy the contents of the directory.  */
+    #####: 2314:      if (x->one_file_system && device != 0 && device != src_sb.st_dev)
+        -: 2315:        {
+        -: 2316:          /* Here, we are crossing a file system boundary and cp's -x option
+        -: 2317:             is in effect: so don't copy the contents of this directory. */
+        -: 2318:        }
+        -: 2319:      else
+        -: 2320:        {
+        -: 2321:          /* Copy the contents of the directory.  Don't just return if
+        -: 2322:             this fails -- otherwise, the failure to read a single file
+        -: 2323:             in a source directory would cause the containing destination
+        -: 2324:             directory not to have owner/perms set properly.  */
+    #####: 2325:          delayed_ok = copy_dir (src_name, dst_name, new_dst, &src_sb, dir, x,
+        -: 2326:                                 first_dir_created_per_command_line_arg,
+        -: 2327:                                 copy_into_self);
+        -: 2328:        }
+        -: 2329:    }
+        3: 2330:  else if (x->symbolic_link)
+        -: 2331:    {
+        1: 2332:      dest_is_symlink = true;
+        1: 2333:      if (*src_name != '/')
+        -: 2334:        {
+        -: 2335:          /* Check that DST_NAME denotes a file in the current directory.  */
+        -: 2336:          struct stat dot_sb;
+        -: 2337:          struct stat dst_parent_sb;
+        -: 2338:          char *dst_parent;
+        -: 2339:          bool in_current_dir;
+        -: 2340:
+        1: 2341:          dst_parent = dir_name (dst_name);
+        -: 2342:
+        2: 2343:          in_current_dir = (STREQ (".", dst_parent)
+        -: 2344:                            /* If either stat call fails, it's ok not to report
+        -: 2345:                               the failure and say dst_name is in the current
+        -: 2346:                               directory.  Other things will fail later.  */
+    #####: 2347:                            || stat (".", &dot_sb) != 0
+    #####: 2348:                            || stat (dst_parent, &dst_parent_sb) != 0
+        1: 2349:                            || SAME_INODE (dot_sb, dst_parent_sb));
+        1: 2350:          free (dst_parent);
+        -: 2351:
+        1: 2352:          if (! in_current_dir)
+        -: 2353:            {
+    #####: 2354:              error (0, 0,
+        -: 2355:           _("%s: can make relative symbolic links only in current directory"),
+        -: 2356:                     quote (dst_name));
+    #####: 2357:              goto un_backup;
+        -: 2358:            }
+        -: 2359:        }
+        1: 2360:      if (symlink (src_name, dst_name) != 0)
+        -: 2361:        {
+    #####: 2362:          error (0, errno, _("cannot create symbolic link %s to %s"),
+        -: 2363:                 quote_n (0, dst_name), quote_n (1, src_name));
+    #####: 2364:          goto un_backup;
+        -: 2365:        }
+        -: 2366:    }
+        -: 2367:
+        -: 2368:  /* POSIX 2008 states that it is implementation-defined whether
+        -: 2369:     link() on a symlink creates a hard-link to the symlink, or only
+        -: 2370:     to the referent (effectively dereferencing the symlink) (POSIX
+        -: 2371:     2001 required the latter behavior, although many systems provided
+        -: 2372:     the former).  Yet cp, invoked with '--link --no-dereference',
+        -: 2373:     should not follow the link.  We can approximate the desired
+        -: 2374:     behavior by skipping this hard-link creating block and instead
+        -: 2375:     copying the symlink, via the 'S_ISLNK'- copying code below.
+        -: 2376:     LINK_FOLLOWS_SYMLINKS is tri-state; if it is -1, we don't know
+        -: 2377:     how link() behaves, so we use the fallback case for safety.
+        -: 2378:
+        -: 2379:     Note gnulib's linkat module, guarantees that the symlink is not
+        -: 2380:     dereferenced.  However its emulation currently doesn't maintain
+        -: 2381:     timestamps or ownership so we only call it when we know the
+        -: 2382:     emulation will not be needed.  */
+        2: 2383:  else if (x->hard_link
+        -: 2384:           && !(LINK_FOLLOWS_SYMLINKS && S_ISLNK (src_mode)
+        -: 2385:                && x->dereference == DEREF_NEVER))
+        -: 2386:    {
+        1: 2387:      if (! create_hard_link (src_name, dst_name, false, false))
+    #####: 2388:        goto un_backup;
+        -: 2389:    }
+        1: 2390:  else if (S_ISREG (src_mode)
+    #####: 2391:           || (x->copy_as_regular && !S_ISLNK (src_mode)))
+        -: 2392:    {
+        1: 2393:      copied_as_regular = true;
+        -: 2394:      /* POSIX says the permission bits of the source file must be
+        -: 2395:         used as the 3rd argument in the open call.  Historical
+        -: 2396:         practice passed all the source mode bits to 'open', but the extra
+        -: 2397:         bits were ignored, so it should be the same either way.
+        -: 2398:
+        -: 2399:         This call uses DST_MODE_BITS, not SRC_MODE.  These are
+        -: 2400:         normally the same, and the exception (where x->set_mode) is
+        -: 2401:         used only by 'install', which POSIX does not specify and
+        -: 2402:         where DST_MODE_BITS is what's wanted.  */
+        2: 2403:      if (! copy_reg (src_name, dst_name, x, dst_mode_bits & S_IRWXUGO,
+        -: 2404:                      omitted_permissions, &new_dst, &src_sb))
+    #####: 2405:        goto un_backup;
+        -: 2406:    }
+    #####: 2407:  else if (S_ISFIFO (src_mode))
+        -: 2408:    {
+        -: 2409:      /* Use mknod, rather than mkfifo, because the former preserves
+        -: 2410:         the special mode bits of a fifo on Solaris 10, while mkfifo
+        -: 2411:         does not.  But fall back on mkfifo, because on some BSD systems,
+        -: 2412:         mknod always fails when asked to create a FIFO.  */
+    #####: 2413:      if (mknod (dst_name, src_mode & ~omitted_permissions, 0) != 0)
+    #####: 2414:        if (mkfifo (dst_name, src_mode & ~S_IFIFO & ~omitted_permissions) != 0)
+        -: 2415:          {
+    #####: 2416:            error (0, errno, _("cannot create fifo %s"), quote (dst_name));
+    #####: 2417:            goto un_backup;
+        -: 2418:          }
+        -: 2419:    }
+    #####: 2420:  else if (S_ISBLK (src_mode) || S_ISCHR (src_mode) || S_ISSOCK (src_mode))
+        -: 2421:    {
+    #####: 2422:      if (mknod (dst_name, src_mode & ~omitted_permissions, src_sb.st_rdev)
+        -: 2423:          != 0)
+        -: 2424:        {
+    #####: 2425:          error (0, errno, _("cannot create special file %s"),
+        -: 2426:                 quote (dst_name));
+    #####: 2427:          goto un_backup;
+        -: 2428:        }
+        -: 2429:    }
+    #####: 2430:  else if (S_ISLNK (src_mode))
+        -: 2431:    {
+    #####: 2432:      char *src_link_val = areadlink_with_size (src_name, src_sb.st_size);
+    #####: 2433:      dest_is_symlink = true;
+    #####: 2434:      if (src_link_val == NULL)
+        -: 2435:        {
+    #####: 2436:          error (0, errno, _("cannot read symbolic link %s"), quote (src_name));
+    #####: 2437:          goto un_backup;
+        -: 2438:        }
+        -: 2439:
+    #####: 2440:      if (symlink (src_link_val, dst_name) == 0)
+    #####: 2441:        free (src_link_val);
+        -: 2442:      else
+        -: 2443:        {
+    #####: 2444:          int saved_errno = errno;
+    #####: 2445:          bool same_link = false;
+    #####: 2446:          if (x->update && !new_dst && S_ISLNK (dst_sb.st_mode)
+    #####: 2447:              && dst_sb.st_size == strlen (src_link_val))
+        -: 2448:            {
+        -: 2449:              /* See if the destination is already the desired symlink.
+        -: 2450:                 FIXME: This behavior isn't documented, and seems wrong
+        -: 2451:                 in some cases, e.g., if the destination symlink has the
+        -: 2452:                 wrong ownership, permissions, or time stamps.  */
+    #####: 2453:              char *dest_link_val =
+    #####: 2454:                areadlink_with_size (dst_name, dst_sb.st_size);
+    #####: 2455:              if (dest_link_val && STREQ (dest_link_val, src_link_val))
+    #####: 2456:                same_link = true;
+    #####: 2457:              free (dest_link_val);
+        -: 2458:            }
+    #####: 2459:          free (src_link_val);
+        -: 2460:
+    #####: 2461:          if (! same_link)
+        -: 2462:            {
+    #####: 2463:              error (0, saved_errno, _("cannot create symbolic link %s"),
+        -: 2464:                     quote (dst_name));
+    #####: 2465:              goto un_backup;
+        -: 2466:            }
+        -: 2467:        }
+        -: 2468:
+    #####: 2469:      if (x->preserve_security_context)
+    #####: 2470:        restore_default_fscreatecon_or_die ();
+        -: 2471:
+    #####: 2472:      if (x->preserve_ownership)
+        -: 2473:        {
+        -: 2474:          /* Preserve the owner and group of the just-'copied'
+        -: 2475:             symbolic link, if possible.  */
+    #####: 2476:          if (HAVE_LCHOWN
+    #####: 2477:              && lchown (dst_name, src_sb.st_uid, src_sb.st_gid) != 0
+    #####: 2478:              && ! chown_failure_ok (x))
+        -: 2479:            {
+    #####: 2480:              error (0, errno, _("failed to preserve ownership for %s"),
+        -: 2481:                     dst_name);
+    #####: 2482:              goto un_backup;
+        -: 2483:            }
+        -: 2484:          else
+        -: 2485:            {
+        -: 2486:              /* Can't preserve ownership of symlinks.
+        -: 2487:                 FIXME: maybe give a warning or even error for symlinks
+        -: 2488:                 in directories with the sticky bit set -- there, not
+        -: 2489:                 preserving owner/group is a potential security problem.  */
+        -: 2490:            }
+        -: 2491:        }
+        -: 2492:    }
+        -: 2493:  else
+        -: 2494:    {
+    #####: 2495:      error (0, 0, _("%s has unknown file type"), quote (src_name));
+    #####: 2496:      goto un_backup;
+        -: 2497:    }
+        -: 2498:
+        3: 2499:  if (command_line_arg && x->dest_info)
+        -: 2500:    {
+        -: 2501:      /* Now that the destination file is very likely to exist,
+        -: 2502:         add its info to the set.  */
+        -: 2503:      struct stat sb;
+    #####: 2504:      if (lstat (dst_name, &sb) == 0)
+    #####: 2505:        record_file (x->dest_info, dst_name, &sb);
+        -: 2506:    }
+        -: 2507:
+        -: 2508:  /* If we've just created a hard-link due to cp's --link option,
+        -: 2509:     we're done.  */
+        3: 2510:  if (x->hard_link && ! S_ISDIR (src_mode)
+        1: 2511:      && !(LINK_FOLLOWS_SYMLINKS && S_ISLNK (src_mode)
+        -: 2512:           && x->dereference == DEREF_NEVER))
+        1: 2513:    return delayed_ok;
+        -: 2514:
+        2: 2515:  if (copied_as_regular)
+        1: 2516:    return delayed_ok;
+        -: 2517:
+        -: 2518:  /* POSIX says that 'cp -p' must restore the following:
+        -: 2519:     - permission bits
+        -: 2520:     - setuid, setgid bits
+        -: 2521:     - owner and group
+        -: 2522:     If it fails to restore any of those, we may give a warning but
+        -: 2523:     the destination must not be removed.
+        -: 2524:     FIXME: implement the above. */
+        -: 2525:
+        -: 2526:  /* Adjust the times (and if possible, ownership) for the copy.
+        -: 2527:     chown turns off set[ug]id bits for non-root,
+        -: 2528:     so do the chmod last.  */
+        -: 2529:
+        1: 2530:  if (x->preserve_timestamps)
+        -: 2531:    {
+        -: 2532:      struct timespec timespec[2];
+    #####: 2533:      timespec[0] = get_stat_atime (&src_sb);
+    #####: 2534:      timespec[1] = get_stat_mtime (&src_sb);
+        -: 2535:
+    #####: 2536:      if ((dest_is_symlink
+    #####: 2537:           ? utimens_symlink (dst_name, timespec)
+    #####: 2538:           : utimens (dst_name, timespec))
+    #####: 2539:          != 0)
+        -: 2540:        {
+    #####: 2541:          error (0, errno, _("preserving times for %s"), quote (dst_name));
+    #####: 2542:          if (x->require_preserve)
+    #####: 2543:            return false;
+        -: 2544:        }
+        -: 2545:    }
+        -: 2546:
+        -: 2547:  /* The operations beyond this point may dereference a symlink.  */
+        1: 2548:  if (dest_is_symlink)
+        1: 2549:    return delayed_ok;
+        -: 2550:
+        -: 2551:  /* Avoid calling chown if we know it's not necessary.  */
+    #####: 2552:  if (x->preserve_ownership
+    #####: 2553:      && (new_dst || !SAME_OWNER_AND_GROUP (src_sb, dst_sb)))
+        -: 2554:    {
+    #####: 2555:      switch (set_owner (x, dst_name, -1, &src_sb, new_dst, &dst_sb))
+        -: 2556:        {
+        -: 2557:        case -1:
+    #####: 2558:          return false;
+        -: 2559:
+        -: 2560:        case 0:
+    #####: 2561:          src_mode &= ~ (S_ISUID | S_ISGID | S_ISVTX);
+    #####: 2562:          break;
+        -: 2563:        }
+        -: 2564:    }
+        -: 2565:
+    #####: 2566:  set_author (dst_name, -1, &src_sb);
+        -: 2567:
+    #####: 2568:  if (x->preserve_xattr && ! copy_attr (src_name, -1, dst_name, -1, x)
+    #####: 2569:      && x->require_preserve_xattr)
+    #####: 2570:    return false;
+        -: 2571:
+    #####: 2572:  if (x->preserve_mode || x->move_mode)
+        -: 2573:    {
+    #####: 2574:      if (copy_acl (src_name, -1, dst_name, -1, src_mode) != 0
+    #####: 2575:          && x->require_preserve)
+    #####: 2576:        return false;
+        -: 2577:    }
+    #####: 2578:  else if (x->set_mode)
+        -: 2579:    {
+    #####: 2580:      if (set_acl (dst_name, -1, x->mode) != 0)
+    #####: 2581:        return false;
+        -: 2582:    }
+    #####: 2583:  else if (x->explicit_no_preserve_mode)
+        -: 2584:    {
+    #####: 2585:      if (set_acl (dst_name, -1, 0777 & ~cached_umask ()) != 0)
+    #####: 2586:        return false;
+        -: 2587:    }
+        -: 2588:  else
+        -: 2589:    {
+    #####: 2590:      if (omitted_permissions)
+        -: 2591:        {
+    #####: 2592:          omitted_permissions &= ~ cached_umask ();
+        -: 2593:
+    #####: 2594:          if (omitted_permissions && !restore_dst_mode)
+        -: 2595:            {
+        -: 2596:              /* Permissions were deliberately omitted when the file
+        -: 2597:                 was created due to security concerns.  See whether
+        -: 2598:                 they need to be re-added now.  It'd be faster to omit
+        -: 2599:                 the lstat, but deducing the current destination mode
+        -: 2600:                 is tricky in the presence of implementation-defined
+        -: 2601:                 rules for special mode bits.  */
+    #####: 2602:              if (new_dst && lstat (dst_name, &dst_sb) != 0)
+        -: 2603:                {
+    #####: 2604:                  error (0, errno, _("cannot stat %s"), quote (dst_name));
+    #####: 2605:                  return false;
+        -: 2606:                }
+    #####: 2607:              dst_mode = dst_sb.st_mode;
+    #####: 2608:              if (omitted_permissions & ~dst_mode)
+    #####: 2609:                restore_dst_mode = true;
+        -: 2610:            }
+        -: 2611:        }
+        -: 2612:
+    #####: 2613:      if (restore_dst_mode)
+        -: 2614:        {
+    #####: 2615:          if (lchmod (dst_name, dst_mode | omitted_permissions) != 0)
+        -: 2616:            {
+    #####: 2617:              error (0, errno, _("preserving permissions for %s"),
+        -: 2618:                     quote (dst_name));
+    #####: 2619:              if (x->require_preserve)
+    #####: 2620:                return false;
+        -: 2621:            }
+        -: 2622:        }
+        -: 2623:    }
+        -: 2624:
+    #####: 2625:  return delayed_ok;
+        -: 2626:
+        -: 2627:un_backup:
+        -: 2628:
+    #####: 2629:  if (x->preserve_security_context)
+    #####: 2630:    restore_default_fscreatecon_or_die ();
+        -: 2631:
+        -: 2632:  /* We have failed to create the destination file.
+        -: 2633:     If we've just added a dev/ino entry via the remember_copied
+        -: 2634:     call above (i.e., unless we've just failed to create a hard link),
+        -: 2635:     remove the entry associating the source dev/ino with the
+        -: 2636:     destination file name, so we don't try to 'preserve' a link
+        -: 2637:     to a file we didn't create.  */
+    #####: 2638:  if (earlier_file == NULL)
+    #####: 2639:    forget_created (src_sb.st_ino, src_sb.st_dev);
+        -: 2640:
+    #####: 2641:  if (dst_backup)
+        -: 2642:    {
+    #####: 2643:      if (rename (dst_backup, dst_name) != 0)
+    #####: 2644:        error (0, errno, _("cannot un-backup %s"), quote (dst_name));
+        -: 2645:      else
+        -: 2646:        {
+    #####: 2647:          if (x->verbose)
+    #####: 2648:            printf (_("%s -> %s (unbackup)\n"),
+        -: 2649:                    quote_n (0, dst_backup), quote_n (1, dst_name));
+        -: 2650:        }
+        -: 2651:    }
+    #####: 2652:  return false;
+        -: 2653:}
+        -: 2654:
+        -: 2655:static bool _GL_ATTRIBUTE_PURE
+        3: 2656:valid_options (const struct cp_options *co)
+        -: 2657:{
+        3: 2658:  assert (co != NULL);
+        3: 2659:  assert (VALID_BACKUP_TYPE (co->backup_type));
+        3: 2660:  assert (VALID_SPARSE_MODE (co->sparse_mode));
+        3: 2661:  assert (VALID_REFLINK_MODE (co->reflink_mode));
+        3: 2662:  assert (!(co->hard_link && co->symbolic_link));
+        3: 2663:  assert (!
+        -: 2664:          (co->reflink_mode == REFLINK_ALWAYS
+        -: 2665:           && co->sparse_mode != SPARSE_AUTO));
+        3: 2666:  return true;
+        -: 2667:}
+        -: 2668:
+        -: 2669:/* Copy the file SRC_NAME to the file DST_NAME.  The files may be of
+        -: 2670:   any type.  NONEXISTENT_DST should be true if the file DST_NAME
+        -: 2671:   is known not to exist (e.g., because its parent directory was just
+        -: 2672:   created);  NONEXISTENT_DST should be false if DST_NAME might already
+        -: 2673:   exist.  OPTIONS is ... FIXME-describe
+        -: 2674:   Set *COPY_INTO_SELF if SRC_NAME is a parent of (or the
+        -: 2675:   same as) DST_NAME; otherwise, set clear it.
+        -: 2676:   Return true if successful.  */
+        -: 2677:
+        -: 2678:extern bool
+        3: 2679:copy (char const *src_name, char const *dst_name,
+        -: 2680:      bool nonexistent_dst, const struct cp_options *options,
+        -: 2681:      bool *copy_into_self, bool *rename_succeeded)
+        -: 2682:{
+        3: 2683:  assert (valid_options (options));
+        -: 2684:
+        -: 2685:  /* Record the file names: they're used in case of error, when copying
+        -: 2686:     a directory into itself.  I don't like to make these tools do *any*
+        -: 2687:     extra work in the common case when that work is solely to handle
+        -: 2688:     exceptional cases, but in this case, I don't see a way to derive the
+        -: 2689:     top level source and destination directory names where they're used.
+        -: 2690:     An alternative is to use COPY_INTO_SELF and print the diagnostic
+        -: 2691:     from every caller -- but I don't want to do that.  */
+        3: 2692:  top_level_src_name = src_name;
+        3: 2693:  top_level_dst_name = dst_name;
+        -: 2694:
+        3: 2695:  bool first_dir_created_per_command_line_arg = false;
+        3: 2696:  return copy_internal (src_name, dst_name, nonexistent_dst, 0, NULL,
+        -: 2697:                        options, true,
+        -: 2698:                        &first_dir_created_per_command_line_arg,
+        -: 2699:                        copy_into_self, rename_succeeded);
+        -: 2700:}
+        -: 2701:
+        -: 2702:/* Set *X to the default options for a value of type struct cp_options.  */
+        -: 2703:
+        -: 2704:extern void
+        4: 2705:cp_options_default (struct cp_options *x)
+        -: 2706:{
+        4: 2707:  memset (x, 0, sizeof *x);
+        -: 2708:#ifdef PRIV_FILE_CHOWN
+        -: 2709:  {
+        -: 2710:    priv_set_t *pset = priv_allocset ();
+        -: 2711:    if (!pset)
+        -: 2712:      xalloc_die ();
+        -: 2713:    if (getppriv (PRIV_EFFECTIVE, pset) == 0)
+        -: 2714:      {
+        -: 2715:        x->chown_privileges = priv_ismember (pset, PRIV_FILE_CHOWN);
+        -: 2716:        x->owner_privileges = priv_ismember (pset, PRIV_FILE_OWNER);
+        -: 2717:      }
+        -: 2718:    priv_freeset (pset);
+        -: 2719:  }
+        -: 2720:#else
+        4: 2721:  x->chown_privileges = x->owner_privileges = (geteuid () == 0);
+        -: 2722:#endif
+        4: 2723:}
+        -: 2724:
+        -: 2725:/* Return true if it's OK for chown to fail, where errno is
+        -: 2726:   the error number that chown failed with and X is the copying
+        -: 2727:   option set.  */
+        -: 2728:
+        -: 2729:extern bool
+    #####: 2730:chown_failure_ok (struct cp_options const *x)
+        -: 2731:{
+        -: 2732:  /* If non-root uses -p, it's ok if we can't preserve ownership.
+        -: 2733:     But root probably wants to know, e.g. if NFS disallows it,
+        -: 2734:     or if the target system doesn't support file ownership.  */
+        -: 2735:
+    #####: 2736:  return ((errno == EPERM || errno == EINVAL) && !x->chown_privileges);
+        -: 2737:}
+        -: 2738:
+        -: 2739:/* Similarly, return true if it's OK for chmod and similar operations
+        -: 2740:   to fail, where errno is the error number that chmod failed with and
+        -: 2741:   X is the copying option set.  */
+        -: 2742:
+        -: 2743:static bool
+    #####: 2744:owner_failure_ok (struct cp_options const *x)
+        -: 2745:{
+    #####: 2746:  return ((errno == EPERM || errno == EINVAL) && !x->owner_privileges);
+        -: 2747:}
+        -: 2748:
+        -: 2749:/* Return the user's umask, caching the result.  */
+        -: 2750:
+        -: 2751:extern mode_t
+    #####: 2752:cached_umask (void)
+        -: 2753:{
+        -: 2754:  static mode_t mask = (mode_t) -1;
+    #####: 2755:  if (mask == (mode_t) -1)
+        -: 2756:    {
+    #####: 2757:      mask = umask (0);
+    #####: 2758:      umask (mask);
+        -: 2759:    }
+    #####: 2760:  return mask;
+        -: 2761:}

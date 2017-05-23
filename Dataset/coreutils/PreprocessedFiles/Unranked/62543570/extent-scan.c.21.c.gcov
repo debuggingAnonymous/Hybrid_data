@@ -1,0 +1,232 @@
+        -:    0:Source:src/extent-scan.c
+        -:    0:Graph:src/extent-scan.gcno
+        -:    0:Data:src/extent-scan.gcda
+        -:    0:Runs:8
+        -:    0:Programs:2
+        -:    1:/* extent-scan.c -- core functions for scanning extents
+        -:    2:   Copyright (C) 2010-2012 Free Software Foundation, Inc.
+        -:    3:
+        -:    4:   This program is free software: you can redistribute it and/or modify
+        -:    5:   it under the terms of the GNU General Public License as published by
+        -:    6:   the Free Software Foundation, either version 3 of the License, or
+        -:    7:   (at your option) any later version.
+        -:    8:
+        -:    9:   This program is distributed in the hope that it will be useful,
+        -:   10:   but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   11:   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+        -:   12:   GNU General Public License for more details.
+        -:   13:
+        -:   14:   You should have received a copy of the GNU General Public License
+        -:   15:   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+        -:   16:
+        -:   17:   Written by Jie Liu (jeff.liu@oracle.com).  */
+        -:   18:
+        -:   19:#include <config.h>
+        -:   20:#include <sys/types.h>
+        -:   21:#include <sys/ioctl.h>
+        -:   22:#include <sys/utsname.h>
+        -:   23:#include <assert.h>
+        -:   24:
+        -:   25:#include "system.h"
+        -:   26:#include "extent-scan.h"
+        -:   27:#include "fiemap.h"
+        -:   28:#include "xstrtol.h"
+        -:   29:
+        -:   30:
+        -:   31:/* Work around Linux kernel issues on BTRFS and EXT4 before 2.6.39.
+        -:   32:   FIXME: remove in 2013, or whenever we're pretty confident
+        -:   33:   that the offending, unpatched kernels are no longer in use.  */
+        -:   34:static bool
+    #####:   35:extent_need_sync (void)
+        -:   36:{
+        -:   37:  /* For now always return true, to be on the safe side.
+        -:   38:     If/when FIEMAP semantics are well defined (before SEEK_HOLE support
+        -:   39:     is usable) and kernels implementing them are in use, we may relax
+        -:   40:     this once again.  */
+    #####:   41:  return true;
+        -:   42:
+        -:   43:#if FIEMAP_BEHAVIOR_IS_DEFINED_AND_USABLE
+        -:   44:  static int need_sync = -1;
+        -:   45:
+        -:   46:  if (need_sync == -1)
+        -:   47:    {
+        -:   48:      struct utsname name;
+        -:   49:      need_sync = 0; /* No workaround by default.  */
+        -:   50:
+        -:   51:# ifdef __linux__
+        -:   52:      if (uname (&name) != -1 && STRNCMP_LIT (name.release, "2.6.") == 0)
+        -:   53:        {
+        -:   54:           unsigned long val;
+        -:   55:           if (xstrtoul (name.release + 4, NULL, 10, &val, NULL) == LONGINT_OK)
+        -:   56:             {
+        -:   57:               if (val < 39)
+        -:   58:                 need_sync = 1;
+        -:   59:             }
+        -:   60:        }
+        -:   61:# endif
+        -:   62:    }
+        -:   63:
+        -:   64:  return need_sync;
+        -:   65:#endif
+        -:   66:}
+        -:   67:
+        -:   68:/* Allocate space for struct extent_scan, initialize the entries if
+        -:   69:   necessary and return it as the input argument of extent_scan_read().  */
+        -:   70:extern void
+    #####:   71:extent_scan_init (int src_fd, struct extent_scan *scan)
+        -:   72:{
+    #####:   73:  scan->fd = src_fd;
+    #####:   74:  scan->ei_count = 0;
+    #####:   75:  scan->ext_info = NULL;
+    #####:   76:  scan->scan_start = 0;
+    #####:   77:  scan->initial_scan_failed = false;
+    #####:   78:  scan->hit_final_extent = false;
+    #####:   79:  scan->fm_flags = extent_need_sync () ? FIEMAP_FLAG_SYNC : 0;
+    #####:   80:}
+        -:   81:
+        -:   82:#ifdef __linux__
+        -:   83:# ifndef FS_IOC_FIEMAP
+        -:   84:#  define FS_IOC_FIEMAP _IOWR ('f', 11, struct fiemap)
+        -:   85:# endif
+        -:   86:/* Call ioctl(2) with FS_IOC_FIEMAP (available in linux 2.6.27) to
+        -:   87:   obtain a map of file extents excluding holes.  */
+        -:   88:extern bool
+    #####:   89:extent_scan_read (struct extent_scan *scan)
+        -:   90:{
+    #####:   91:  unsigned int si = 0;
+    #####:   92:  struct extent_info *last_ei = scan->ext_info;
+        -:   93:
+        -:   94:  while (true)
+        -:   95:    {
+        -:   96:      union { struct fiemap f; char c[4096]; } fiemap_buf;
+    #####:   97:      struct fiemap *fiemap = &fiemap_buf.f;
+    #####:   98:      struct fiemap_extent *fm_extents = &fiemap->fm_extents[0];
+        -:   99:      enum { count = (sizeof fiemap_buf - sizeof *fiemap)/sizeof *fm_extents };
+        -:  100:      verify (count > 1);
+        -:  101:
+        -:  102:      /* This is required at least to initialize fiemap->fm_start,
+        -:  103:         but also serves (in mid 2010) to appease valgrind, which
+        -:  104:         appears not to know the semantics of the FIEMAP ioctl. */
+    #####:  105:      memset (&fiemap_buf, 0, sizeof fiemap_buf);
+        -:  106:
+    #####:  107:      fiemap->fm_start = scan->scan_start;
+    #####:  108:      fiemap->fm_flags = scan->fm_flags;
+    #####:  109:      fiemap->fm_extent_count = count;
+    #####:  110:      fiemap->fm_length = FIEMAP_MAX_OFFSET - scan->scan_start;
+        -:  111:
+        -:  112:      /* Fall back to the standard copy if call ioctl(2) failed for
+        -:  113:         the first time.  */
+    #####:  114:      if (ioctl (scan->fd, FS_IOC_FIEMAP, fiemap) < 0)
+        -:  115:        {
+    #####:  116:          if (scan->scan_start == 0)
+    #####:  117:            scan->initial_scan_failed = true;
+    #####:  118:          return false;
+        -:  119:        }
+        -:  120:
+        -:  121:      /* If 0 extents are returned, then no more scans are needed.  */
+    #####:  122:      if (fiemap->fm_mapped_extents == 0)
+        -:  123:        {
+    #####:  124:          scan->hit_final_extent = true;
+    #####:  125:          return scan->scan_start != 0;
+        -:  126:        }
+        -:  127:
+    #####:  128:      assert (scan->ei_count <= SIZE_MAX - fiemap->fm_mapped_extents);
+    #####:  129:      scan->ei_count += fiemap->fm_mapped_extents;
+        -:  130:      {
+        -:  131:        /* last_ei points into a buffer that may be freed via xnrealloc.
+        -:  132:           Record its offset and adjust after allocation.  */
+    #####:  133:        size_t prev_idx = last_ei - scan->ext_info;
+    #####:  134:        scan->ext_info = xnrealloc (scan->ext_info, scan->ei_count,
+        -:  135:                                    sizeof (struct extent_info));
+    #####:  136:        last_ei = scan->ext_info + prev_idx;
+        -:  137:      }
+        -:  138:
+    #####:  139:      unsigned int i = 0;
+    #####:  140:      for (i = 0; i < fiemap->fm_mapped_extents; i++)
+        -:  141:        {
+    #####:  142:          assert (fm_extents[i].fe_logical
+        -:  143:                  <= OFF_T_MAX - fm_extents[i].fe_length);
+        -:  144:
+    #####:  145:          if (si && last_ei->ext_flags
+    #####:  146:              == (fm_extents[i].fe_flags & ~FIEMAP_EXTENT_LAST)
+    #####:  147:              && (last_ei->ext_logical + last_ei->ext_length
+    #####:  148:                  == fm_extents[i].fe_logical))
+        -:  149:            {
+        -:  150:              /* Merge previous with last.  */
+    #####:  151:              last_ei->ext_length += fm_extents[i].fe_length;
+        -:  152:              /* Copy flags in case different.  */
+    #####:  153:              last_ei->ext_flags = fm_extents[i].fe_flags;
+        -:  154:            }
+    #####:  155:          else if ((si == 0 && scan->scan_start > fm_extents[i].fe_logical)
+    #####:  156:                   || (si && (last_ei->ext_logical + last_ei->ext_length
+    #####:  157:                              > fm_extents[i].fe_logical)))
+        -:  158:            {
+        -:  159:              /* BTRFS before 2.6.38 could return overlapping extents
+        -:  160:                 for sparse files.  We adjust the returned extents
+        -:  161:                 rather than failing, as otherwise it would be inefficient
+        -:  162:                 to detect this on the initial scan.  */
+        -:  163:              uint64_t new_logical;
+        -:  164:              uint64_t length_adjust;
+    #####:  165:              if (si == 0)
+    #####:  166:                new_logical = scan->scan_start;
+        -:  167:              else
+        -:  168:                {
+        -:  169:                  /* We could return here if scan->scan_start == 0
+        -:  170:                     but don't so as to minimize special cases.  */
+    #####:  171:                  new_logical = last_ei->ext_logical + last_ei->ext_length;
+        -:  172:                }
+    #####:  173:              length_adjust = new_logical - fm_extents[i].fe_logical;
+        -:  174:              /* If an extent is contained within the previous one, fail.  */
+    #####:  175:              if (length_adjust < fm_extents[i].fe_length)
+        -:  176:                {
+    #####:  177:                  if (scan->scan_start == 0)
+    #####:  178:                    scan->initial_scan_failed = true;
+    #####:  179:                  return false;
+        -:  180:                }
+    #####:  181:              fm_extents[i].fe_logical = new_logical;
+    #####:  182:              fm_extents[i].fe_length -= length_adjust;
+        -:  183:              /* Process the adjusted extent again.  */
+    #####:  184:              i--;
+    #####:  185:              continue;
+        -:  186:            }
+        -:  187:          else
+        -:  188:            {
+    #####:  189:              last_ei = scan->ext_info + si;
+    #####:  190:              last_ei->ext_logical = fm_extents[i].fe_logical;
+    #####:  191:              last_ei->ext_length = fm_extents[i].fe_length;
+    #####:  192:              last_ei->ext_flags = fm_extents[i].fe_flags;
+    #####:  193:              si++;
+        -:  194:            }
+        -:  195:        }
+        -:  196:
+    #####:  197:      if (last_ei->ext_flags & FIEMAP_EXTENT_LAST)
+    #####:  198:        scan->hit_final_extent = true;
+        -:  199:
+        -:  200:      /* If we have enough extents, discard the last as it might
+        -:  201:         be merged with one from the next scan.  */
+    #####:  202:      if (si > count && !scan->hit_final_extent)
+    #####:  203:        last_ei = scan->ext_info + --si - 1;
+        -:  204:
+        -:  205:      /* We don't bother reallocating any trailing slots.  */
+    #####:  206:      scan->ei_count = si;
+        -:  207:
+    #####:  208:      if (scan->hit_final_extent)
+    #####:  209:        break;
+        -:  210:      else
+    #####:  211:        scan->scan_start = last_ei->ext_logical + last_ei->ext_length;
+        -:  212:
+    #####:  213:      if (si >= count)
+    #####:  214:        break;
+    #####:  215:    }
+        -:  216:
+    #####:  217:  return true;
+        -:  218:}
+        -:  219:#else
+        -:  220:extern bool
+        -:  221:extent_scan_read (struct extent_scan *scan ATTRIBUTE_UNUSED)
+        -:  222:{
+        -:  223:  scan->initial_scan_failed = true;
+        -:  224:  errno = ENOTSUP;
+        -:  225:  return false;
+        -:  226:}
+        -:  227:#endif
