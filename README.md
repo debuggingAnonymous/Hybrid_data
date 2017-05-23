@@ -27,16 +27,16 @@ The open source C projects making up the subjects in this VM include:
 2. **Tcas**: 37 injected errors from the `Siemens and SIR Benchmark`.
 
 #### DataSet ####
-This folder contains the dataset for all evaluated techniques, subjects and bugs. 
-Each folder in ~/work/hybrid/`<subject>` contains the following information:
-1. The pre-processed files in folder  ~/work/hybrid/`<subject>`/PreprocessedFiles/ contains: 
+This folder contains the dataset for all evaluated techniques, subjects and bugs.
+Each folder in */Dataset/`<subject>`/* contains the following information:
+1. The pre-processed files in folder  */Dataset/`<subject>`/PreprocessedFiles/* contains: 
 	* GDB logs for each execution of the test case
 	* The test coverage for each execution of the program
 	* The faulty statements obtained from the fix patches for each bug
 	* The static slices for each program (and method) in each program
 	* The syntactic and semantic call graphs for each program
 	* The ranking of each statistical debugging measure
-2. For Tcas, the buggy program in folder ~/work/hybrid/`tcas`/Source.
+2. For `Tcas` & `Coreutils`, the buggy program in folder */Dataset/`<subject>`/Source/*.
 
 Evaluation Results
 ---------------------
